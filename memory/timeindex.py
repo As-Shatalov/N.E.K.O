@@ -930,7 +930,13 @@ class TimeIndexedMemory:
         )
 
     def has_conversation(self, event_id, lanlan_name) -> bool:
-        """Whether rows of ``event_id`` exist in the original table (strict: raises when unreadable)."""
+        """Whether rows of ``event_id`` exist in the original table (strict: raises when unreadable).
+
+        Rows left without a timestamp (the insert committed, the timestamp
+        ``UPDATE`` of :meth:`store_conversation` did not) are completed here
+        before answering True: timeframe readers filter on the timestamp, so
+        such a row would otherwise count as stored while no reader sees it.
+        """
         if not self._ensure_engine_exists(lanlan_name):
             raise RuntimeError(f"time index of {lanlan_name!r} unavailable")
         original_table = self._validate_table_name(TIME_ORIGINAL_TABLE_NAME)
@@ -939,7 +945,21 @@ class TimeIndexedMemory:
                 text(f"SELECT 1 FROM {original_table} WHERE session_id = :session_id LIMIT 1"),
                 {"session_id": event_id},
             ).fetchone()
-        return row is not None
+            if row is None:
+                return False
+            missing = conn.execute(
+                text(f"SELECT 1 FROM {original_table} WHERE session_id = :session_id AND timestamp IS NULL LIMIT 1"),
+                {"session_id": event_id},
+            ).fetchone()
+            if missing is not None:
+                self._assert_timeindex_writable(lanlan_name)
+                conn.execute(
+                    text(f"UPDATE {original_table} SET timestamp = :timestamp "
+                         "WHERE session_id = :session_id AND timestamp IS NULL"),
+                    {"timestamp": datetime.now(), "session_id": event_id},
+                )
+                conn.commit()
+        return True
 
     async def ahas_conversation(self, event_id, lanlan_name) -> bool:
         return await asyncio.to_thread(self.has_conversation, event_id, lanlan_name)

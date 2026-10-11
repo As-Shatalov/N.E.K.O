@@ -706,3 +706,30 @@ def test_a_deeply_nested_sidecar_does_not_block_recent_writes(tmp_path):
     recent_file.write_recent_payload(path, [])
     assert json.loads(Path(path).read_text(encoding="utf-8")) == []
     assert "k1" in recent_file.read_retired_keys(path)
+
+
+# ── 评审第 7 轮 ──────────────────────────────────────────────────────────
+
+
+def test_a_time_index_row_without_timestamp_is_completed(tmp_path, monkeypatch):
+    from sqlalchemy import create_engine, text
+
+    from config import TIME_ORIGINAL_TABLE_NAME
+    from memory.timeindex import TimeIndexedMemory
+
+    monkeypatch.setattr("memory.timeindex.assert_cloudsave_writable", lambda *a, **k: None)
+    engine = create_engine(f"sqlite:///{(tmp_path / 'ti.db').as_posix()}")
+    with engine.connect() as conn:
+        conn.execute(text(f"CREATE TABLE {TIME_ORIGINAL_TABLE_NAME} "
+                          "(id INTEGER PRIMARY KEY, session_id TEXT, message TEXT, timestamp DATETIME)"))
+        # 插入已提交、补时间戳的 UPDATE 失败：行在、时间戳为空
+        conn.execute(text(f"INSERT INTO {TIME_ORIGINAL_TABLE_NAME} (session_id, message) VALUES ('idem-x', '{{}}')"))
+        conn.commit()
+    tim = object.__new__(TimeIndexedMemory)
+    tim.engines = {NAME: engine}
+    monkeypatch.setattr(tim, "_ensure_engine_exists", lambda *_a, **_k: True, raising=False)
+    assert tim.has_conversation("idem-x", NAME) is True
+    assert tim.has_conversation("idem-y", NAME) is False
+    with engine.connect() as conn:
+        stamps = conn.execute(text(f"SELECT timestamp FROM {TIME_ORIGINAL_TABLE_NAME}")).fetchall()
+    assert stamps and all(row[0] is not None for row in stamps)
