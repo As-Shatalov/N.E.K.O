@@ -100,6 +100,7 @@ CLOUDSAVE_ERROR_I18N_KEYS = {
     "CLOUDSAVE_CHARACTER_NOT_FOUND": "cloudsave.error.cloudCharacterNotFound",
     "LOCAL_CHARACTER_EXISTS": "cloudsave.error.localCharacterExists",
     "VISIT_DATA_BUSY": "cloudsave.error.visitDataBusy",
+    "VISIT_DATA_AMBIGUOUS": "cloudsave.error.visitDataAmbiguous",
     "CLOUD_CHARACTER_EXISTS": "cloudsave.error.cloudCharacterExists",
     "CLOUDSAVE_WRITE_FENCE_ACTIVE": "cloudsave.error.writeFenceActive",
     "NAME_AUDIT_FAILED": "cloudsave.error.nameAuditFailed",
@@ -335,12 +336,23 @@ async def _visit_name_refusal(config_manager, name: str):
     An overwrite of a local character is checked too: when that character's
     own rename is still unreconciled, the import would replace its profile
     (and uid) first, and recovery could then no longer tell where its
-    entries belong.
+    entries belong. A rename that can never be reconciled answers
+    ``VISIT_DATA_AMBIGUOUS`` (delete one of the two characters) rather than
+    ``VISIT_DATA_BUSY`` (try again later).
     """
     from main_routers.visit_router import character_hooks
 
-    if not await character_hooks.name_blocked(config_manager, name):
+    reason = await character_hooks.name_block_reason(config_manager, name)
+    if reason is None:
         return None
+    if reason == character_hooks.NAME_AMBIGUOUS:
+        return _cloudsave_error_response(
+            "VISIT_DATA_AMBIGUOUS",
+            "This character's visit data from an unfinished rename cannot be separated automatically, because "
+            "its old name is now used by another character. Delete one of the two characters, then download again.",
+            status_code=409,
+            character_name=name,
+        )
     return _cloudsave_error_response(
         "VISIT_DATA_BUSY",
         "Visit data under this name is still being sorted out (a character with this name was just "

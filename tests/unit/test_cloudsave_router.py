@@ -2169,9 +2169,9 @@ async def test_cloudsave_forced_overwrite_keeps_the_session_when_the_name_is_bus
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_cloudsave_overwrite_is_not_blocked_by_a_rename_ambiguous_for_good(monkeypatch):
-    # 改名标记永久 ambiguous（旧名已被另一个角色占着）：重试也解不开，与删除路径一样放行覆盖下载，
-    # 否则用户只会一直看到「请稍后再试」
+async def test_cloudsave_overwrite_of_a_rename_ambiguous_for_good_asks_to_delete_one(monkeypatch):
+    # 改名标记永久 ambiguous（旧名已被另一个角色占着）：覆盖会换掉角色身份（uid），之后对账再也退役不了
+    # 它的数据，所以照样拦住；但重试解不开，提示改成「先删除其中一个角色」而不是「请稍后再试」
     from main_logic.visit.subjects import set_roster_marker
 
     async with _visit_download_env(monkeypatch, target_name="云端角色") as (target_cm, download, _retire_state):
@@ -2185,8 +2185,11 @@ async def test_cloudsave_overwrite_is_not_blocked_by_a_rename_ambiguous_for_good
         assert uid and get_character_uid(loaded["旧名"]) not in (None, uid)
         marker = {"old": "旧名", "new": "云端角色", "uid": uid}
         await set_roster_marker(target_cm.config_dir, "pending_rename", marker)
-        # 变异：ambiguous 也挡必红
-        result = await download(overwrite=True)
-        assert result["success"] is True
+        response = await download(overwrite=True)
+        payload = json.loads(response.body)
+        # 变异：ambiguous 放行 / 按「稍后再试」答复必红
+        assert response.status_code == 409 and payload["code"] == "VISIT_DATA_AMBIGUOUS"
+        _assert_localized_error_payload(payload, "cloudsave.error.visitDataAmbiguous")
+        assert get_character_uid(target_cm.load_characters()["猫娘"]["云端角色"]) == uid
         peers = json.loads((Path(target_cm.config_dir) / "visit_peers.json").read_text(encoding="utf-8"))
         assert peers["pending_rename"] == marker
