@@ -812,7 +812,9 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     visit_id = spool.visit_id
     current = state["debrief_choice"]
     if current == "preview:diary":
-        # 预览已落盘：只复用，不再生成
+        # 预览已落盘：只复用，不再生成。前面解析角色名有 await：回给页面前再核一次账号
+        if await own_visit_uid() != state["own_uid"]:
+            return 404, {"error": "unknown_or_expired"}
         return 200, {"ok": True, "applied": "preview", "preview": dict(state["debrief_pending"])}
     if current not in _CHIP_CHOICES:
         return _already_chosen(state)

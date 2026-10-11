@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -42,6 +43,7 @@ from utils.file_utils import atomic_write_json
 __all__ = [
     "RECENT_IDEMPOTENCY_META_KEY",
     "RETIRED_KEYS_FILENAME",
+    "VISIT_DIARY_KEY_RE",
     "RecentFileDeletedError",
     "RecentGenerationConflictError",
     "acquire_recent_file_locks",
@@ -518,10 +520,14 @@ RETIRED_KEYS_FILENAME = "recent.retired_keys.json"
 RECENT_IDEMPOTENCY_META_KEY = "idempotency_key"
 """Message metadata key carrying the idempotency key of a keyed ``/cache`` write."""
 
+VISIT_DIARY_KEY_RE = re.compile(r"^visit-debrief:[A-Za-z0-9_-]{22}$")
+"""The only keyed recent entries: one visit's diary (an assistant message), ``visit-debrief:{visit_id}``."""
+
 _KEY_MARKER = '"' + RECENT_IDEMPOTENCY_META_KEY + '"'
 
 
 def _entry_key(entry: Any) -> str | None:
+    # 只认串门日记：AI 消息、键格式完整。普通消息里调用方带的同名 metadata 不是写过的证据
     if not isinstance(entry, dict):
         return None
     meta = entry.get("metadata")
@@ -529,7 +535,10 @@ def _entry_key(entry: Any) -> str | None:
         data = entry.get("data")
         meta = data.get("metadata") if isinstance(data, dict) else None
     key = meta.get(RECENT_IDEMPOTENCY_META_KEY) if isinstance(meta, dict) else None
-    return key if isinstance(key, str) and key else None
+    kind = entry.get("type") or ("ai" if entry.get("role") == "assistant" else entry.get("role"))
+    if kind != "ai" or not isinstance(key, str) or VISIT_DIARY_KEY_RE.fullmatch(key) is None:
+        return None
+    return key
 
 
 def keyed_entry_keys(payload: Any) -> set[str]:

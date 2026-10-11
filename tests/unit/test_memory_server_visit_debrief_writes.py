@@ -48,6 +48,8 @@ pytestmark = pytest.mark.unit
 NAME = "Neko"
 VISIT = "AbCdEfGhIjKlMnOpQrStUv"
 KEY = f"visit-debrief:{VISIT}"
+K1, K2, K3 = (f"visit-debrief:{c * 22}" for c in "123")
+KDONE, KPEND = "visit-debrief:" + "D" * 22, "visit-debrief:" + "P" * 22
 
 
 class FakeTimeIndex:
@@ -311,13 +313,13 @@ def _keyed_entry(text, key):
 
 def test_rewrites_record_dropped_keyed_entries(tmp_path):
     path = str(tmp_path / "recent.json")
-    recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("d", "k1"), HumanMessage(content="h")]))
+    recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("d", K1), HumanMessage(content="h")]))
     recent_file.write_recent_payload(path, messages_to_dict([HumanMessage(content="h")]))
-    assert set(recent_file.read_retired_keys(path)) == {"k1"}
+    assert set(recent_file.read_retired_keys(path)) == {K1}
     # 已记的键保留第一次的时间
-    first = recent_file.read_retired_keys(path)["k1"]
+    first = recent_file.read_retired_keys(path)[K1]
     recent_file.write_recent_payload(path, [])
-    assert recent_file.read_retired_keys(path)["k1"] == first
+    assert recent_file.read_retired_keys(path)[K1] == first
     # recent.json 的根仍是 list
     assert isinstance(json.loads(Path(path).read_text(encoding="utf-8")), list)
 
@@ -332,7 +334,7 @@ def test_unkeyed_rewrites_leave_no_sidecar(tmp_path):
 def test_sidecar_is_written_before_recent_is_replaced(tmp_path, monkeypatch):
     # 故障注入：写完旁路、替换 recent.json 之前崩溃 → 键已记、条目仍在，两者都是「写过」的证据
     path = str(tmp_path / "recent.json")
-    recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("d", "k1")]))
+    recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("d", K1)]))
 
     real = recent_file.atomic_write_json
 
@@ -344,8 +346,8 @@ def test_sidecar_is_written_before_recent_is_replaced(tmp_path, monkeypatch):
     monkeypatch.setattr(recent_file, "atomic_write_json", crash)
     with pytest.raises(OSError):
         recent_file.write_recent_payload(path, [])
-    assert recent_file.keyed_entry_keys(json.loads(Path(path).read_text(encoding="utf-8"))) == {"k1"}
-    assert "k1" in recent_file.read_retired_keys(path)
+    assert recent_file.keyed_entry_keys(json.loads(Path(path).read_text(encoding="utf-8"))) == {K1}
+    assert K1 in recent_file.read_retired_keys(path)
 
 
 async def test_manager_keyed_append_sees_present_and_retired_keys(tmp_path, monkeypatch):
@@ -353,13 +355,13 @@ async def test_manager_keyed_append_sees_present_and_retired_keys(tmp_path, monk
     monkeypatch.setattr("memory.recent.assert_cloudsave_writable", lambda *a, **k: None)
     path = str(tmp_path / "recent.json")
     mgr = _recent_manager(path)
-    assert await mgr.append_keyed([_keyed_entry("d", "k1")], NAME, "k1") == "written"
-    assert await mgr.append_keyed([_keyed_entry("d", "k1")], NAME, "k1") == "present"
+    assert await mgr.append_keyed([_keyed_entry("d", K1)], NAME, K1) == "written"
+    assert await mgr.append_keyed([_keyed_entry("d", K1)], NAME, K1) == "present"
     await mgr.update_history([HumanMessage(content="x")], NAME, compress=False)
     with recent_file.recent_file_access(path) as resolved:
         recent_file.write_recent_payload_unlocked(resolved, messages_to_dict([HumanMessage(content="x")]))
     mgr.user_histories.clear()
-    assert await mgr.append_keyed([_keyed_entry("d", "k1")], NAME, "k1") == "retired"
+    assert await mgr.append_keyed([_keyed_entry("d", K1)], NAME, K1) == "retired"
     assert recent_file.keyed_entry_keys(json.loads(Path(path).read_text(encoding="utf-8"))) == set()
 
 
@@ -367,31 +369,31 @@ def test_cloud_apply_records_keys_before_replacing_recent(tmp_path):
     from utils.cloudsave_runtime.staging import retire_recent_keys_before_replace
 
     target = tmp_path / "recent.json"
-    recent_file.write_recent_payload(str(target), messages_to_dict([_keyed_entry("d", "k1")]))
+    recent_file.write_recent_payload(str(target), messages_to_dict([_keyed_entry("d", K1)]))
     staged = tmp_path / "staged.json"
     staged.write_text("[]", encoding="utf-8")
     retire_recent_keys_before_replace(target, staged)
-    assert "k1" in recent_file.read_retired_keys(str(target))
-    recent_file.write_recent_payload(str(target), messages_to_dict([_keyed_entry("d", "k3")]))
+    assert K1 in recent_file.read_retired_keys(str(target))
+    recent_file.write_recent_payload(str(target), messages_to_dict([_keyed_entry("d", K3)]))
     retire_recent_keys_before_replace(target, None)
-    assert "k3" in recent_file.read_retired_keys(str(target))
+    assert K3 in recent_file.read_retired_keys(str(target))
 
 
 async def test_cleanup_drops_old_records_of_terminal_keys_only(env):
     from app.memory_server import idempotency
 
     path = os.path.join(str(env.root), NAME, "recent.json")
-    recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("a", "done-key"),
-                                                             _keyed_entry("b", "pending-key")]))
+    recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("a", KDONE),
+                                                             _keyed_entry("b", KPEND)]))
     recent_file.write_recent_payload(path, [])
-    await idempotency.update_key(NAME, "done-key", idempotency.transition(idempotency.KEY_STATE_DONE))
-    await idempotency.update_key(NAME, "pending-key", idempotency.transition(idempotency.KEY_STATE_PENDING))
+    await idempotency.update_key(NAME, KDONE, idempotency.transition(idempotency.KEY_STATE_DONE))
+    await idempotency.update_key(NAME, KPEND, idempotency.transition(idempotency.KEY_STATE_PENDING))
     report = await idempotency.cleanup_expired([NAME], ttl_s=0, now=10**12)
     assert report["retired_removed"] == 1
     # pending 键的退役记录不过期：它是「已写过 recent」的唯一证据
-    assert set(recent_file.read_retired_keys(path)) == {"pending-key"}
+    assert set(recent_file.read_retired_keys(path)) == {KPEND}
     # done 键记录本身永久保留
-    assert (await idempotency.read_key(NAME, "done-key"))["state"] == "done"
+    assert (await idempotency.read_key(NAME, KDONE))["state"] == "done"
 
 
 def test_only_the_shared_writer_and_cloud_apply_replace_recent_json():
@@ -655,9 +657,9 @@ async def test_cleanup_reads_key_records_under_the_recent_lock(env, monkeypatch)
     from app.memory_server import idempotency
 
     path = os.path.join(str(env.root), NAME, "recent.json")
-    recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("a", "done-key")]))
+    recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("a", KDONE)]))
     recent_file.write_recent_payload(path, [])
-    await idempotency.update_key(NAME, "done-key", idempotency.transition(idempotency.KEY_STATE_DONE))
+    await idempotency.update_key(NAME, KDONE, idempotency.transition(idempotency.KEY_STATE_DONE))
     real = recent_file.prune_retired_keys
 
     def restore_then_prune(target, should_drop):
@@ -667,7 +669,7 @@ async def test_cleanup_reads_key_records_under_the_recent_lock(env, monkeypatch)
     monkeypatch.setattr(recent_file, "prune_retired_keys", restore_then_prune)
     report = await idempotency.cleanup_expired([NAME], ttl_s=0, now=10**12)
     assert report["retired_removed"] == 0
-    assert "done-key" in recent_file.read_retired_keys(path)
+    assert KDONE in recent_file.read_retired_keys(path)
 
 
 # ── 评审第 5 轮 ──────────────────────────────────────────────────────────
@@ -700,12 +702,12 @@ def test_extraction_skips_only_well_formed_diary_keys():
 
 def test_a_deeply_nested_sidecar_does_not_block_recent_writes(tmp_path):
     path = str(tmp_path / "recent.json")
-    recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("d", "k1")]))
+    recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("d", K1)]))
     sidecar = recent_file.recent_sidecar_path(path, recent_file.RETIRED_KEYS_FILENAME)
     Path(sidecar).write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
     recent_file.write_recent_payload(path, [])
     assert json.loads(Path(path).read_text(encoding="utf-8")) == []
-    assert "k1" in recent_file.read_retired_keys(path)
+    assert K1 in recent_file.read_retired_keys(path)
 
 
 # ── 评审第 7 轮 ──────────────────────────────────────────────────────────
@@ -733,3 +735,18 @@ def test_a_time_index_row_without_timestamp_is_completed(tmp_path, monkeypatch):
     with engine.connect() as conn:
         stamps = conn.execute(text(f"SELECT timestamp FROM {TIME_ORIGINAL_TABLE_NAME}")).fetchall()
     assert stamps and all(row[0] is not None for row in stamps)
+
+
+
+# ── 评审第 8 轮 ──────────────────────────────────────────────────────────
+
+
+def test_only_well_formed_diary_entries_count_as_retired_evidence(tmp_path):
+    # 普通消息里调用方带的同名 metadata（格式不对、或不是 AI 消息）不是「写过」的证据，也不进旁路
+    path = str(tmp_path / "recent.json")
+    human = {"type": "human", "data": {"content": "x", "metadata": {"idempotency_key": KEY}}}
+    odd = messages_to_dict([_keyed_entry("y", "visit-debrief:manual")])[0]
+    recent_file.write_recent_payload(path, [human, odd])
+    assert recent_file.keyed_entry_keys([human, odd]) == set()
+    recent_file.write_recent_payload(path, [])
+    assert not os.path.exists(recent_file.recent_sidecar_path(path, recent_file.RETIRED_KEYS_FILENAME))

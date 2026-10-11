@@ -936,3 +936,19 @@ async def test_both_writes_run_with_the_character_lifecycle_held(env, monkeypatc
     assert (await choose("confirm"))[0] == 200
     assert held["uids"] == [CHAR_UID_A]
     assert seen == [("facts", True), ("cache", True)]
+
+
+# ── 评审第 8 轮 ──────────────────────────────────────────────────────────
+
+
+async def test_a_cached_preview_is_not_returned_to_another_account(env, monkeypatch):
+    await visit(env)
+    await preview(env)
+    from main_logic.visit import local_chars
+
+    async def resolve_then_switch(uid):
+        env.account = OWN_B  # 解析角色名的这段 await 里换了账号
+        return "A"
+
+    monkeypatch.setattr(local_chars, "resolve_char_name", resolve_then_switch)
+    assert await choose("diary") == (404, {"error": "unknown_or_expired"})

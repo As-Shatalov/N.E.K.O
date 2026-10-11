@@ -1243,8 +1243,9 @@ async def cache_conversation(request: HistoryRequest, lanlan_name: str):
 
 # ── keyed private /cache and visit facts (catgirl visit "keep as diary", OD-16 v4) ──
 
-_KEYED_CACHE_KEY_RE = re.compile(r"^visit-debrief:[A-Za-z0-9_-]{22}$")
-"""The only keyed private ``/cache`` writes: one visit's diary entry (``visit-debrief:{visit_id}``)."""
+from utils.recent_file import VISIT_DIARY_KEY_RE as _KEYED_CACHE_KEY_RE  # noqa: E402
+
+# The only keyed private ``/cache`` writes: one visit's diary entry (``visit-debrief:{visit_id}``).
 
 _VISIT_FACT_IMPORTANCE = 4
 """Below the reflection threshold (5): visit facts are recalled but never synthesized."""
