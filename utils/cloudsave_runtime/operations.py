@@ -326,12 +326,14 @@ def _replaced_local_characters(config_manager, kept_character_map: dict[str, Any
     return replaced
 
 
-def _fresh_character_names(config_manager, kept_character_map: dict[str, Any]) -> frozenset[str]:
+def _fresh_character_names(config_manager, kept_character_map: dict[str, Any]) -> dict[str, str | None]:
     """Names the snapshot gives to characters new to this machine (a uid, or else a name, none had).
 
-    Entries the visit roster holds under such a name belong to whichever
-    local character had it before; the new character starts with none. A
-    missing or unreadable runtime file reports nothing.
+    Maps each name to the uid of the local character that held it before
+    the import (``None``: no local character had it; ``""``: one without a
+    uid). Entries the visit roster holds under such a name belong to that
+    holder; the new character starts with none. A missing or unreadable
+    runtime file reports nothing.
     """
     from utils.config_manager import get_character_uid
 
@@ -339,18 +341,20 @@ def _fresh_character_names(config_manager, kept_character_map: dict[str, Any]) -
         with open(config_manager.get_runtime_config_path("characters.json"), "r", encoding="utf-8") as f:
             payload = json.load(f)
     except (OSError, ValueError, RecursionError):
-        return frozenset()
+        return {}
     local_map = payload.get("猫娘") if isinstance(payload, dict) else None
     if not isinstance(local_map, dict):
-        return frozenset()
+        return {}
     local_uids = {get_character_uid(data) for data in local_map.values() if isinstance(data, dict)}
-    fresh = set()
+    fresh: dict[str, str | None] = {}
     for name, data in kept_character_map.items():
         uid = get_character_uid(data) if isinstance(data, dict) else None
         # 没有 uid 的按名字认：本机原来没有这个名字就是新带来的
         if (uid not in local_uids) if uid else (name not in local_map):
-            fresh.add(name)
-    return frozenset(fresh)
+            holder = local_map.get(name)
+            fresh[name] = None if name not in local_map else (
+                (get_character_uid(holder) if isinstance(holder, dict) else None) or "")
+    return fresh
 
 
 def _preserve_local_character_ids(character_map: dict[str, Any], local_character_map: Any) -> None:
@@ -1663,7 +1667,8 @@ def import_local_cloudsave_snapshot(
     full-runtime snapshot), the names of the local characters it keeps and
     the ``{old, new, uid}`` of the local characters it keeps under another
     name, plus ``fresh_names=`` the names it gives to characters new to this
-    machine and ``replaced=`` the ``{name, character_uid}`` of local
+    machine (mapped to the uid of their previous local holder, ``None`` for
+    none) and ``replaced=`` the ``{name, character_uid}`` of local
     characters it keeps by name under a new uid, right before the first
     runtime file is written.
     Data owned by other layers (the visit roster) can so record what to
@@ -1841,7 +1846,7 @@ def import_local_cloudsave_snapshot(
         fresh_character_names = (
             _fresh_character_names(config_manager, characters_payload["猫娘"])
             if on_characters_removed is not None
-            else frozenset()
+            else {}
         )
         replaced_characters = (
             _replaced_local_characters(config_manager, characters_payload["猫娘"])

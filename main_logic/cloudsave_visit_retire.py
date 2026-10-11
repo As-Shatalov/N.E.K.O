@@ -23,7 +23,8 @@ import) is loaded only when an import really removes a character.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
+from types import MappingProxyType
 from pathlib import Path, PurePath
 from typing import Any
 
@@ -48,7 +49,7 @@ def removed_characters_recorder(
 
     def record(
         removed: list[dict[str, Any]], kept_local_names: frozenset[str], renamed: list[dict[str, str]],
-        fresh_names: frozenset[str] = frozenset(),
+        fresh_names: Mapping[str, str | None] = MappingProxyType({}),
         replaced: Iterable[dict[str, Any]] = (),
     ) -> int:
         replaced = list(replaced)
@@ -75,8 +76,7 @@ def removed_characters_recorder(
             failure = failure or exc
         try:
             # 最后标交出去的名字：刚写下的改名标记与之前没对完账的都要看
-            removed_uids = [entry.get("character_uid") for entry in [*removed, *replaced]]
-            recorded += record_handed_over_names_sync(config_dir, fresh_names, removed_uids)
+            recorded += record_handed_over_names_sync(config_dir, fresh_names, [*removed, *replaced])
         except Exception as exc:  # noqa: BLE001
             failure = failure or exc
         if failure is not None:

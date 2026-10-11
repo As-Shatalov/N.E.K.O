@@ -91,7 +91,7 @@ def test_full_snapshot_reports_the_removed_character_before_committing(pair):
     result = CloudSaveManager(target_cm).import_if_needed(reason="unit", force=True, on_characters_removed=record)
     assert result["action"] == "imported"
     # 云端角色是快照新带来的，不算「保留下来的本地角色」
-    assert seen == [([{"name": "本地角色", "character_uid": uid}], frozenset(), [], frozenset({"云端角色"}),
+    assert seen == [([{"name": "本地角色", "character_uid": uid}], frozenset(), [], {"云端角色": None},
                      {"本地角色"})]
     assert _names_on_disk(target_cm) == {"云端角色"}
 
@@ -107,7 +107,7 @@ def test_import_without_removals_reports_only_the_new_names(pair):
         on_characters_removed=lambda removed, _kept, renamed, fresh_names, replaced: seen.append(
             (removed, renamed, fresh_names, replaced)),
     )
-    assert seen == [([], [], frozenset({"云端角色"}), [])]
+    assert seen == [([], [], {"云端角色": None}, [])]
     assert {"本地角色", "云端角色"} <= _names_on_disk(target_cm)
 
 
@@ -180,7 +180,8 @@ def test_removed_characters_come_from_the_runtime_file_only(pair, tmp_path):
     assert operations._removed_local_characters(target_cm, reused) == (
         [], frozenset({"本地角色"}), [{"old": "本地角色", "new": "新名字", "uid": uid}],
     )
-    assert operations._fresh_character_names(target_cm, reused) == frozenset({"本地角色"})
+    # 新名字连同导入前的主人一起报出：这里是改名的这个角色自己
+    assert operations._fresh_character_names(target_cm, reused) == {"本地角色": uid}
     assert operations._removed_local_characters(target_cm, {"本地角色": {}}) == ([], frozenset({"本地角色"}), [])
     # 文件读不出：什么都不报（变异：退回 load_characters 的默认角色必红）
     path = Path(target_cm.get_runtime_config_path("characters.json"))
@@ -290,7 +291,7 @@ async def test_a_snapshot_rename_moves_the_visit_data_to_the_new_name(tmp_path):
     import_local_cloudsave_snapshot(target_cm, on_characters_removed=removed_characters_recorder(target_cm))
     peers = json.loads((config_dir / "visit_peers.json").read_text(encoding="utf-8"))
     # 变异：不记改名必红（旧名下的对端没人迁，以后同名新角色会继承）
-    assert peers["pending_rename"] == {"old": "本地角色", "new": "新名字", "uid": uid}
+    assert peers["pending_rename"] == {"old": "本地角色", "new": "新名字", "uid": uid, "source": "cloudsave"}
     assert "pending_retire" not in peers
     # 启动对账按 uid 正向迁移
     assert await lc.reconcile_rename(config_dir, {"新名字"}, {"新名字": uid}) == frozenset()
@@ -330,7 +331,7 @@ async def test_a_snapshot_rename_queues_behind_an_earlier_pending_rename(tmp_pat
     assert lc.record_renamed_characters_sync(config_dir, [item]) == 1
     peers = json.loads((config_dir / "visit_peers.json").read_text(encoding="utf-8"))
     assert peers["pending_rename"] == earlier
-    assert peers["pending_rename_queue"] == [item]
+    assert peers["pending_rename_queue"] == [{**item, "source": "cloudsave"}]
     assert await lc.name_marker_state(config_dir, "A") == lc.NAME_RENAMING
     assert await lc.name_marker_state(config_dir, "C") == lc.NAME_RENAMING
 
@@ -450,6 +451,29 @@ async def test_a_same_name_uid_replacement_retires_the_other_name_of_its_pending
     assert await roster.get_char_entry(PEER_Y, "本地角色") is not None
 
 
+async def test_handed_over_skips_names_another_local_character_held_before_the_import(tmp_path):
+    from main_logic.visit.subjects import set_roster_marker
+
+    marker = {"old": "A", "new": "B", "uid": "c" * 32}
+    await set_roster_marker(tmp_path, "pending_rename", marker)
+    # A 导入前归本机另一个角色 V（标记因此本就分不开）；快照把 V 换成新角色 W：
+    # A 下的条目有 V 的，不能整个迁给这笔改名（变异：不看导入前的主人必红）
+    assert lc.record_handed_over_names_sync(tmp_path, {"A": "v" * 32}, []) == 0
+    assert json.loads((tmp_path / "visit_peers.json").read_text(encoding="utf-8"))["pending_rename"] == marker
+    # 导入前没人用、或就是这个角色自己的：照记
+    assert lc.record_handed_over_names_sync(tmp_path, {"A": "c" * 32}, []) == 1
+
+
+async def test_a_removed_uid_less_character_does_not_hide_unrelated_uid_less_markers(tmp_path):
+    from main_logic.visit.subjects import set_roster_marker
+
+    # 启动导入早于补发 uid：被删的角色可能没有 uid。它不该把所有没 uid 的改名标记都当成自己的
+    # （变异：按 uid 比对 None 必红）
+    await set_roster_marker(tmp_path, "pending_rename", {"old": "A", "new": "B"})
+    assert lc.record_handed_over_names_sync(
+        tmp_path, {"A": None}, [{"name": "Z", "character_uid": None}]) == 1
+
+
 def test_two_local_characters_trading_names_are_not_migrated(pair):
     _source_cm, target_cm = pair
     uid = _local_uid(target_cm)
@@ -477,7 +501,8 @@ async def test_a_rename_whose_old_name_goes_to_a_new_character_still_migrates(tm
     record = removed_characters_recorder(SimpleNamespace(config_dir=str(config_dir)))
     record([], frozenset(), [{"old": "A", "new": "C", "uid": uid}], frozenset({"A"}))
     peers = json.loads((config_dir / "visit_peers.json").read_text(encoding="utf-8"))
-    assert peers["pending_rename"] == {"old": "A", "new": "C", "uid": uid, "handed_over": ["A"]}
+    assert peers["pending_rename"] == {"old": "A", "new": "C", "uid": uid, "source": "cloudsave",
+                                       "handed_over": ["A"]}
     unsettled = await lc.reconcile_renames(config_dir, {"A", "C"}, {"A": newcomer, "C": uid})
     # 变异：不记 handed_over / 对账不认 handed_over 必红（新角色 A 继承原角色的对端）
     assert unsettled == frozenset()

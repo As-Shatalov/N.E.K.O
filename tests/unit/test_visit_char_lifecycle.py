@@ -831,3 +831,44 @@ async def test_startup_recovery_skips_the_names_of_renames_still_queued(tmp_path
     # 变异：只跳过位置上的两个名字必红（Q 的逐场补录会按新名找不到条目、记成已完成）
     assert report.renamed is False
     assert skipped and {"A", "X", "P", "Q"} <= set(skipped[0])
+
+
+# ── 云快照改名的回滚、链式中间名、已清完名册的退役 ─────────────────────
+
+
+async def test_a_rolled_back_cloudsave_rename_is_cleared_without_moving_anything_back(tmp_path):
+    # 快照要把 uid A 从 A 改成 B、并删掉原来叫 B 的角色；导入回滚：两个角色都还在
+    roster = await seed_roster(tmp_path, own_char="A")
+    await seed_roster(tmp_path, peer_uid=PEER_Y, tag=TAG_Y, own_char="B")
+    await make_visit(tmp_path, vid(3), [ln(1)], own_char="B", own_char_uid=CHAR_UID_B)
+    marker = {"old": "A", "new": "B", "uid": CHAR_UID_A, "source": lc.CLOUDSAVE_SOURCE}
+    await set_roster_marker(tmp_path, "pending_rename", marker)
+    assert await lc.reconcile_rename(tmp_path, {"A", "B"}, {"A": CHAR_UID_A, "B": CHAR_UID_B}) == frozenset()
+    # 变异：按普通改名反向改写必红（B 的真实条目与场次被搬进 A）
+    assert await roster.get_char_entry(PEER_Y, "B") is not None
+    assert await roster.get_char_entry(PEER_Y, "A") is None
+    assert await _state_char(tmp_path, vid(3)) == "B"
+    assert "pending_rename" not in _peers(tmp_path)
+
+
+async def test_a_chained_rename_moves_the_entries_under_every_intermediate_name(tmp_path):
+    roster = await seed_roster(tmp_path, own_char="A")
+    await seed_roster(tmp_path, peer_uid=PEER_Y, tag=TAG_Y, own_char="C")
+    await make_visit(tmp_path, vid(3), [ln(1)], own_char="C", own_char_uid=CHAR_UID_A)
+    # A -> B 没对完账期间又叫过 C、现在叫 D：C 下串门留下的条目同样是它的（变异：只迁 old / new 必红）
+    await set_roster_marker(tmp_path, "pending_rename",
+                            {"old": "A", "new": "B", "uid": CHAR_UID_A, "chained": ["C", "D"]})
+    assert await lc.reconcile_rename(tmp_path, {"D"}, {"D": CHAR_UID_A}) == frozenset()
+    assert await roster.get_char_entry(PEER_X, "D") is not None
+    assert await roster.get_char_entry(PEER_Y, "D") is not None and await roster.get_char_entry(PEER_Y, "C") is None
+    assert await _state_char(tmp_path, vid(3)) == "D"
+
+
+async def test_a_rename_does_not_wait_for_a_retirement_whose_roster_step_is_done(tmp_path):
+    roster = await _visit_data(tmp_path)
+    await set_roster_marker(tmp_path, "pending_rename", {"old": "A", "new": "A2", "uid": CHAR_UID_A})
+    # 退役 A2 时按名字清名册那一步已做完，只剩按 uid 的步骤（比如人设被锁）补不完：
+    # 迁进来的条目不会再被清，改名不必等（变异：照样等必红）
+    await add_roster_marker_item(tmp_path, "pending_retire", {**lc.retire_item("A2", CHAR_UID_B), "roster_done": True})
+    assert await lc.reconcile_rename(tmp_path, {"A2"}, {"A2": CHAR_UID_A}) == frozenset()
+    assert await roster.get_char_entry(PEER_X, "A2") is not None

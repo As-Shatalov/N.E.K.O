@@ -87,6 +87,8 @@ logger = get_module_logger(__name__, "Main")
 PENDING_RENAME = "pending_rename"
 PENDING_RENAME_QUEUE = "pending_rename_queue"
 PENDING_RETIRE = "pending_retire"
+CLOUDSAVE_SOURCE = "cloudsave"
+"""``source`` of a rename marker a cloudsave import wrote: nothing is migrated before startup recovery."""
 
 RetirePersona = Callable[[str], Awaitable[Any]]
 """``retire_persona(character_uid)``: delete the visit persona of a deleted character."""
@@ -196,38 +198,50 @@ async def reconcile_rename(
         # 云快照导入把名字交给了本机原来没有的角色（handed_over）：导入那一刻这个名字下的条目
         # 都还是这个角色的，新角色不能继承，照常迁走
         handed = _handed_over_names(marker)
-        reused = any(name in uid_of and uid_of[name] != uid and name not in handed for name in (old, new))
+        held = rename_marker_names(marker) or (old, new)
+        reused = any(name in uid_of and uid_of[name] != uid and name not in handed for name in held)
         forward = new in current and not reused
         backward = old in current and not forward and not reused
         deleted = not current
-        # 这个角色又被改到第三个名字（云快照导入带来的改名，标记位被这笔占着、没能另记）：
-        # 旧名与新名下的条目都还是它的，一起迁到它现在的名字
+        # 这个角色又被改到别的名字（云快照导入带来的改名，标记位被这笔占着、没能另记，名字记在
+        # chained 里）：标记涉及的每个名字下的条目都还是它的，一起迁到它现在的名字
         moved = len(current) == 1 and not current & {old, new} and not reused
     else:
+        held = (old, new)
         forward = new in names and old not in names
         backward = old in names and new not in names
         deleted = old not in names and new not in names
         moved = False
-    target = new if forward else next(iter(current)) if moved else old if backward and undo_moves else None
+    # 云快照导入记下的改名：迁移只在启动对账里做，导入回滚时什么都没迁过。不能按普通改名
+    # 反向改写——新名下是本机另一个角色（导入要删它、但跟着一起回滚了）的真实数据
+    from_cloudsave = marker.get("source") == CLOUDSAVE_SOURCE
+    undo = undo_moves and not from_cloudsave
+    if from_cloudsave and uid is not None and uid_of is not None and old in current and not forward:
+        # 导入回滚了（这个角色还叫旧名）：什么都没迁过，新名被别的角色占着也无所谓，直接撤标记
+        backward = True
+    target = new if forward else next(iter(current)) if moved else old if backward and undo else None
     if target is not None:
         try:
             retiring = await read_roster_marker(config_dir, PENDING_RETIRE)
         except RosterCorruptError as exc:
             logger.error("visit recovery: roster unreadable, rename not reconciled: %s", exc)
             return ALL_NAMES
-        if isinstance(retiring, list) and any((_item_fields(item) or ("", None))[0] == target for item in retiring):
+        # 按名字清名册那一步已做完的退役项（roster_done）不再碰这个名字：剩下的按 uid 的步骤
+        # 补不完也不影响迁进来的条目，不能让改名跟着一直等
+        if isinstance(retiring, list) and any(
+                (_item_fields(item) or ("", None))[0] == target and item.get("roster_done") is not True
+                for item in retiring):
             # 目标名字下还有已删除角色的残留没退役完：先迁进去，之后按名字退役会连这个角色的条目一起删。
             # 留着标记等退役补完（启动恢复先补退役、再对账）
             logger.warning("visit recovery: pending_rename %r -> %r waits for the retirement of %r", old, new, target)
             return frozenset({old, new})
-    if forward:
-        await roster.rename_char(old, new)
-        await VisitSpool.rename_own_char(config_dir, old, new)
-    elif moved:
-        for name in (old, new):
-            await roster.rename_char(name, target)
-            await VisitSpool.rename_own_char(config_dir, name, target)
-    elif backward and not undo_moves:
+    if forward or moved:
+        # 标记涉及的每个名字（含 chained 记下的中间名字）下的条目都迁到它现在的名字
+        for name in held:
+            if name != target:
+                await roster.rename_char(name, target)
+                await VisitSpool.rename_own_char(config_dir, name, target)
+    elif backward and not undo:
         # 事务自己收尾：迁移只在提交之后做，回滚时什么都没动过。不能反向改写——新名下
         # 若有已删除角色的残留数据，会被错挂到这个角色名下
         pass
@@ -668,7 +682,7 @@ def record_renamed_characters_sync(config_dir: str | Path, renamed: Iterable[Map
             continue
         if not _has_visit_files_sync(config_dir, uid):
             continue
-        marker = {"old": old, "new": new, "uid": uid}
+        marker = {"old": old, "new": new, "uid": uid, "source": CLOUDSAVE_SOURCE}
         ok, existing = set_roster_marker_sync(config_dir, PENDING_RENAME, marker)
         if ok:
             written += 1
@@ -690,7 +704,8 @@ def record_renamed_characters_sync(config_dir: str | Path, renamed: Iterable[Map
 
 
 def record_handed_over_names_sync(
-    config_dir: str | Path, fresh_names: Iterable[str], removed_uids: Iterable[str] = (),
+    config_dir: str | Path, fresh_names: Mapping[str, str | None] | Iterable[str],
+    removed: Iterable[Mapping[str, Any]] = (),
 ) -> int:
     """Mark the names a cloudsave import gives to new characters on the pending renames still holding them.
 
@@ -699,23 +714,35 @@ def record_handed_over_names_sync(
     of them to a character new to this machine, those entries remain the
     renamed character's and the marker records the name as ``handed_over``
     (otherwise the reconciliation would see the name reused and keep the
-    entries there, for the new character to inherit). Renames of removed
-    characters are left to their retirement. Returns the markers updated.
+    entries there, for the new character to inherit). ``fresh_names`` maps
+    each such name to the uid of its holder before the import (``None``: no
+    local character had it): a name another local character held stays as
+    it is, its entries mixed with that character's. Renames of removed
+    characters (``{name, character_uid}``; a uid-less one by name) are left
+    to their retirement. Returns the markers updated.
     """
     config_dir = Path(config_dir)
-    fresh = frozenset(fresh_names)
-    gone = set(removed_uids)
+    fresh = dict(fresh_names) if isinstance(fresh_names, Mapping) else dict.fromkeys(fresh_names)
+    removed = list(removed)
+    gone_uids = {entry.get("character_uid") for entry in removed if entry.get("character_uid")}
+    gone_names = {entry.get("name") for entry in removed if not entry.get("character_uid")}
     if not fresh or not _may_exist(config_dir / VISIT_PEERS_FILENAME):
         return 0
     updated = 0
     slot, queued = read_roster_markers_sync(config_dir, PENDING_RENAME, PENDING_RENAME_QUEUE)
     queued = _queued_renames(queued)
     for key, marker in [(PENDING_RENAME, slot)] + [(PENDING_RENAME_QUEUE, item) for item in queued]:
-        if not isinstance(marker, dict) or marker.get("uid") in gone:
+        held = rename_marker_names(marker)
+        if held is None:
+            continue
+        marker_uid = marker.get("uid") if isinstance(marker.get("uid"), str) and marker.get("uid") else None
+        # 被删角色的改名交给它的退役；没有 uid 的标记按名字认它是不是被删的那个
+        if (marker_uid in gone_uids) if marker_uid else bool(gone_names & set(held)):
             continue
         handed = _handed_over_names(marker)
-        adding = [name for name in (marker.get("old"), marker.get("new"))
-                  if isinstance(name, str) and name in fresh and name not in handed]
+        # 导入前这个名字归本机另一个角色：条目早和它的混在一起，不能整个迁走
+        adding = [name for name in held
+                  if name in fresh and name not in handed and fresh[name] in (None, marker_uid)]
         if not adding:
             continue
         value = {**marker, "handed_over": sorted(handed | set(adding))}
