@@ -845,3 +845,36 @@ async def test_bind_replay_rechecks_the_account_after_waiting_for_the_lock(env, 
     lock.release()
     await replay
     assert socket.sent == []
+
+
+# ── 评审第 5 轮 ──────────────────────────────────────────────────────────
+
+
+async def test_startup_resume_keeps_a_newer_retry(env):
+    await visit(env)
+    await preview(env)
+    stale = await state_of(env=env)
+    env.memory.script["cache"] = [(503, {})]
+    await choose("confirm")
+    assert await armed(env) == 30
+    spool = VisitSpool(env.tmp, vid(1))
+    # 补录拿着进入 committing 之前的旧快照（没有 debrief_retry）：不能用它把 30 s 后的定时换成立即重试
+    await debrief.resume_diary_commit(spool, {**stale, "debrief_choice": "committing:diary"})
+    await asyncio.sleep(0)
+    assert len(env.sleeps) == 1 and env.memory.steps().count("cache") == 1
+
+
+async def test_startup_replay_shows_the_current_choice(env):
+    await visit(env)
+    await preview(env)
+    env.host.blocks.clear()
+    lock = debrief._visit_lock(vid(1))
+    await lock.acquire()
+    # 另一页的选择正持锁：补录的推送排在它后面，按它之后的 state 投递
+    task = asyncio.ensure_future(debrief.show_owed(env.host, vid(1), own_char="A", lang="zh"))
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+    await VisitSpool(env.tmp, vid(1)).mark_forget()
+    lock.release()
+    assert await task is False
+    assert env.host.blocks == []

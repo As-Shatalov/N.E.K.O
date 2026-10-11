@@ -550,7 +550,7 @@ def _read_current_payload_unlocked(path: Any) -> Any:
         return []
     try:
         return json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         # 旧文件已坏：比对不出移出了哪些键，照常写（坏文件本来就读不出任何条目）
         return []
 
@@ -595,7 +595,7 @@ def retire_removed_keyed_entries(path: Any, old: Any, new: Any) -> list[str]:
         return []
     try:
         data = read_retired_keys_unlocked(path)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         # 旁路坏了 / 读不出：不能因此挡住 recent.json 的写入，从这几条重新记起
         data = {}
     now = time.time()

@@ -147,7 +147,16 @@ async def render_chips(visit_id: str, *, own_char: str, status: Optional[str] = 
 
 
 async def show_owed(host: Any, visit_id: str, *, own_char: str, lang: Optional[str]) -> bool:
-    """Render the block ``visit_id`` currently owes (chips, preview or failure block) and its state frame."""
+    """Render the block ``visit_id`` currently owes (chips, preview or failure block) and its state frame.
+
+    Under the per-visit lock, from the current ``state.json``: a choice made
+    meanwhile on another page is never overtaken by an older block.
+    """
+    async with _visit_lock(visit_id):
+        return await _show_owed_locked(host, visit_id, own_char=own_char, lang=lang)
+
+
+async def _show_owed_locked(host: Any, visit_id: str, *, own_char: str, lang: Optional[str]) -> bool:
     try:
         state = await _spool(visit_id).read_state()
     except Exception as exc:  # noqa: BLE001 - 读不出：等 bind 重放
@@ -606,9 +615,17 @@ async def resume_diary_commit(spool: Any, state: Mapping[str, Any]) -> None:
     A ``next_at`` still in the future is waited for (restarts never bypass the
     backoff); a visit without ``debrief_retry`` (older version) is due now.
     """
-    retry = state.get("debrief_retry")
-    next_at = float(retry["next_at"]) if isinstance(retry, Mapping) else 0.0
-    schedule_commit_retry(spool.visit_id, next_at)
+    visit_id = spool.visit_id
+    async with _visit_lock(visit_id):
+        # 补录拿的是扫描时的快照：期间手动「写入」可能已暂时失败、排了更新的 next_at，不能用旧值覆盖
+        if visit_id in _timers:
+            return
+        current = await spool.read_state()
+        if current is None or current["debrief_choice"] != "committing:diary":
+            return
+        retry = current.get("debrief_retry")
+        next_at = float(retry["next_at"]) if isinstance(retry, Mapping) else 0.0
+        schedule_commit_retry(visit_id, next_at)
 
 
 # ── 两步提交（端点、定时重试、启动补录共用） ─────────────────────────────

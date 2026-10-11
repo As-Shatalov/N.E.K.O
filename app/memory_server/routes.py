@@ -1358,7 +1358,9 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
     fact in favour of a visit fact). A key left
     ``pending`` (crash after the facts were saved) is settled by counting the
     visit's facts in the active and archived pools, read strictly: either
-    file unreadable answers 503 and writes nothing. An empty list is a no-op
+    file unreadable answers 503 and writes nothing; the facts still missing
+    are then written (rows already there are skipped by their effect key)
+    and ``written`` counts both. An empty list is a no-op
     that still records the key.
     """
     from . import idempotency
@@ -1393,20 +1395,12 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
             # 读不了就不猜：活跃池读失败时宽松加载会把空列表缓存成事实池，写回就抹掉已有事实
             logger.warning(f"[MemoryServer] visit_facts {lanlan_name}: fact pool unreadable: {exc}")
             raise unavailable from exc
-        already = sum(
-            1 for row in rows
-            if row.get("origin") == "neko_visit" and row.get("visit_id") == req.visit_id
-        )
+        mine = [row for row in rows if row.get("origin") == "neko_visit" and row.get("visit_id") == req.visit_id]
+        already = len(mine)
+        known_effects = {row.get("effect_key") for row in mine}
         try:
-            if already:
-                # 上次已落盘、标 done 之前中断：按真实条数补记 done，不再写
-                deduped = max(len(texts) - already, 0)
-                await idempotency.update_key(
-                    lanlan_name, key,
-                    idempotency.transition(idempotency.KEY_STATE_DONE, written=already, deduped=deduped,
-                                           content_hash=facts_hash),
-                )
-                return {"ok": True, "written": already, "deduped": deduped, "duplicate": True}
+            # 上次已落盘一部分、标 done 之前中断（或之后被删 / 被恢复掉几条）：照样带 effect_key 走一遍，
+            # 已在的行按 effect_key 跳过，只补缺的；written 按真实条数算
             await idempotency.update_key(
                 lanlan_name, key,
                 idempotency.transition(idempotency.KEY_STATE_PENDING, kind="visit_facts", content_hash=facts_hash),
@@ -1432,8 +1426,9 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
                     effect_keys=[idempotency.effect_key_for(key, i) for i in range(len(extracted))],
                     visit_origin={"visit_id": req.visit_id},
                 )
-            written = len(created)
-            deduped = len(texts) - written
+            # 返回值里也有按 effect_key 重放的已在行：只算这次真正新写的
+            written = already + sum(1 for row in created if row.get("effect_key") not in known_effects)
+            deduped = max(len(texts) - written, 0)
             await idempotency.update_key(
                 lanlan_name, key,
                 idempotency.transition(idempotency.KEY_STATE_DONE, written=written, deduped=deduped),
@@ -1441,7 +1436,10 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
         except Exception as exc:  # noqa: BLE001 - 没确认：键留 pending，503 让调用方用同一 visit_id 重试
             logger.warning(f"[MemoryServer] visit_facts {lanlan_name}: not confirmed: {exc!r}")
             raise unavailable from exc
-    return {"ok": True, "written": written, "deduped": deduped}
+    body = {"ok": True, "written": written, "deduped": deduped}
+    if already:
+        body["duplicate"] = True
+    return body
 
 
 @app.get("/internal/memory/{lanlan_name}/theater/stories")

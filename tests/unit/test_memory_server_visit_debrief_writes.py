@@ -668,3 +668,41 @@ async def test_cleanup_reads_key_records_under_the_recent_lock(env, monkeypatch)
     report = await idempotency.cleanup_expired([NAME], ttl_s=0, now=10**12)
     assert report["retired_removed"] == 0
     assert "done-key" in recent_file.read_retired_keys(path)
+
+
+# ── 评审第 5 轮 ──────────────────────────────────────────────────────────
+
+
+async def test_a_pending_retry_fills_in_missing_visit_facts(env):
+    from app.memory_server import idempotency
+
+    await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
+    # 标 done 之前中断，且其中一条随后被删掉
+    rows = json.loads(Path(env.fs._facts_path(NAME)).read_text(encoding="utf-8"))
+    Path(env.fs._facts_path(NAME)).write_text(json.dumps([r for r in rows if r["text"] != "邻居家有只白猫"],
+                                                         ensure_ascii=False), encoding="utf-8")
+    env.fs._facts.pop(NAME, None)
+    data = json.loads(Path(idempotency.keys_path(NAME)).read_text(encoding="utf-8"))
+    data[f"visit-facts:{VISIT}"]["state"] = "pending"
+    Path(idempotency.keys_path(NAME)).write_text(json.dumps(data), encoding="utf-8")
+    body = await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
+    assert body["written"] == 2
+    assert sorted(r["text"] for r in _pool(env) if r.get("visit_id") == VISIT) == ["在邻居家看了星星", "邻居家有只白猫"]
+
+
+def test_extraction_skips_only_well_formed_diary_keys():
+    from app.memory_server.rows import _extract_role_tagged_messages_from_rows
+
+    manual = messages_to_dict([_keyed_entry("普通助手消息", "visit-debrief:manual")])[0]
+    rows = [(1, "s", json.dumps(manual, ensure_ascii=False))]
+    assert [m["data"]["content"] for m in _extract_role_tagged_messages_from_rows(rows)] == ["普通助手消息"]
+
+
+def test_a_deeply_nested_sidecar_does_not_block_recent_writes(tmp_path):
+    path = str(tmp_path / "recent.json")
+    recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("d", "k1")]))
+    sidecar = recent_file.recent_sidecar_path(path, recent_file.RETIRED_KEYS_FILENAME)
+    Path(sidecar).write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+    recent_file.write_recent_payload(path, [])
+    assert json.loads(Path(path).read_text(encoding="utf-8")) == []
+    assert "k1" in recent_file.read_retired_keys(path)

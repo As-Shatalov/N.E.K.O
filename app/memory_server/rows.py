@@ -27,6 +27,7 @@ No module state, no imports from sibling submodules. Precedent:
 """
 
 import json
+import re
 from datetime import datetime
 
 from memory.message_sources import is_theater_memory_message
@@ -132,13 +133,17 @@ def _extract_user_messages_from_rows(rows: list) -> list[str]:
     return user_msgs
 
 
+# 与 /cache 带键写入接受的键同一格式（app/memory_server/routes.py::_KEYED_CACHE_KEY_RE）
+_VISIT_DIARY_KEY_RE = re.compile(r"^visit-debrief:[A-Za-z0-9_-]{22}$")
+
+
 def _is_keyed_diary(msg: dict) -> bool:
     """Whether a stored message is a visit diary entry (an AI message keyed ``visit-debrief:*``)."""
     from utils.llm_client import message_metadata
     from utils.recent_file import RECENT_IDEMPOTENCY_META_KEY
 
     key = message_metadata(msg).get(RECENT_IDEMPOTENCY_META_KEY)
-    return msg.get('type') == 'ai' and isinstance(key, str) and key.startswith('visit-debrief:')
+    return msg.get('type') == 'ai' and isinstance(key, str) and _VISIT_DIARY_KEY_RE.fullmatch(key) is not None
 
 
 def _extract_role_tagged_messages_from_rows(rows: list) -> list[dict]:
