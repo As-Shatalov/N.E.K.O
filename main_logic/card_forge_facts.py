@@ -202,6 +202,17 @@ def _importance_weight(item: dict[str, Any]) -> float:
     return 1.0 + max(0, _safe_importance(item.get("importance")))
 
 
+_UNSHAREABLE_ORIGINS = frozenset({"neko_visit"})
+"""Fact origins never sampled into a community card: a visit's facts are about the neighbour's home."""
+
+
+def _shareable_facts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``items`` without facts whose ``origin`` must not leave this machine (same list when none)."""
+    if not any(isinstance(item, dict) and item.get("origin") in _UNSHAREABLE_ORIGINS for item in items):
+        return items
+    return [item for item in items if not (isinstance(item, dict) and item.get("origin") in _UNSHAREABLE_ORIGINS)]
+
+
 def _weighted_pick(items: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
     pool = [
         item
@@ -761,7 +772,7 @@ async def build_forge_facts_payload(
     )
     facts, stats = await asyncio.to_thread(
         _select_forge_facts_with_stats,
-        raw,
+        _shareable_facts(raw),
         min_importance=min_importance,
         include_absorbed=include_absorbed,
         limit=limit,
@@ -781,7 +792,7 @@ async def build_forge_facts_payload(
         # 那种行只要这轮没被抽中，就会作为"久远记忆"发出去，而它其实还活着。
         archive_facts, archive_stats = await asyncio.to_thread(
             _select_archive_facts,
-            raw_archive,
+            _shareable_facts(raw_archive),
             min_importance=min_importance,
             include_absorbed=include_absorbed,
             exclude_ids=excluded_ids,

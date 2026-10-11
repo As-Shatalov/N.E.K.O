@@ -396,14 +396,35 @@ async def test_renamed_character_gets_its_chips_under_the_new_name(monkeypatch, 
     assert _chip_ids(socket) == [chips_request_id(vid(5))]
 
 
-async def test_preview_and_failed_blocks_are_left_to_pr14(monkeypatch, tmp_path):
-    await _pending(tmp_path, 6, debrief_choice="preview:diary",
-                   debrief_pending={"diary": "d", "facts": []})
+async def test_bind_replays_the_block_the_current_choice_owes(monkeypatch, tmp_path):
+    from main_logic.visit.spool import new_debrief_writes
+    from main_routers.visit_router.debrief import failed_request_id, preview_request_id
+
+    diary = "第一行" + chr(10) * 2 + "第二行"
+    pending = {"diary": diary, "facts": ["去了邻居家"]}
+    await _pending(tmp_path, 6, debrief_choice="preview:diary", debrief_pending=pending)
+    await _pending(tmp_path, 10, debrief_choice="committing:diary", debrief_pending=pending)
+    writes = {**new_debrief_writes(), "facts": True, "facts_written": 1}
+    await _pending(tmp_path, 11, debrief_choice="commit_failed:diary", debrief_pending=pending,
+                   debrief_writes=writes,
+                   debrief_commit_error={"step": "cache", "status": 422, "at": 1.0, "seq": 2})
     manager = _ProtocolManager()
     install(monkeypatch, manager)
     socket = VisitSocket([bind()])
     await run(socket, manager)
-    assert _chip_ids(socket) == []
+    assert _chip_ids(socket) == [preview_request_id(vid(6)), preview_request_id(vid(10)),
+                                 failed_request_id(vid(11), 2)]
+    blocks = {f["request_id"]: f["blocks"] for f in socket.sent if f.get("type") == "chat_blocks"}
+    # 预览正文逐字放在 plain_text 块里（换行原样保留），零 LLM
+    plain = [b["text"] for b in blocks[preview_request_id(vid(6))] if b.get("plain_text")]
+    assert plain == [diary, "去了邻居家"]
+    # 写入中：「不记」置灰、「写入」可点，后面紧跟 committing 状态帧
+    buttons = {b["id"]: b for b in blocks[preview_request_id(vid(10))][-2]["buttons"]}
+    assert buttons["forget"].get("disabled") is True and not buttons["confirm"].get("disabled")
+    frames = [(f["visit_id"], f["phase"]) for f in socket.sent if f.get("type") == "visit_debrief"]
+    assert frames == [(vid(10), "committing"), (vid(11), "commit_failed")]
+    failed = [f for f in socket.sent if f.get("type") == "visit_debrief" and f["phase"] == "commit_failed"][0]
+    assert failed["seq"] == 2 and failed["written"] == {"facts": True, "cache": False}
 
 
 async def test_ack_is_per_connection_and_never_clears_the_flag(monkeypatch, tmp_path):

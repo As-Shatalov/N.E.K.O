@@ -169,8 +169,14 @@ async def test_render_chips_recovery_callback(monkeypatch):
     async def own_uid():
         return "uid-own"
 
+    class _Spool:
+        async def read_state(self):
+            return {"visit_id": "v" * 22, "debrief_choice": "ask_later"}
+
     # 场次归属的真实读盘见 test_visit_socket_bind 的补录用例
     monkeypatch.setattr(debrief, "_visit_owner", owner)
+    # 投递哪一块按 state.json 的当前选择定（芯片 / 预览块 / 失败块，见 test_visit_debrief_choice）
+    monkeypatch.setattr(debrief, "_spool", lambda _visit_id: _Spool())
     monkeypatch.setattr(accounts, "own_visit_uid", own_uid)
     fake = FakeHost("Host")
     monkeypatch.setattr(host_port.ManagerHost, "for_character", classmethod(lambda cls, name: fake))

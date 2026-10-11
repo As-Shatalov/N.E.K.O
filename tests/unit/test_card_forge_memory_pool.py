@@ -763,3 +763,17 @@ async def test_current_scoped_wire_id_does_not_exclude_legacy_literal_namesake(q
     payload = await query_pool([target], [literal], exclude_fact_ids=wire_id)
     assert payload["totalMemoryCount"] == 2
     assert [row["text"] for row in payload["facts"]] == [literal["text"]]
+
+
+@pytest.mark.asyncio
+async def test_visit_facts_never_enter_a_card(query_pool):
+    # 串门「记成日记」的事实是邻居家的内容：不进社区分享卡片（OD-16 v4）
+    visits = [memory(f"visit-{i}", origin="neko_visit", visit_id="v" * 22) for i in range(3)]
+    for _ in range(200):
+        payload = await query_pool([memory("own-1"), *visits[:2]], [visits[2], memory("old-1")])
+        assert not any(str(f["id"]).startswith("visit-") for f in payload["facts"])
+
+
+def test_pool_without_visit_facts_is_passed_through_unchanged():
+    items = [memory("a"), memory("b")]
+    assert F._shareable_facts(items) is items

@@ -1137,6 +1137,15 @@ async def cache_conversation(request: HistoryRequest, lanlan_name: str):
             idempotency_key = str(request.idempotency_key or "").strip()
             if len(idempotency_key) > 160:
                 return {"status": "error", "message": "idempotency_key_too_long"}
+            if (
+                not theater_episode_batch
+                and _KEYED_CACHE_KEY_RE.fullmatch(idempotency_key) is not None
+            ):
+                # 串门「记成日记」（OD-16 v4）：角色级幂等、两处都确认落盘才算写成，
+                # 不登记 post-turn 后处理
+                return await _cache_keyed(
+                    lanlan_name, request.input_history, input_history, idempotency_key,
+                )
             if idempotency_key and not theater_episode_batch:
                 # Only a theater episode write is idempotent: it upserts one
                 # capsule per Session and the key fences retracted attempts.
@@ -1230,6 +1239,189 @@ async def cache_conversation(request: HistoryRequest, lanlan_name: str):
         except Exception as e:
             logger.error(f"[MemoryServer] cache 失败: {e}", exc_info=True)
             return {"status": "error", "message": str(e)}
+
+
+# ── keyed private /cache and visit facts (catgirl visit "keep as diary", OD-16 v4) ──
+
+_KEYED_CACHE_KEY_RE = re.compile(r"^visit-debrief:[A-Za-z0-9_-]{22}$")
+"""The only keyed private ``/cache`` writes: one visit's diary entry (``visit-debrief:{visit_id}``)."""
+
+_VISIT_FACT_IMPORTANCE = 4
+"""Below the reflection threshold (5): visit facts are recalled but never synthesized."""
+
+
+def _keyed_cache_session_id(key: str) -> str:
+    """The ``time_indexed.db`` session id of a keyed write (derived from the key, never random)."""
+    from . import idempotency
+
+    return f"idem-{idempotency.key_digest(key)}"
+
+
+def _canonical_history_hash(raw: str) -> str:
+    data = json.loads(raw)
+    canonical = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _keyed_unconfirmed(message: str) -> JSONResponse:
+    # 503：键留在 pending，调用方按暂时性失败用同一个键重试
+    return JSONResponse({"status": "error", "message": message}, status_code=503)
+
+
+async def _cache_keyed(lanlan_name: str, raw_history: str, input_history: list, key: str):
+    """Keyed ``/cache`` write, idempotent per character (design section 4.6 ``/cache``).
+
+    The key record goes ``pending`` (with the canonical content hash) before
+    anything is stored and ``done`` only after both stores confirmed: first
+    ``time_indexed.db`` (rows under a session id derived from the key), then
+    ``recent.json`` (entries carry the key in their metadata). A retry of a
+    key that is not ``done`` decides from the stores themselves: no time-index
+    row means neither was written (recent is written second); with the row,
+    the recent entry or its retired-key record proves the second step, else
+    only recent is written. Unconfirmed writes answer 503 and leave the key
+    ``pending``. Post-turn signals are never registered for keyed writes.
+    Errors are returned, never raised: the caller's ``except`` turns anything
+    raised into a 200 ``status:'error'``.
+    """
+    from utils.recent_file import RECENT_IDEMPOTENCY_META_KEY
+
+    from . import idempotency
+
+    if any(getattr(message, "type", "") != "ai" for message in input_history):
+        # 带键写入只为「记成日记」这一种 AI 独白批次设计：不登记后处理、恢复只核对两处存储
+        return JSONResponse({"status": "error", "message": "keyed cache writes accept assistant messages only"},
+                            status_code=422)
+    content_hash = _canonical_history_hash(raw_history)
+    for message in input_history:
+        message.metadata = {**(message.metadata or {}), RECENT_IDEMPOTENCY_META_KEY: key}
+    session_id = _keyed_cache_session_id(key)
+    async with idempotency.key_lock(lanlan_name, key):
+        try:
+            record = await idempotency.read_key(lanlan_name, key)
+        except (idempotency.IdempotencyStateError, OSError):
+            return _keyed_unconfirmed("idempotency state unreadable; retry later")
+        if record is not None and record.get("state") in idempotency.TERMINAL_KEY_STATES:
+            return {"status": "cached", "duplicate": True, "count": 0}
+        stored_hash = record.get("content_hash") if record is not None else None
+        if stored_hash is not None and stored_hash != content_hash:
+            # 同一场的日记只有一份（客户端重试用落盘的同一份正文）：内容变了是调用方的错，不是可重试的失败
+            return JSONResponse({"status": "error", "message": "idempotency_key reused with different content"},
+                                status_code=422)
+        try:
+            await idempotency.update_key(
+                lanlan_name, key,
+                idempotency.transition(idempotency.KEY_STATE_PENDING, content_hash=content_hash, kind="cache"),
+            )
+            async with runtime._get_settle_lock(lanlan_name):
+                had_row = await runtime.time_manager.ahas_conversation(session_id, lanlan_name)
+                if not had_row:
+                    await runtime.time_manager.astore_conversation_strict(session_id, input_history, lanlan_name)
+                outcome = await runtime.recent_history_manager.append_keyed(input_history, lanlan_name, key)
+            await idempotency.update_key(lanlan_name, key, idempotency.transition(idempotency.KEY_STATE_DONE))
+        except Exception as exc:  # noqa: BLE001 - 任一处没确认落盘：键留 pending，503 让调用方重试
+            logger.warning(f"[MemoryServer] keyed cache {lanlan_name}: not confirmed: {exc!r}")
+            return _keyed_unconfirmed("keyed write not confirmed; retry later")
+    if had_row and outcome != "written":
+        return {"status": "cached", "duplicate": True, "count": 0}
+    logger.info(f"[MemoryServer] cache: {lanlan_name} keyed +{len(input_history)} 条消息")
+    return {"status": "cached", "count": len(input_history)}
+
+
+class VisitFactItem(BaseModel):
+    text: str = Field(min_length=1, max_length=60)
+
+
+class VisitFactsRequest(BaseModel):
+    visit_id: str = Field(pattern=r"^[A-Za-z0-9_-]{22}$")
+    facts: list[VisitFactItem] = Field(default_factory=list, max_length=3)
+
+
+@app.post("/internal/memory/{lanlan_name}/visit_facts")
+async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
+    """Write the (at most three) facts of one visit's diary into the private fact pool.
+
+    Idempotent per ``visit_id`` (key ``visit-facts:{visit_id}``): a ``done``
+    key answers the ``written`` count of the first write. The server stamps
+    every new fact ``source='ai_disclosure'``, ``importance=4``,
+    ``absorbed=True``, ``origin='neko_visit'`` and ``visit_id`` (callers
+    cannot override them), so reflection never synthesizes them while recall
+    still finds them; exact and semantic dedup apply as usual. A key left
+    ``pending`` (crash after the facts were saved) is settled by counting the
+    visit's facts in the active and archived pools, read strictly: either
+    file unreadable answers 503 and writes nothing. An empty list is a no-op
+    that still records the key.
+    """
+    from . import idempotency
+
+    lanlan_name = validate_lanlan_name(lanlan_name)
+    if runtime.fact_store is None:
+        raise HTTPException(
+            status_code=503,
+            detail="memory_server not fully initialized (limited mode or startup incomplete)",
+        )
+    texts = [item.text.strip() for item in req.facts]
+    if any(not text for text in texts):
+        raise HTTPException(status_code=422, detail="each fact text must contain 1..60 characters")
+    key = f"visit-facts:{req.visit_id}"
+    unavailable = HTTPException(status_code=503, detail="visit facts not confirmed; retry later")
+    async with idempotency.key_lock(lanlan_name, key):
+        try:
+            record = await idempotency.read_key(lanlan_name, key)
+        except (idempotency.IdempotencyStateError, OSError) as exc:
+            raise unavailable from exc
+        if record is not None and record.get("state") in idempotency.TERMINAL_KEY_STATES:
+            return {"ok": True, "written": int(record.get("written") or 0),
+                    "deduped": int(record.get("deduped") or 0), "duplicate": True}
+        try:
+            rows = await runtime.fact_store.aload_facts_strict(lanlan_name, include_archive=True)
+        except RuntimeError as exc:
+            # 读不了就不猜：活跃池读失败时宽松加载会把空列表缓存成事实池，写回就抹掉已有事实
+            logger.warning(f"[MemoryServer] visit_facts {lanlan_name}: fact pool unreadable: {exc}")
+            raise unavailable from exc
+        already = sum(
+            1 for row in rows
+            if row.get("origin") == "neko_visit" and row.get("visit_id") == req.visit_id
+        )
+        try:
+            if already:
+                # 上次已落盘、标 done 之前中断：按真实条数补记 done，不再写
+                deduped = max(len(texts) - already, 0)
+                await idempotency.update_key(
+                    lanlan_name, key,
+                    idempotency.transition(idempotency.KEY_STATE_DONE, written=already, deduped=deduped),
+                )
+                return {"ok": True, "written": already, "deduped": deduped, "duplicate": True}
+            await idempotency.update_key(
+                lanlan_name, key, idempotency.transition(idempotency.KEY_STATE_PENDING, kind="visit_facts"),
+            )
+            created: list[dict] = []
+            if texts:
+                extracted = [
+                    {
+                        "text": text,
+                        "importance": _VISIT_FACT_IMPORTANCE,
+                        "source": "ai_disclosure",
+                        "entity": "neko",
+                        "_visit_origin": {"visit_id": req.visit_id},
+                    }
+                    for text in texts
+                ]
+                created = await runtime.fact_store._apersist_new_facts(
+                    lanlan_name,
+                    extracted,
+                    default_source="ai_disclosure",
+                    effect_keys=[idempotency.effect_key_for(key, i) for i in range(len(extracted))],
+                )
+            written = len(created)
+            deduped = len(texts) - written
+            await idempotency.update_key(
+                lanlan_name, key,
+                idempotency.transition(idempotency.KEY_STATE_DONE, written=written, deduped=deduped),
+            )
+        except Exception as exc:  # noqa: BLE001 - 没确认：键留 pending，503 让调用方用同一 visit_id 重试
+            logger.warning(f"[MemoryServer] visit_facts {lanlan_name}: not confirmed: {exc!r}")
+            raise unavailable from exc
+    return {"ok": True, "written": written, "deduped": deduped}
 
 
 @app.get("/internal/memory/{lanlan_name}/theater/stories")

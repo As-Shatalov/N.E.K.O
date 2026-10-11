@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Home-coming debrief, runtime side (OD-16 v4, design §3.7.4; the two-step diary write is PR-14).
+"""Home-coming debrief (OD-16 v4, design §3.7.4 / §4.6): summary, chips, preview and the two-step diary write.
 
 After the visit is finalized the cat tells the family, in two or three
 sentences, who the visit was with and what they talked about:
@@ -35,13 +35,31 @@ sentences, who the visit was with and what they talked about:
 
 :func:`render_chips` is also the ``render_chips`` callback of PR-08 startup
 recovery (PR-09b wires it).
+
+"Keep as diary" (PR-14, ``POST /api/visit/debrief/choice``, :data:`router`):
+``diary`` only generates a preview (``main_logic.visit.debrief_writers``)
+and shows it verbatim; ``confirm`` writes exactly that preview in two steps
+(``visit_facts`` then the keyed ``/cache``) through :func:`run_commit`, the
+single place that writes, shared with the backoff timer
+(:func:`schedule_commit_retry`) and startup recovery
+(:func:`resume_diary_commit`); ``forget`` writes nothing; ``abandon`` gives
+up a permanently failed write. Every choice of one visit is serialized
+under one per-visit lock. Labels come from ``static/locales`` (``visit.debrief.*``)
+in the UI language. A freshly bound display gets whatever block the visit's
+current choice owes (:func:`owed_block`).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
+import weakref
+from collections.abc import Mapping
 from typing import Any, Optional
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 from config.visit_settings import (
     VISIT_CEREMONY_TIMEOUT_S,
@@ -65,17 +83,22 @@ def chips_request_id(visit_id: str) -> str:
     return f"visit-debrief:{visit_id}"
 
 
+def t(key: str, lang: Optional[str]) -> str:
+    """``visit.debrief.<key>`` from ``static/locales`` in ``lang`` (the page renders it verbatim)."""
+    from main_logic.core._shared import get_locale_text
+
+    dotted = f"visit.debrief.{key}"
+    return get_locale_text(lang, dotted, dotted)
+
+
 def chip_blocks(visit_id: str, lang: Optional[str]) -> list[dict]:
     """The chips message: one line of text and the two buttons (``diary`` / ``forget``)."""
-    from config.prompts.prompts_visit import get_visit_debrief_chip_labels
-
-    prompt, diary, forget = get_visit_debrief_chip_labels(lang)
     return [
-        {"type": "text", "text": prompt},
+        {"type": "text", "text": t("question", lang)},
         {"type": "buttons", "buttons": [
-            {"id": "diary", "label": diary, "action": DEBRIEF_ACTION,
+            {"id": "diary", "label": t("choiceDiary", lang), "action": DEBRIEF_ACTION,
              "payload": {"visit_id": visit_id, "choice": "diary"}},
-            {"id": "forget", "label": forget, "action": DEBRIEF_ACTION, "variant": "danger",
+            {"id": "forget", "label": t("choiceForget", lang), "action": DEBRIEF_ACTION, "variant": "danger",
              "payload": {"visit_id": visit_id, "choice": "forget"}},
         ]},
     ]
@@ -120,7 +143,28 @@ async def render_chips(visit_id: str, *, own_char: str, status: Optional[str] = 
             return False
         if await own_visit_uid() != owner:
             return False  # 写提示的这段 await 里登出 / 换了账号：芯片不再发
-    return await show_chips(host, visit_id, own_char=own_char, lang=prompt_lang())
+    return await show_owed(host, visit_id, own_char=own_char, lang=prompt_lang())
+
+
+async def show_owed(host: Any, visit_id: str, *, own_char: str, lang: Optional[str]) -> bool:
+    """Render the block ``visit_id`` currently owes (chips, preview or failure block) and its state frame."""
+    try:
+        state = await _spool(visit_id).read_state()
+    except Exception as exc:  # noqa: BLE001 - 读不出：等 bind 重放
+        logger.debug("visit %s: state unreadable: %s", visit_id[:6], type(exc).__name__)
+        return False
+    owed = owed_block(state, lang) if state is not None else None
+    if owed is None:
+        return False
+    request_id, blocks, frame = owed
+    try:
+        shown = bool(await host.render_chat_blocks(blocks, request_id=request_id, source_name=own_char))
+    except Exception as exc:  # noqa: BLE001 - 页面不在：标记留在 state.json，等下次 bind 重放
+        logger.info("visit %s: debrief block not shown: %s", visit_id[:6], type(exc).__name__)
+        return False
+    if shown and frame is not None:
+        await host.send_frame(frame)
+    return shown
 
 
 async def _visit_owner(visit_id: str) -> Optional[str]:
@@ -229,3 +273,517 @@ async def _offer_chips(rt: Any, *, has_lines: bool) -> None:
                        type(writing.exception()).__name__)
     await show_chips(rt.host, rt.visit_id, own_char=rt.lanlan_name, lang=rt.lang)
     await _push_state(rt, "asked")
+
+
+# =====================================================================
+# 「记成日记」：预览、两步写入与状态机（OD-16 v4，§3.7.4 / §4.6，PR-14）
+# =====================================================================
+
+CHOICES = ("diary", "confirm", "forget", "abandon")
+_CHIP_CHOICES = (None, "ask_later", "generating:diary")
+_FINAL_CHOICES = ("diary", "forget", "abandoned")
+_PENDING_COMMIT = ("committing:diary", "commit_failed:diary")
+_DIARY_LLM_MAX_TOKENS = 900
+"""Output budget of the diary call: the entry (``VISIT_DIARY_MAX_TOKENS``) plus up to three facts and the JSON."""
+
+router = APIRouter()
+
+_locks: "weakref.WeakValueDictionary[tuple[int, str], asyncio.Lock]" = weakref.WeakValueDictionary()
+_timers: dict[str, asyncio.Task] = {}
+
+_now = time.time
+"""Wall clock of the retry schedule (``debrief_retry.next_at`` survives restarts); tests replace it."""
+
+_sleep = asyncio.sleep
+"""Sleep of the retry timers; tests replace it."""
+
+
+def preview_request_id(visit_id: str) -> str:
+    return f"visit-debrief-preview:{visit_id}"
+
+
+def failed_request_id(visit_id: str, seq: int) -> str:
+    return f"visit-debrief-failed:{visit_id}:{int(seq)}"
+
+
+def _visit_lock(visit_id: str) -> asyncio.Lock:
+    # 同一场的选择、生成与提交串行；按事件循环分开（测试一个用例一个循环）
+    key = (id(asyncio.get_running_loop()), visit_id)
+    lock = _locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _locks[key] = lock
+    return lock
+
+
+def written_of(writes: Mapping[str, Any]) -> dict:
+    """``written`` of §4.6: facts only when some fact was actually new, the diary when ``/cache`` confirmed."""
+    return {"facts": int(writes.get("facts_written") or 0) > 0, "cache": writes.get("cache") is True}
+
+
+def unconfirmed_of(writes: Mapping[str, Any]) -> dict:
+    """``unconfirmed`` of §4.6: a step that may have been written without confirmation (in flight counts)."""
+    return {
+        step: bool(writes.get(f"{step}_unconfirmed") or writes.get(f"{step}_inflight"))
+        for step in ("facts", "cache")
+    }
+
+
+def apply_transition(writes: Mapping[str, Any], step: str, event: str, detail: Mapping[str, Any]) -> dict:
+    """``debrief_writes`` after one ``commit_diary`` transition (a new dict)."""
+    new = dict(writes)
+    if event == "inflight":
+        new[f"{step}_inflight"] = True
+    elif event == "confirmed":
+        new[step] = True
+        new[f"{step}_inflight"] = False
+        new[f"{step}_unconfirmed"] = False
+        if step == "facts":
+            new["facts_written"] = max(0, int(detail.get("facts_written") or 0))
+    elif event == "rejected":
+        new[f"{step}_inflight"] = False
+    elif event == "indeterminate":
+        new[f"{step}_inflight"] = False
+        new[f"{step}_unconfirmed"] = True
+    else:
+        raise ValueError(f"unknown transition {event!r}")
+    return new
+
+
+def preview_blocks(visit_id: str, pending: Mapping[str, Any], lang: Optional[str], *,
+                   committing: bool = False) -> list[dict]:
+    """The preview message: the diary entry and every fact verbatim (``plain_text`` blocks) and "save / don't keep".
+
+    ``committing`` (replayed while the two-step write is pending): "don't
+    keep" is disabled and a status line says it is being saved; "save"
+    stays clickable for an immediate retry.
+    """
+    blocks: list[dict] = [
+        {"type": "text", "text": t("previewTitle", lang)},
+        {"type": "text", "text": str(pending.get("diary") or ""), "plain_text": True},
+    ]
+    facts = [str(f) for f in (pending.get("facts") or [])]
+    if facts:
+        blocks.append({"type": "text", "text": t("previewFactsLabel", lang)})
+        blocks.extend({"type": "text", "text": fact, "plain_text": True} for fact in facts)
+    forget = {"id": "forget", "label": t("choiceForget", lang), "action": DEBRIEF_ACTION, "variant": "danger",
+              "payload": {"visit_id": visit_id, "choice": "forget"}}
+    if committing:
+        forget["disabled"] = True
+    blocks.append({"type": "buttons", "buttons": [
+        {"id": "confirm", "label": t("previewConfirm", lang), "action": DEBRIEF_ACTION,
+         "payload": {"visit_id": visit_id, "choice": "confirm"}},
+        forget,
+    ]})
+    if committing:
+        blocks.append({"type": "status", "tone": "info", "text": t("committing", lang)})
+    return blocks
+
+
+def failed_blocks(visit_id: str, state: Mapping[str, Any], lang: Optional[str]) -> list[dict]:
+    """The "write failed" message of a ``commit_failed:diary`` visit (retry / give up, both carrying ``seq``)."""
+    seq = int(state["debrief_commit_error"]["seq"])
+    written = written_of(state["debrief_writes"])
+    unconfirmed = unconfirmed_of(state["debrief_writes"])
+    blocks: list[dict] = [{"type": "text", "text": t("commitFailed", lang)}]
+    if written["facts"] and not written["cache"]:
+        blocks.append({"type": "text", "text": t("commitFailedPartial", lang)})
+    if any(unconfirmed.values()):
+        blocks.append({"type": "text", "text": t("commitFailedUnknown", lang)})
+    blocks.append({"type": "buttons", "buttons": [
+        {"id": "retry", "label": t("commitRetry", lang), "action": DEBRIEF_ACTION,
+         "payload": {"visit_id": visit_id, "choice": "confirm", "seq": seq}},
+        {"id": "abandon", "label": t("commitAbandon", lang), "action": DEBRIEF_ACTION, "variant": "danger",
+         "payload": {"visit_id": visit_id, "choice": "abandon", "written": written,
+                     "unconfirmed": unconfirmed, "seq": seq}},
+    ]})
+    return blocks
+
+
+def _state_frame(visit_id: str, phase: str, request_id: str, **extra: Any) -> dict:
+    return {"type": "visit_debrief", "visit_id": visit_id, "phase": phase, "request_id": request_id,
+            **extra, "ts": _now()}
+
+
+def committing_frame(state: Mapping[str, Any]) -> dict:
+    """``visit_debrief{committing, seq}``: pages grey "don't keep" and failure blocks up to ``seq``."""
+    error = state.get("debrief_commit_error")
+    seq = int(error["seq"]) if error else 0
+    return _state_frame(state["visit_id"], "committing", preview_request_id(state["visit_id"]), seq=seq)
+
+
+def commit_failed_frame(state: Mapping[str, Any]) -> dict:
+    seq = int(state["debrief_commit_error"]["seq"])
+    return _state_frame(state["visit_id"], "commit_failed", failed_request_id(state["visit_id"], seq), seq=seq,
+                        written=written_of(state["debrief_writes"]),
+                        unconfirmed=unconfirmed_of(state["debrief_writes"]))
+
+
+def owed_request_id(state: Mapping[str, Any]) -> Optional[str]:
+    """The ``request_id`` of the block :func:`owed_block` would deliver (None when nothing is owed)."""
+    visit_id = state["visit_id"]
+    choice = state["debrief_choice"]
+    if choice in _CHIP_CHOICES:
+        return chips_request_id(visit_id)
+    if choice in ("preview:diary", "committing:diary"):
+        return preview_request_id(visit_id)
+    if choice == "commit_failed:diary":
+        return failed_request_id(visit_id, state["debrief_commit_error"]["seq"])
+    return None
+
+
+def owed_block(state: Mapping[str, Any], lang: Optional[str]) -> Optional[tuple[str, list[dict], Optional[dict]]]:
+    """``(request_id, blocks, state frame)`` a page owes for this visit's current choice, or None.
+
+    Chips while undecided (``generating:diary`` too: a crashed generation
+    is offered again, never regenerated on its own), the preview while
+    ``preview:diary``, the preview with "don't keep" disabled while
+    ``committing:diary`` (then a ``committing`` frame), the failure block
+    while ``commit_failed:diary`` (then a ``commit_failed`` frame). The
+    blocks are built from ``state.json`` only (no LLM).
+    """
+    visit_id = state["visit_id"]
+    choice = state["debrief_choice"]
+    if choice in _CHIP_CHOICES:
+        return chips_request_id(visit_id), chip_blocks(visit_id, lang), None
+    if choice == "preview:diary":
+        return preview_request_id(visit_id), preview_blocks(visit_id, state["debrief_pending"], lang), None
+    if choice == "committing:diary":
+        return (preview_request_id(visit_id), preview_blocks(visit_id, state["debrief_pending"], lang, committing=True),
+                committing_frame(state))
+    if choice == "commit_failed:diary":
+        seq = int(state["debrief_commit_error"]["seq"])
+        return failed_request_id(visit_id, seq), failed_blocks(visit_id, state, lang), commit_failed_frame(state)
+    return None
+
+
+def _spool(visit_id: str):
+    from main_logic.visit.spool import VisitSpool
+    from main_routers.visit_router import runtime
+
+    return VisitSpool(runtime.runtime_deps().config_dir(), visit_id)
+
+
+def _host(own_char: str):
+    from main_routers.visit_router.host_port import ManagerHost
+
+    return ManagerHost.for_character(own_char)
+
+
+async def _send(own_char: str, frame: dict) -> bool:
+    host = _host(own_char)
+    if host is None:
+        return False
+    return await host.send_frame(frame)
+
+
+async def _render(own_char: str, blocks: list[dict], request_id: str) -> bool:
+    host = _host(own_char)
+    if host is None:
+        return False
+    try:
+        return bool(await host.render_chat_blocks(blocks, request_id=request_id, source_name=own_char))
+    except Exception as exc:  # noqa: BLE001 - 页面不在：标记留在 state.json，等 bind 重放
+        logger.info("visit debrief: block %s not shown: %s", request_id, type(exc).__name__)
+        return False
+
+
+def _lang() -> str:
+    from main_routers.visit_router.local_context import prompt_lang
+
+    return prompt_lang()
+
+
+async def _own_char(state: Mapping[str, Any]) -> Optional[str]:
+    from main_logic.visit import local_chars
+
+    # 按 uid 认当前名字：改名后跟着新名字走；角色已删就是 None
+    return await local_chars.resolve_char_name(state["own_char_uid"])
+
+
+def _diary_llm():
+    from config.visit_settings import VISIT_LLM_TIMEOUT_S
+    from main_routers.visit_router.llm import one_shot_llm
+
+    return one_shot_llm(max_tokens=_DIARY_LLM_MAX_TOKENS, timeout=VISIT_LLM_TIMEOUT_S)
+
+
+async def _family_names() -> tuple[str, ...]:
+    from main_routers.visit_router.background import _family_names as family_names
+
+    return await family_names()
+
+
+# ── 后台退避重试 ──────────────────────────────────────────────────────────
+
+
+def _cancel_timer(visit_id: str) -> None:
+    task = _timers.pop(visit_id, None)
+    if task is not None and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+
+
+def schedule_commit_retry(visit_id: str, next_at: float) -> None:
+    """(Re)arm the one in-process retry of a ``committing:diary`` visit at wall time ``next_at``."""
+    _cancel_timer(visit_id)
+    task = asyncio.ensure_future(_retry_at(visit_id, float(next_at)))
+    _timers[visit_id] = task
+
+
+async def _retry_at(visit_id: str, next_at: float) -> None:
+    try:
+        await _sleep(max(0.0, next_at - _now()))
+    except asyncio.CancelledError:
+        return
+    if _timers.get(visit_id) is asyncio.current_task():
+        # 先摘掉自己：这次再暂时失败会登记下一次定时，不能把正在跑的自己取消掉
+        del _timers[visit_id]
+    try:
+        await run_commit(visit_id, "timer")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - state.json 读不出等：下次启动补录再排
+        logger.warning("visit %s: diary retry failed: %r", visit_id[:6], exc)
+
+
+def cancel_commit_timers() -> list[asyncio.Task]:
+    """Cancel every pending diary retry (shutdown / startup rollback); returns the tasks."""
+    tasks = list(_timers.values())
+    _timers.clear()
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    return tasks
+
+
+def pending_commit_retries() -> dict[str, asyncio.Task]:
+    """The armed retries by visit id (for tests and diagnostics)."""
+    return dict(_timers)
+
+
+async def resume_diary_commit(spool: Any, state: Mapping[str, Any]) -> None:
+    """Startup recovery callback: arm the retry of a ``committing:diary`` visit at its persisted ``next_at``.
+
+    A ``next_at`` still in the future is waited for (restarts never bypass the
+    backoff); a visit without ``debrief_retry`` (older version) is due now.
+    """
+    retry = state.get("debrief_retry")
+    next_at = float(retry["next_at"]) if isinstance(retry, Mapping) else 0.0
+    schedule_commit_retry(spool.visit_id, next_at)
+
+
+# ── 两步提交（端点、定时重试、启动补录共用） ─────────────────────────────
+
+
+async def run_commit(visit_id: str, trigger: str) -> tuple[int, dict]:
+    """Run (or continue) the two-step write of ``visit_id`` under its lock; ``(http status, body)``.
+
+    The only place a diary is written: the ``confirm`` endpoint, the retry
+    timer and startup recovery all come here. Done → ``diary``; transient →
+    stays ``committing:diary`` with the next backoff step persisted and
+    armed; permanent → ``commit_failed:diary`` with the failure block.
+    """
+    async with _visit_lock(visit_id):
+        return await _run_commit_locked(visit_id, trigger)
+
+
+async def _run_commit_locked(visit_id: str, trigger: str) -> tuple[int, dict]:
+    from config.visit_settings import VISIT_DEBRIEF_COMMIT_BACKOFF_S
+    from main_logic.visit import debrief_writers
+
+    spool = _spool(visit_id)
+    state = await spool.read_state()
+    if state is None:
+        return 404, {"error": "unknown_or_expired"}
+    if state["debrief_choice"] != "committing:diary":
+        return _not_committing(state)
+    own_char = await _own_char(state)
+    if not own_char:
+        # 角色已删：退役流程负责这场的文件，不再写
+        return 404, {"error": "unknown_or_expired"}
+    writes = dict(state["debrief_writes"])
+
+    async def on_transition(step: str, event: str, detail: Mapping[str, Any]) -> None:
+        nonlocal writes
+        writes = apply_transition(writes, step, event, detail)
+        # 落盘之后 commit_diary 才继续：请求在途时崩溃，「可能已写」的证据也在
+        await spool.update_state(debrief_writes=writes)
+
+    result = await debrief_writers.commit_diary(own_char, visit_id, state["debrief_pending"], writes, on_transition)
+    lang = _lang()
+    if result.kind == "done":
+        await spool.update_state(debrief_choice="diary", debrief_pending=None, debrief_retry=None,
+                                 debrief_chip_pending=False)
+        _cancel_timer(visit_id)
+        await spool.delete_if_settled()
+        await _send(own_char, _state_frame(visit_id, "chosen", preview_request_id(visit_id), choice="diary"))
+        if trigger != "http":
+            # 发起页自己追加状态；后台补完时没有发起页，单独发一条
+            await _render(own_char, [{"type": "status", "tone": "success", "text": t("savedDiary", lang)}],
+                          f"visit-debrief-done:{visit_id}")
+        return 200, {"ok": True, "applied": "diary"}
+    if result.kind == "transient":
+        retry = state["debrief_retry"] or {"attempts": 0, "next_at": 0.0}
+        attempts = int(retry["attempts"]) + 1
+        delay = VISIT_DEBRIEF_COMMIT_BACKOFF_S[min(attempts, len(VISIT_DEBRIEF_COMMIT_BACKOFF_S)) - 1]
+        next_at = _now() + delay
+        await spool.update_state(debrief_retry={"attempts": attempts, "next_at": next_at})
+        schedule_commit_retry(visit_id, next_at)
+        logger.warning("visit %s: diary write step %s not done (status %s); retry %d in %ds",
+                       visit_id[:6], result.step, result.status, attempts, delay)
+        return 503, {"retry": True, "next_retry_at": next_at}
+    previous = state["debrief_commit_error"]
+    seq = (int(previous["seq"]) if previous else 0) + 1
+    state = await spool.update_state(
+        debrief_choice="commit_failed:diary", debrief_retry=None,
+        debrief_commit_error={"step": result.step, "status": int(result.status), "at": _now(), "seq": seq},
+    )
+    _cancel_timer(visit_id)
+    logger.warning("visit %s: diary write step %s rejected (status %s); waiting for the user",
+                   visit_id[:6], result.step, result.status)
+    await _send(own_char, commit_failed_frame(state))
+    await _render(own_char, failed_blocks(visit_id, state, lang), failed_request_id(visit_id, seq))
+    return 502, {"error": "commit_failed", "step": result.step, "status": int(result.status),
+                 "written": written_of(state["debrief_writes"]),
+                 "unconfirmed": unconfirmed_of(state["debrief_writes"])}
+
+
+def _already_chosen(state: Mapping[str, Any]) -> tuple[int, dict]:
+    choice = state["debrief_choice"]
+    if choice in _PENDING_COMMIT:
+        return 409, {"error": "already_chosen", "choice": "diary", "completed": False,
+                     "state": "committing" if choice == "committing:diary" else "commit_failed"}
+    return 409, {"error": "already_chosen", "choice": choice, "completed": True}
+
+
+def _not_committing(state: Mapping[str, Any]) -> tuple[int, dict]:
+    choice = state["debrief_choice"]
+    if choice in _CHIP_CHOICES or choice == "preview:diary":
+        return 409, {"error": "not_previewed"}
+    return _already_chosen(state)
+
+
+# ── POST /api/visit/debrief/choice ───────────────────────────────────────
+
+
+async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, dict]:
+    from main_logic.visit.spool import is_digestable
+    from main_routers.visit_router.accounts import own_visit_uid
+
+    spool = _spool(visit_id)
+    lock = _visit_lock(visit_id)
+    async with lock:
+        state = await spool.read_state()
+        # 别的社区账号的场次（共用电脑）当作不存在；记忆关的场次本来就没有芯片
+        if (state is None or state["own_uid"] != await own_visit_uid() or not is_digestable(state)
+                or state["finalized"] is None):
+            return 404, {"error": "unknown_or_expired"}
+        own_char = await _own_char(state)
+        if not own_char:
+            return 404, {"error": "unknown_or_expired"}
+        current = state["debrief_choice"]
+        if choice == "diary":
+            return await _choose_diary(spool, state, own_char)
+        if choice == "forget":
+            if current in _CHIP_CHOICES or current == "preview:diary":
+                from main_logic.visit.debrief_writers import write_forget
+
+                await write_forget(spool)
+                await _send(own_char, _state_frame(visit_id, "chosen", chips_request_id(visit_id), choice="forget"))
+                return 200, {"ok": True, "applied": "forget"}
+            return _already_chosen(state)
+        if choice == "abandon":
+            if current != "commit_failed:diary":
+                if current in _FINAL_CHOICES:
+                    return _already_chosen(state)
+                return 409, {"error": "not_failed"}
+            if seq != state["debrief_commit_error"]["seq"]:
+                return 409, {"error": "stale_failure", "seq": state["debrief_commit_error"]["seq"]}
+            from main_logic.visit.debrief_writers import write_forget
+
+            written = written_of(state["debrief_writes"])
+            unconfirmed = unconfirmed_of(state["debrief_writes"])
+            await write_forget(spool, final_choice="abandoned")
+            _cancel_timer(visit_id)
+            await _send(own_char, _state_frame(visit_id, "chosen", failed_request_id(visit_id, seq),
+                                               choice="abandoned", written=written, unconfirmed=unconfirmed))
+            return 200, {"ok": True, "applied": "abandoned", "written": written, "unconfirmed": unconfirmed}
+        # confirm
+        if current == "preview:diary":
+            state = await spool.update_state(debrief_choice="committing:diary")
+        elif current == "commit_failed:diary":
+            if seq != state["debrief_commit_error"]["seq"]:
+                # 点的是旧版失败块（或绕过前端不带 seq）：以新块为准，不重新提交
+                return 409, {"error": "stale_failure", "seq": state["debrief_commit_error"]["seq"]}
+            # 「重试」：退避计数清零，只补未完成那步
+            state = await spool.update_state(debrief_choice="committing:diary", debrief_retry=None)
+        elif current != "committing:diary":
+            return _not_committing(state)
+        _cancel_timer(visit_id)
+        await _send(own_char, committing_frame(state))
+        return await _run_commit_locked(visit_id, "http")
+
+
+async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> tuple[int, dict]:
+    from main_logic.visit import debrief_writers
+
+    visit_id = spool.visit_id
+    current = state["debrief_choice"]
+    if current == "preview:diary":
+        # 预览已落盘：只复用，不再生成
+        return 200, {"ok": True, "applied": "preview", "preview": dict(state["debrief_pending"])}
+    if current not in _CHIP_CHOICES:
+        return _already_chosen(state)
+    await spool.update_state(debrief_choice="generating:diary")
+    try:
+        preview = await debrief_writers.generate_diary_preview(
+            spool, llm=_diary_llm(), own_char=own_char, family_names=await _family_names(),
+        )
+    except debrief_writers.NothingToRecord:
+        return 404, {"error": "unknown_or_expired"}
+    except debrief_writers.DiaryGenerationFailed:
+        # 留在 generating:diary：再点「记成日记」重新生成
+        return 503, {"retry": True}
+    pending = preview.to_pending()
+    # 预览、状态与待投递标记一次原子写：之后 bind 重放的就是这一份
+    await spool.update_state(debrief_pending=pending, debrief_choice="preview:diary", debrief_chip_pending=True)
+    lang = _lang()
+    await _render(own_char, preview_blocks(visit_id, pending, lang), preview_request_id(visit_id))
+    await _send(own_char, _state_frame(visit_id, "preview", preview_request_id(visit_id)))
+    return 200, {"ok": True, "applied": "preview", "preview": pending}
+
+
+def _parse_choice(payload: Mapping[str, Any]) -> tuple[Optional[str], Optional[str], Optional[int], Optional[str]]:
+    from utils.visit_wire import VISIT_ID_RE
+
+    visit_id = payload.get("visit_id")
+    if not isinstance(visit_id, str) or VISIT_ID_RE.fullmatch(visit_id) is None:
+        return None, None, None, "visit_id_format"
+    choice = payload.get("choice")
+    if choice not in CHOICES:
+        return None, None, None, "invalid_choice"
+    seq = payload.get("seq")
+    if seq is not None and (isinstance(seq, bool) or not isinstance(seq, int) or seq < 1):
+        return None, None, None, "invalid_seq"
+    return visit_id, choice, seq, None
+
+
+@router.post("/debrief/choice")
+async def debrief_choice(request: Request):
+    """The user's answer to the debrief chips / preview / failure block (§4.6; state machine in §3.7.4)."""
+    from main_routers.system_router._shared import _read_json_object
+    from main_routers.visit_router.local_guard import http_denied
+
+    payload = await _read_json_object(request)
+    denied = http_denied(request, payload)
+    if denied is not None:
+        return denied
+    visit_id, choice, seq, error = _parse_choice(payload)
+    if error is not None:
+        return JSONResponse({"ok": False, "code": error}, status_code=400)
+    try:
+        status, body = await _choose(visit_id, choice, seq)
+    except Exception as exc:  # noqa: BLE001 - state.json 读写失败等：可重试
+        logger.warning("visit %s: debrief choice %s failed: %r", visit_id[:6], choice, exc)
+        return JSONResponse({"retry": True}, status_code=503)
+    return JSONResponse(body, status_code=status)

@@ -1649,6 +1649,61 @@ class CompressedRecentHistoryManager:
             )
             return 'merged'
 
+    def _append_keyed_locked(self, file_path, lanlan_name, new_messages, key, expected_generation=None) -> str:
+        """Strict keyed append (one critical section). Returns ``'present'``, ``'retired'`` or ``'written'``.
+
+        Unlike :meth:`_append_and_persist_locked` nothing is parked in the
+        pending batches: an unreadable file or a failed write raises, so the
+        keyed ``/cache`` caller leaves its key ``pending`` and answers 503
+        instead of reporting a write that never reached the disk.
+        """
+        with recent_file.recent_file_access(
+            file_path, expected_generation=expected_generation,
+        ) as file_path:
+            status, history = self._load_history_unlocked(file_path, lanlan_name)
+            if status == RECENT_READ_UNREADABLE:
+                raise RuntimeError(f"recent history of {lanlan_name!r} unreadable")
+            pending = recent_file.get_recent_pending_unlocked(file_path)
+            present = recent_file.keyed_entry_keys(messages_to_dict(list(history) + list(pending)))
+            if key in present:
+                return 'present'
+            # 旁路读不出就不猜：抛错让带键写入 503、留着 pending 等重试
+            if key in recent_file.read_retired_keys_unlocked(file_path):
+                return 'retired'
+            merged = list(history) + list(pending) + list(new_messages)
+            recent_file.write_recent_payload_unlocked(file_path, messages_to_dict(merged))
+            # 之前挂着的未落盘批次随这次一起写进去了
+            self._set_pending_batches(lanlan_name, [], file_path)
+            self._cache_history_view(file_path, lanlan_name, merged)
+            return 'written'
+
+    async def append_keyed(self, new_messages, lanlan_name, key: str) -> str:
+        """Append a keyed batch unless ``key`` already is (or was) in this character's recent file.
+
+        Returns ``'present'`` (an entry carries ``key``), ``'retired'`` (an
+        entry carrying it left the file, see
+        :func:`utils.recent_file.retire_removed_keyed_entries`) or
+        ``'written'``. Never compresses. Raises when the file cannot be read
+        or written: the caller must not take that as written.
+        """
+        file_path, admission_generation = self._capture_recent_operation_admission(
+            lanlan_name,
+        )
+        await asyncio.to_thread(
+            assert_cloudsave_writable,
+            self._config_manager,
+            operation="save",
+            target=f"memory/{lanlan_name}/recent.json",
+        )
+        return await _await_recent_mutation_to_completion(
+            self._append_keyed_locked,
+            file_path,
+            lanlan_name,
+            list(new_messages),
+            key,
+            admission_generation,
+        )
+
     async def update_history(self, new_messages, lanlan_name, detailed=False, compress=True, on_compress_done=None):
         file_path, admission_generation = self._capture_recent_operation_admission(
             lanlan_name,
