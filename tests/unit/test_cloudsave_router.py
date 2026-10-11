@@ -2150,6 +2150,28 @@ async def test_cloudsave_download_rechecks_right_before_publishing(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_cloudsave_download_holds_the_character_lock_through_the_import(monkeypatch):
+    # 发布前的复查与导入之间不能放开配置锁：否则并发的改名 / 新建可以先占住名字，再被导入覆盖
+    from utils import character_memory
+
+    async with _visit_download_env(monkeypatch) as (_target_cm, download, _retire_state):
+        module = importlib.import_module("main_routers.cloudsave_router")
+        real_import = module.import_cloudsave_character_unit
+        held = []
+
+        def checked_import(*args, **kwargs):
+            held.append(character_memory.character_config_mutation_lock.locked())
+            return real_import(*args, **kwargs)
+
+        monkeypatch.setattr(module, "import_cloudsave_character_unit", checked_import)
+        result = await download()
+        assert result["success"] is True
+        # 变异：复查后放开锁再导入必红
+        assert held == [True]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_cloudsave_forced_overwrite_keeps_the_session_when_the_name_is_busy(monkeypatch):
     # 名字被串门标记占着时照样会 409：不能先把用户正在进行的会话强制断掉
     from main_logic.visit.spool import VisitSpool

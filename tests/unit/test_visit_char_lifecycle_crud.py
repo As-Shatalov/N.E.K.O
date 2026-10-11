@@ -660,6 +660,24 @@ async def test_reconciling_on_demand_refuses_a_fallback_character_config(env, mo
         Path(path).write_text(original, encoding="utf-8")
 
 
+async def test_a_rename_waiting_for_a_retirement_is_busy_not_ambiguous(env, monkeypatch):
+    cm, _path, config_dir = env
+    uid = _uid(cm, "Old")
+    await set_roster_marker(config_dir, "pending_rename", {"old": "Gone", "new": "Old", "uid": uid})
+    await add_roster_marker_item(config_dir, "pending_retire", lc.retire_item("Old", "f" * 32))
+    replays = []
+
+    async def still_failing(*_a, **_k):
+        replays.append(True)
+        return False
+
+    monkeypatch.setattr(lc, "replay_retires", still_failing)
+    # 改名在等目标名的退役补完（与永久歧义同样留着标记）：只是还没轮到，答「稍后再试」，
+    # 不能让用户去删角色（变异：不看退役必红）；判定前先试着补一次退役（变异：不补必红）
+    assert await character_hooks.name_block_reason(cm, "Gone") == (character_hooks.NAME_BUSY, frozenset())
+    assert replays
+
+
 async def test_unsubscribe_refuses_a_character_whose_rename_cannot_be_settled(tmp_path, monkeypatch):
     config = _unsubscribe_config(tmp_path)
     await _seed_lan(config.config_dir, monkeypatch)

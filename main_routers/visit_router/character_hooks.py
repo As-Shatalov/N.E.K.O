@@ -153,6 +153,11 @@ async def name_block_reason(config_manager: Any, name: str) -> tuple[str, frozen
         state = await char_lifecycle.name_marker_state(config_dir, name)
     if state == char_lifecycle.NAME_RENAMING:
         try:
+            # 改名迁移会等目标名下的退役补完：先补一次，能补完就不用等下次启动
+            await char_lifecycle.replay_retires(config_dir, names_loader(config_manager), retire_persona=retire_persona)
+        except Exception as exc:  # noqa: BLE001 - 补不完照样对账，改名会继续等着
+            logger.warning("visit retire: retry before reconciling the rename holding %r failed: %r", name, exc)
+        try:
             names, uid_of = await names_loader(config_manager)()
             unsettled = await char_lifecycle.reconcile_renames(config_dir, names, uid_of)
         except Exception as exc:  # noqa: BLE001 - 对不完账就挡住这个名字，标记留给启动对账
@@ -160,7 +165,9 @@ async def name_block_reason(config_manager: Any, name: str) -> tuple[str, frozen
         else:
             # 显式判断：ALL_NAMES（读不出）是另一个哨兵，不能被当成「请删除角色」；名字只在队列里时，
             # 挡住它的是前面那笔歧义改名，并非它自己，答「稍后再试」
-            if isinstance(unsettled, frozenset) and name in unsettled:
+            # 改名在等某个名字的退役补完时同样留着标记：那只是还没轮到，不能让用户去删角色
+            if (isinstance(unsettled, frozenset) and name in unsettled
+                    and not await char_lifecycle.names_retiring(config_dir, unsettled)):
                 # 永久 ambiguous（另一个名字已被别的角色占着）：重试也解不开，只有删掉其中一个角色才行
                 logger.warning("visit rename: ambiguous pending_rename holds %r", name)
                 return NAME_AMBIGUOUS, unsettled

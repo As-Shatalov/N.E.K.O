@@ -542,6 +542,16 @@ async def name_marker_state(config_dir: str | Path, name: str) -> str:
     return NAME_FREE
 
 
+async def names_retiring(config_dir: str | Path, names: Iterable[str]) -> bool:
+    """Whether a ``pending_retire`` item still names one of ``names`` (unreadable roster: True)."""
+    wanted = set(names)
+    try:
+        retiring = await read_roster_marker(config_dir, PENDING_RETIRE)
+    except RosterCorruptError:
+        return True
+    return isinstance(retiring, list) and any((_item_fields(item) or ("", None))[0] in wanted for item in retiring)
+
+
 async def is_name_retiring(config_dir: str | Path, name: str) -> bool:
     """Whether a deleted character called ``name`` still has a ``pending_retire`` item (unreadable: False)."""
     return await name_marker_state(config_dir, name) == NAME_RETIRING

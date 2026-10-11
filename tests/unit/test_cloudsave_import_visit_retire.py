@@ -363,6 +363,22 @@ async def test_a_snapshot_rename_of_the_same_character_chains_onto_its_pending_r
     assert await roster.get_char_entry(PEER_X, "C") is not None
 
 
+def test_a_failing_retire_record_still_records_the_renames(tmp_path, monkeypatch):
+    record = removed_characters_recorder(SimpleNamespace(config_dir=str(tmp_path)))
+    renamed = [{"old": "A", "new": "C", "uid": "c" * 32}]
+    calls = []
+
+    def broken(*_a, **_k):
+        raise OSError("visit_peers.json locked")
+
+    monkeypatch.setattr(lc, "record_removed_characters_sync", broken)
+    monkeypatch.setattr(lc, "record_renamed_characters_sync", lambda _d, items: calls.append(items) or 1)
+    # 两步互不连累（变异：第一步失败就不记改名必红），失败照样交给导入方记日志
+    with pytest.raises(OSError):
+        record([{"name": "B", "character_uid": "b" * 32}], frozenset(), renamed)
+    assert calls == [renamed]
+
+
 def test_a_snapshot_rename_onto_a_name_another_local_character_held_is_not_migrated(pair):
     _source_cm, target_cm = pair
     uid = _local_uid(target_cm)

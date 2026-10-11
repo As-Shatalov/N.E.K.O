@@ -50,8 +50,20 @@ def removed_characters_recorder(
     ) -> int:
         from main_logic.visit.char_lifecycle import record_removed_characters_sync, record_renamed_characters_sync
 
-        # 先记删除：它要读当前的改名标记，判断被删角色的另一个名字
-        recorded = record_removed_characters_sync(config_dir, removed, kept_local_names)
-        return recorded + record_renamed_characters_sync(config_dir, renamed)
+        # 先记删除：它要读当前的改名标记，判断被删角色的另一个名字。两步互不连累：
+        # 一步写盘失败（文件被短暂占住）不能让另一步也不记，失败最后再交给导入方记日志
+        recorded = 0
+        failure: Exception | None = None
+        try:
+            recorded += record_removed_characters_sync(config_dir, removed, kept_local_names)
+        except Exception as exc:  # noqa: BLE001
+            failure = exc
+        try:
+            recorded += record_renamed_characters_sync(config_dir, renamed)
+        except Exception as exc:  # noqa: BLE001
+            failure = failure or exc
+        if failure is not None:
+            raise failure
+        return recorded
 
     return record
