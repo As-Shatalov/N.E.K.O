@@ -829,14 +829,17 @@ async def _cleanup_retired_keys(name: str, cutoff: float, report: dict) -> None:
     recent_path = os.path.join(_character_dir(name), "recent.json")
     if not await asyncio.to_thread(os.path.exists, recent_sidecar_path(recent_path, RETIRED_KEYS_FILENAME)):
         return
-    try:
-        records = await asyncio.to_thread(_read_json_object, keys_path(name))
-    except Exception as exc:  # noqa: BLE001 - 键记录读不出：一条都不删
-        logger.warning(f"[Idempotency] {name}: 键记录不可读，保留 recent 退役记录: {exc}")
-        return
+    loaded: dict[str, dict] = {}
+
+    def _records() -> dict:
+        # 在 recent 文件锁内读（prune 持锁调用 _drop）：云存档恢复持同一把锁替换 recent 并删键记录，
+        # 用锁外的旧快照会把恢复之后仍需保留的退役记录删掉
+        if "records" not in loaded:
+            loaded["records"] = _read_json_object(keys_path(name))
+        return loaded["records"]
 
     def _drop(key: str, stamp: Any) -> bool:
-        record = records.get(key)
+        record = _records().get(key)
         terminal = isinstance(record, dict) and record.get("state") in TERMINAL_KEY_STATES
         return (
             terminal
@@ -848,7 +851,7 @@ async def _cleanup_retired_keys(name: str, cutoff: float, report: dict) -> None:
         assert_cloudsave_writable(_config_manager(), operation="save", target=_cloudsave_target(
             os.path.join(_character_dir(name), RETIRED_KEYS_FILENAME)))
         dropped = await asyncio.to_thread(prune_retired_keys, recent_path, _drop)
-    except Exception as exc:  # noqa: BLE001 - startup sweep is best-effort
+    except Exception as exc:  # noqa: BLE001 - startup sweep is best-effort（键记录读不出：一条都不删）
         logger.warning(f"[Idempotency] {name}: recent 退役记录清理失败（跳过）: {exc}")
         return
     report["retired_removed"] += len(dropped)

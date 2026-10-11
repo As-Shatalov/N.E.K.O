@@ -3018,7 +3018,7 @@ class FactStore:
     # 测试会红，而不是等着线上打转。
     _PERSISTED_FACT_FIELDS = frozenset({
         'text', 'importance', 'entity', 'source', 'event_when',
-        '_external_import', '_visit_origin',
+        '_external_import',
     })
 
     @staticmethod
@@ -3472,6 +3472,7 @@ class FactStore:
         expected_subject_generation: int | None = None,
         reconciled_facts: list[dict] | None = None,
         effect_keys: list[str | None] | None = None,
+        visit_origin: dict | None = None,
     ) -> list[dict]:
         # 近重复配对在锁内只收集，出锁之后才投递：投递要拿
         # FactDedupResolver 的 per-character 锁，而 aresolve 是反着来的——
@@ -3514,6 +3515,10 @@ class FactStore:
                     {"effect_keys": effect_keys}
                     if effect_keys is not None else {}
                 ),
+                **(
+                    {"visit_origin": visit_origin}
+                    if visit_origin is not None else {}
+                ),
             )
         if near_dup_pairs:
             await self._aenqueue_near_dup_pairs(lanlan_name, near_dup_pairs)
@@ -3554,6 +3559,7 @@ class FactStore:
         reconciled_facts: list[dict] | None = None,
         near_dup_pairs_out: list | None = None,
         effect_keys: list[str | None] | None = None,
+        visit_origin: dict | None = None,
     ) -> list[dict]:
         """Dedup (SHA-256 + FTS5) + persist. importance < 5 facts are KEPT
         (RFC §3.1.3)—downstream `get_unabsorbed_facts(min_importance=5)`
@@ -4109,10 +4115,9 @@ class FactStore:
 
             if external_import is not None:
                 self._apply_external_import_provenance(fact_entry, external_import)
-            visit_origin = fact.get('_visit_origin')
-            if isinstance(visit_origin, dict) and isinstance(visit_origin.get('visit_id'), str):
-                # 串门「记成日记」的事实（visit_facts 端点）：只盖在新建行上，精确去重命中的
-                # 旧事实不升级这些字段。absorbed=True 让 reflection 永不合成它们
+            if visit_origin is not None:
+                # 串门「记成日记」的事实（只有 visit_facts 端点传这个参数，绝不读模型产出的字段）：
+                # 只盖在新建行上，精确去重命中的旧事实不升级。absorbed=True 让 reflection 永不合成它们
                 self._apply_visit_origin(fact_entry, visit_origin)
             if effect_key is not None:
                 fact_entry['effect_key'] = effect_key

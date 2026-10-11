@@ -157,6 +157,11 @@ async def show_owed(host: Any, visit_id: str, *, own_char: str, lang: Optional[s
     if owed is None:
         return False
     request_id, blocks, frame = owed
+    from main_routers.visit_router.accounts import own_visit_uid
+
+    if await own_visit_uid() != state.get("own_uid"):
+        # 读 state 的这段 await 里登出 / 换了账号：不把这一场的预览正文推给现在登录的账号
+        return False
     try:
         shown = bool(await host.render_chat_blocks(blocks, request_id=request_id, source_name=own_char))
     except Exception as exc:  # noqa: BLE001 - 页面不在：标记留在 state.json，等下次 bind 重放

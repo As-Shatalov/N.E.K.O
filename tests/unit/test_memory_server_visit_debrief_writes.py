@@ -627,3 +627,44 @@ async def test_visit_facts_reject_a_changed_fact_list(env, settle):
         await _facts(env, ["改过的事实"])
     assert info.value.status_code == 422
     assert [r["text"] for r in _pool(env) if r.get("visit_id") == VISIT] == ["在邻居家看了星星"]
+
+
+# ── 评审第 4 轮 ──────────────────────────────────────────────────────────
+
+
+async def test_model_output_cannot_claim_visit_provenance(env):
+    # 普通抽取路径里模型多吐一个 _visit_origin：不能把事实标成串门事实、躲开 reflection 与铸卡
+    await env.fs._apersist_new_facts(NAME, [
+        {"text": "她喜欢晒太阳", "importance": 7, "_visit_origin": {"visit_id": VISIT}},
+    ])
+    row = [r for r in _pool(env) if r["text"] == "她喜欢晒太阳"][0]
+    assert "origin" not in row and "visit_id" not in row and row["absorbed"] is False
+
+
+def test_extraction_skips_only_visit_diary_keys():
+    from app.memory_server.rows import _extract_role_tagged_messages_from_rows
+
+    other = messages_to_dict([_keyed_entry("别的带键消息", "theater:abc")])[0]
+    human = {"type": "human", "data": {"content": "人说的", "metadata": {"idempotency_key": "visit-debrief:x"}}}
+    rows = [(1, "s", json.dumps(other, ensure_ascii=False)), (2, "s", json.dumps(human, ensure_ascii=False))]
+    assert [m["data"]["content"] for m in _extract_role_tagged_messages_from_rows(rows)] == ["别的带键消息", "人说的"]
+
+
+async def test_cleanup_reads_key_records_under_the_recent_lock(env, monkeypatch):
+    # 清理排队等 recent 文件锁期间，云存档恢复删掉了键记录：锁内重读，保留退役记录
+    from app.memory_server import idempotency
+
+    path = os.path.join(str(env.root), NAME, "recent.json")
+    recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("a", "done-key")]))
+    recent_file.write_recent_payload(path, [])
+    await idempotency.update_key(NAME, "done-key", idempotency.transition(idempotency.KEY_STATE_DONE))
+    real = recent_file.prune_retired_keys
+
+    def restore_then_prune(target, should_drop):
+        os.remove(idempotency.keys_path(NAME))
+        return real(target, should_drop)
+
+    monkeypatch.setattr(recent_file, "prune_retired_keys", restore_then_prune)
+    report = await idempotency.cleanup_expired([NAME], ttl_s=0, now=10**12)
+    assert report["retired_removed"] == 0
+    assert "done-key" in recent_file.read_retired_keys(path)

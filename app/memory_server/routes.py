@@ -1419,7 +1419,6 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
                         "importance": _VISIT_FACT_IMPORTANCE,
                         "source": "ai_disclosure",
                         "entity": "neko",
-                        "_visit_origin": {"visit_id": req.visit_id},
                     }
                     for text in texts
                 ]
@@ -1431,6 +1430,7 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
                     # 换成邻居家的串门事实
                     semantic_dedup=False,
                     effect_keys=[idempotency.effect_key_for(key, i) for i in range(len(extracted))],
+                    visit_origin={"visit_id": req.visit_id},
                 )
             written = len(created)
             deduped = len(texts) - written

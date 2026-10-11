@@ -133,11 +133,12 @@ def _extract_user_messages_from_rows(rows: list) -> list[str]:
 
 
 def _is_keyed_diary(msg: dict) -> bool:
-    """Whether a stored message is a keyed ``/cache`` write (the visit diary entry)."""
+    """Whether a stored message is a visit diary entry (an AI message keyed ``visit-debrief:*``)."""
     from utils.llm_client import message_metadata
     from utils.recent_file import RECENT_IDEMPOTENCY_META_KEY
 
-    return bool(message_metadata(msg).get(RECENT_IDEMPOTENCY_META_KEY))
+    key = message_metadata(msg).get(RECENT_IDEMPOTENCY_META_KEY)
+    return msg.get('type') == 'ai' and isinstance(key, str) and key.startswith('visit-debrief:')
 
 
 def _extract_role_tagged_messages_from_rows(rows: list) -> list[dict]:
