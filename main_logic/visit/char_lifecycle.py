@@ -396,13 +396,20 @@ async def begin_rename(
     Runs inside the rename transaction (under the character-config lock),
     with ``names`` / ``uid_of`` read from the config before the rename. An
     earlier marker is reconciled first, and the whole queue when this
-    character has a queued rename; when it cannot be (ambiguous, unreadable
-    spools, this character's own rename still pending)
+    character has a queued rename or ``old`` was handed over to it by another
+    character's pending rename; when it cannot be (ambiguous, unreadable
+    spools, this character's own or the handing rename still pending)
     :class:`RenamePendingElsewhere` is raised and nothing is written. An unreadable roster raises :class:`RosterCorruptError`.
     """
     config_dir = Path(config_dir)
     if not await has_visit_data(config_dir):
         return None
+    # 旧名是云快照刚交给这个角色的、原来那个角色的改名还没对完账：迁移会把人家的条目一起带走
+
+    async def current() -> tuple[set[str], dict[str, str] | None]:
+        return names, uid_of
+
+    await _settle_handed_over(config_dir, old, character_uid, current)
     # 这个角色自己还有一笔排在队里的改名（云快照导入记下的）：位置那笔对得完不代表它也对完了。
     # 先把整个队列对一遍；它还挂着就拒绝这次改名，否则那笔只记着旧的两个名字，新名字没人占着
     if await _own_rename_pending(config_dir, old, character_uid, queued_only=True):
@@ -511,7 +518,8 @@ async def begin_retire(
     """Add the ``pending_retire`` item before the delete commits; return it (``None``: no visit data).
 
     With ``load_names`` (the config before the delete), a pending rename of
-    this very character is reconciled first; when it cannot be,
+    this very character, or one that handed ``name`` over to it, is
+    reconciled first; when it cannot be,
     :class:`RenamePendingElsewhere` is raised and nothing is written. An
     unreadable roster raises :class:`RosterCorruptError` (the delete is
     refused rather than leaving visit data no marker points at).
@@ -521,6 +529,8 @@ async def begin_retire(
         return None
     others: tuple[str, ...] = ()
     if load_names is not None:
+        # 名字是云快照刚交给这个角色的、原来那个角色的改名还没对完账：按名字退役会删掉人家的条目
+        await _settle_handed_over(config_dir, name, character_uid, load_names)
         others = await _settle_own_rename(config_dir, name, character_uid, load_names)
     for other in others:
         await add_roster_marker_item(config_dir, PENDING_RETIRE, retire_item(other, character_uid))
@@ -708,6 +718,37 @@ async def is_name_renaming(config_dir: str | Path, name: str) -> bool:
 async def is_name_retiring(config_dir: str | Path, name: str) -> bool:
     """Whether a deleted character called ``name`` still has a ``pending_retire`` item (unreadable: False)."""
     return await name_marker_state(config_dir, name) == NAME_RETIRING
+
+
+async def _handed_over_pending(config_dir: Path, name: str, character_uid: str | None) -> bool:
+    """Whether another character's pending rename lists ``name`` as handed over (to this character)."""
+    slot, queued = await read_roster_markers(config_dir, PENDING_RENAME, PENDING_RENAME_QUEUE)
+    for item in (slot, *_queued_renames(queued)):
+        uid = item.get("uid") if isinstance(item, dict) else None
+        if name in _handed_over_names(item) and not (uid and character_uid and uid == character_uid):
+            return True
+    return False
+
+
+async def _settle_handed_over(
+    config_dir: Path, name: str, character_uid: str | None, load_names: LoadNames,
+) -> None:
+    """Reconcile the renames that handed ``name`` over before it is renamed or deleted; raise if one stays.
+
+    A cloudsave import gave ``name`` to this character while another
+    character's rename still owns the entries under it: retiring or moving
+    them by name would destroy or carry off that character's data.
+    """
+    if not await _handed_over_pending(config_dir, name, character_uid):
+        return
+    try:
+        names, uid_of = await load_names()
+        await reconcile_renames(config_dir, names, uid_of)
+    except Exception as exc:  # noqa: BLE001 - 对不完账就拒绝，标记留给启动对账
+        logger.warning("visit lifecycle: rename handing %r over not reconciled: %r", name, exc)
+        raise RenamePendingElsewhere("another character's rename still owns this name's visit data") from exc
+    if await _handed_over_pending(config_dir, name, character_uid):
+        raise RenamePendingElsewhere("another character's rename still owns this name's visit data")
 
 
 async def _own_rename_pending(config_dir: Path, name: str, character_uid: str | None, *, queued_only: bool) -> bool:

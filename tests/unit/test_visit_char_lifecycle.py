@@ -1148,3 +1148,50 @@ async def test_renaming_without_a_queued_rename_of_its_own_is_unchanged(tmp_path
     marker = await lc.begin_rename(tmp_path, "A", "A2", CHAR_UID_A, names={"A"}, uid_of={"A": CHAR_UID_A})
     assert marker == {"old": "A", "new": "A2", "uid": CHAR_UID_A}
     assert _peers(tmp_path)["pending_rename_queue"] == [other]
+
+
+# ── 快照交给新角色的名字：原角色的改名对完账之前不能按名字删 / 迁 ─────────────
+
+
+async def test_deleting_the_fresh_holder_of_a_handed_over_name_settles_the_rename_first(tmp_path):
+    roster = await seed_roster(tmp_path, own_char="A")
+    # 快照把 uid A 从 A 改成 B，并把 A 交给本机原来没有的 uid B（handed_over）：A 下的条目还是 uid A 的
+    handed = {"old": "A", "new": "B", "uid": CHAR_UID_A, "source": lc.CLOUDSAVE_SOURCE, "handed_over": ["A"]}
+    await set_roster_marker(tmp_path, "pending_rename", handed)
+    load = _loader({"A", "B"}, {"A": CHAR_UID_B, "B": CHAR_UID_A})
+    # 删 uid B 前先把那笔改名对完：条目迁到 B，之后按名字退役 A 不会删到它们（变异：不先对账必红）
+    await lc.begin_retire(tmp_path, "A", CHAR_UID_B, load_names=load)
+    assert await roster.get_char_entry(PEER_X, "B") is not None
+    assert await roster.get_char_entry(PEER_X, "A") is None
+    assert "pending_rename" not in _peers(tmp_path)
+
+
+async def test_deleting_the_fresh_holder_is_refused_while_the_handing_rename_cannot_settle(tmp_path, monkeypatch):
+    await seed_roster(tmp_path, own_char="A")
+    handed = {"old": "A", "new": "B", "uid": CHAR_UID_A, "source": lc.CLOUDSAVE_SOURCE, "handed_over": ["A"]}
+    await set_roster_marker(tmp_path, "pending_rename", handed)
+
+    async def busy(*_a, **_k):
+        raise OSError("spool locked")
+
+    monkeypatch.setattr(VisitSpool, "rename_own_char", busy)
+    load = _loader({"A", "B"}, {"A": CHAR_UID_B, "B": CHAR_UID_A})
+    # 对不完账就拒绝删除（409），不写退役项（变异：不先对账必红，A 下 uid A 的条目会被按名字删掉）
+    with pytest.raises(lc.RenamePendingElsewhere):
+        await lc.begin_retire(tmp_path, "A", CHAR_UID_B, load_names=load)
+    assert "pending_retire" not in _peers(tmp_path)
+
+
+async def test_renaming_the_fresh_holder_of_a_handed_over_name_settles_the_rename_first(tmp_path):
+    roster = await seed_roster(tmp_path, own_char="A")
+    await seed_roster(tmp_path, peer_uid=PEER_Y, tag=TAG_Y, own_char="P")
+    await set_roster_marker(tmp_path, "pending_rename", {"old": "P", "new": "Q", "uid": "e" * 32})
+    handed = {"old": "A", "new": "B", "uid": CHAR_UID_A, "source": lc.CLOUDSAVE_SOURCE, "handed_over": ["A"]}
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", handed)
+    uid_of = {"A": CHAR_UID_B, "B": CHAR_UID_A, "Q": "e" * 32}
+    # uid B（A 的新主人）改名 A -> C：先把交出 A 的那笔迁完，A 下 uid A 的条目归 B，再记这次改名
+    # （变异：不先对账必红，之后迁移会把它们带到 C）
+    marker = await lc.begin_rename(tmp_path, "A", "C", CHAR_UID_B, names=set(uid_of), uid_of=uid_of)
+    assert marker == {"old": "A", "new": "C", "uid": CHAR_UID_B}
+    assert await roster.get_char_entry(PEER_X, "B") is not None and await roster.get_char_entry(PEER_X, "A") is None
+    assert "pending_rename_queue" not in _peers(tmp_path)
