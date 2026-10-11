@@ -2228,3 +2228,25 @@ async def test_cloudsave_overwrite_of_a_rename_ambiguous_for_good_asks_to_delete
         assert get_character_uid(target_cm.load_characters()["猫娘"]["云端角色"]) == uid
         peers = json.loads((Path(target_cm.config_dir) / "visit_peers.json").read_text(encoding="utf-8"))
         assert peers["pending_rename"] == marker
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cloudsave_overwrite_of_an_ambiguous_chained_rename_names_the_character_that_exists(monkeypatch):
+    # 链式改名 Aold -> 乙、又叫过云端角色（现在叫这个）；乙 被另一个角色占着，Aold 已没有角色。
+    # 提示里的「另一个角色」要是真在本机的 乙，不能按字母序挑到不存在的 Aold（变异：按字母序必红）
+    from main_logic.visit.subjects import set_roster_marker
+
+    async with _visit_download_env(monkeypatch, target_name="云端角色") as (target_cm, download, _retire_state):
+        characters = target_cm.load_characters()
+        characters["猫娘"]["乙"] = copy.deepcopy(characters["猫娘"]["云端角色"])
+        characters["猫娘"]["乙"].setdefault("_reserved", {}).pop("character_uid", None)
+        target_cm.save_characters(characters, bypass_write_fence=True)
+        target_cm.backfill_character_uids()
+        uid = get_character_uid(target_cm.load_characters()["猫娘"]["云端角色"])
+        marker = {"old": "Aold", "new": "乙", "uid": uid, "chained": ["云端角色"]}
+        await set_roster_marker(target_cm.config_dir, "pending_rename", marker)
+        response = await download(overwrite=True)
+        payload = json.loads(response.body)
+        assert response.status_code == 409 and payload["code"] == "VISIT_DATA_AMBIGUOUS"
+        assert payload["message_params"] == {"first": "云端角色", "second": "乙"}

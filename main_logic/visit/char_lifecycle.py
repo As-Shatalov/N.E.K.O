@@ -218,7 +218,8 @@ async def reconcile_rename(
         moved = False
     # 云快照导入记下的改名：迁移只在启动对账里做，导入回滚时什么都没迁过。不能按普通改名
     # 反向改写——新名下是本机另一个角色（导入要删它、但跟着一起回滚了）的真实数据
-    from_cloudsave = marker.get("source") == CLOUDSAVE_SOURCE
+    # 已经开始迁过（migrated）的就不再是「什么都没迁过」：导入肯定已提交，之后又改回旧名要照常反向迁回
+    from_cloudsave = marker.get("source") == CLOUDSAVE_SOURCE and marker.get("migrated") is not True
     undo = undo_moves and not from_cloudsave
     if from_cloudsave and uid is not None and uid_of is not None and old in current and not forward:
         # 导入回滚了（这个角色还叫旧名）：什么都没迁过，新名被别的角色占着也无所谓，直接撤标记
@@ -239,6 +240,14 @@ async def reconcile_rename(
             # 留着标记等退役补完（启动恢复先补退役、再对账）
             logger.warning("visit recovery: pending_rename %r -> %r waits for the retirement of %r", old, new, target)
             return frozenset(held)
+    if (forward or moved) and from_cloudsave:
+        # 迁移是几次各自独立的写入：中途失败时标记还在、条目已经挪了一部分。先记下「已开始迁」，
+        # 之后角色再被改回旧名时按普通改名反向迁回，不能当成导入回滚直接撤标记
+        migrated = {**marker, "migrated": True}
+        if not await replace_roster_marker(config_dir, PENDING_RENAME, marker, migrated):
+            logger.warning("visit recovery: pending_rename %r -> %r changed before migrating, deferred", old, new)
+            return ALL_NAMES
+        marker = migrated
     if forward or moved:
         # 标记涉及的每个名字（含 chained 记下的中间名字）下的条目都迁到它现在的名字
         for name in held:
@@ -592,13 +601,16 @@ async def name_marker_state(config_dir: str | Path, name: str) -> str:
 
 
 async def names_retiring(config_dir: str | Path, names: Iterable[str]) -> bool:
-    """Whether a ``pending_retire`` item still names one of ``names`` (unreadable roster: True)."""
+    """Whether a ``pending_retire`` item still clearing its roster names one of ``names`` (unreadable: True)."""
     wanted = set(names)
     try:
         retiring = await read_roster_marker(config_dir, PENDING_RETIRE)
     except RosterCorruptError:
         return True
-    return isinstance(retiring, list) and any((_item_fields(item) or ("", None))[0] in wanted for item in retiring)
+    # 按名字清名册那一步已做完的退役项（roster_done）不再挡改名迁移，这里同样不算
+    return isinstance(retiring, list) and any(
+        (_item_fields(item) or ("", None))[0] in wanted and item.get("roster_done") is not True
+        for item in retiring)
 
 
 async def is_name_retiring(config_dir: str | Path, name: str) -> bool:

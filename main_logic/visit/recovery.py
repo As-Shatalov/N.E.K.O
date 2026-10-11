@@ -1416,7 +1416,15 @@ async def visit_spool_recovery(
             logger.error("visit recovery: retirement replay failed: %r", exc)
             report.retired = False
         try:
-            await drop_deleted_queued_renames(config_dir, uid_of)
+            # 退役重放按项拿放角色配置锁、可能耗时：期间云下载可能把某个角色以第三个名字恢复回来。
+            # 锁内重读名单再判断哪些排队改名属于已删除的角色，旧快照会把它的改名当成「已删」丢掉
+            if config_lock is not None:
+                async with config_lock():
+                    names, uid_of = await load_names()
+                    await drop_deleted_queued_renames(config_dir, uid_of)
+            else:
+                names, uid_of = await load_names()
+                await drop_deleted_queued_renames(config_dir, uid_of)
             unsettled = await _reconcile_rename_guarded(config_dir, names, uid_of, lifecycle_guard, load_names)
             # 云快照一次改了几个角色的名字：其余的排在队列里，位置清掉后依次轮到
             while unsettled == frozenset() and await promote_queued_rename(config_dir):

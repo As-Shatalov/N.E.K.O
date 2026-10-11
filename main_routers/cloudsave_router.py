@@ -347,7 +347,10 @@ async def _visit_name_refusal(config_manager, name: str):
         return None
     reason, names = blocked
     if reason == character_hooks.NAME_AMBIGUOUS:
-        other = next((n for n in sorted(names) if n != name), name)
+        # 链式改名的标记挂着不止两个名字：报本机真有的那个角色，不能按字母序挑到已不存在的中间名字
+        configured = set((await config_manager.aload_characters()).get("猫娘") or {})
+        others = sorted(n for n in names if n != name)
+        other = next((n for n in others if n in configured), others[0] if others else name)
         return _cloudsave_error_response(
             "VISIT_DATA_AMBIGUOUS",
             "An unfinished rename between this character and another one left their visit data impossible to "

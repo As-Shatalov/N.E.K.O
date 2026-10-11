@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from pathlib import Path
 
@@ -894,3 +895,81 @@ async def test_chained_names_of_a_rolled_back_import_are_ignored(tmp_path):
     assert await lc.reconcile_rename(tmp_path, {"A", "C"}, {"A": CHAR_UID_A, "C": CHAR_UID_B}) == frozenset()
     assert await roster.get_char_entry(PEER_X, "A") is not None
     assert "pending_rename" not in _peers(tmp_path)
+
+
+# ── 云快照改名迁了一半、退役已清完名册时的歧义判断、退役重放之后的名单 ─────────────
+
+
+async def test_a_half_migrated_cloudsave_rename_is_moved_back_when_the_character_returns_to_the_old_name(
+    tmp_path, monkeypatch,
+):
+    roster = await seed_roster(tmp_path, own_char="A")
+    await make_visit(tmp_path, vid(1), [ln(1)], own_char="A", own_char_uid=CHAR_UID_A)
+    marker = {"old": "A", "new": "B", "uid": CHAR_UID_A, "source": lc.CLOUDSAVE_SOURCE}
+    await set_roster_marker(tmp_path, "pending_rename", marker)
+    original = VisitSpool.rename_own_char
+
+    async def busy(*_a, **_k):
+        raise OSError("spool locked")
+
+    # 正向迁移：名册已挪到 B，改写场次时失败，标记留着
+    monkeypatch.setattr(VisitSpool, "rename_own_char", busy)
+    with pytest.raises(OSError):
+        await lc.reconcile_rename(tmp_path, {"B"}, {"B": CHAR_UID_A})
+    monkeypatch.setattr(VisitSpool, "rename_own_char", original)
+    assert await roster.get_char_entry(PEER_X, "B") is not None
+    assert _peers(tmp_path)["pending_rename"] == {**marker, "migrated": True}
+    # 之后又一次导入把它改回 A：已经迁过一部分，不能当成「导入回滚、什么都没迁」直接撤标记
+    # （变异：不记 migrated 必红，A 的条目留在 B 下给以后叫 B 的角色继承）
+    assert await lc.reconcile_rename(tmp_path, {"A"}, {"A": CHAR_UID_A}) == frozenset()
+    assert await roster.get_char_entry(PEER_X, "A") is not None
+    assert await roster.get_char_entry(PEER_X, "B") is None
+    assert await _state_char(tmp_path, vid(1)) == "A"
+    assert "pending_rename" not in _peers(tmp_path)
+
+
+async def test_a_retirement_whose_roster_step_is_done_does_not_count_as_retiring(tmp_path):
+    await _visit_data(tmp_path)
+    item = lc.retire_item("A2", CHAR_UID_B)
+    await add_roster_marker_item(tmp_path, "pending_retire", item)
+    assert await lc.names_retiring(tmp_path, {"A2"}) is True
+    # 按名字清名册那一步做完了：改名不再等它，歧义判断也不能再当成「还在退役、稍后再试」
+    # （变异：照算必红，永久歧义一直答 VISIT_DATA_BUSY）
+    await remove_roster_marker_item(tmp_path, "pending_retire", item)
+    await add_roster_marker_item(tmp_path, "pending_retire", {**item, "roster_done": True})
+    assert await lc.names_retiring(tmp_path, {"A2"}) is False
+
+
+@pytest.mark.parametrize("with_lock", [True, False])
+async def test_startup_recovery_rereads_the_characters_after_replaying_retirements(
+    tmp_path, _readable, monkeypatch, with_lock,
+):
+    from main_logic.visit import local_chars
+
+    restored = {"A2": CHAR_UID_A, "X": CHAR_UID_B}
+    calls = []
+
+    async def configured():
+        calls.append(None)
+        # 退役重放期间一次云下载把 uid E 以第三个名字 R 恢复了回来
+        return dict(restored) if len(calls) == 1 else {**restored, "R": "e" * 32}
+
+    lock = asyncio.Lock()
+    held = []
+
+    @contextlib.asynccontextmanager
+    async def config_lock():
+        async with lock:
+            held.append(None)
+            yield
+
+    monkeypatch.setattr(local_chars, "load_local_characters", configured)
+    await seed_roster(tmp_path, own_char="A")
+    stuck = {"old": "A", "new": "X", "uid": CHAR_UID_A}
+    await set_roster_marker(tmp_path, "pending_rename", stuck)
+    queued = {"old": "P", "new": "Q", "uid": "e" * 32}
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", queued)
+    await _recover(tmp_path, ["A2", "X"], {}, list_char_names=None, config_lock=config_lock if with_lock else None)
+    # 恢复回来的角色的排队改名不能按重放之前的旧名单当成「已删」撤掉（变异：不重读必红）
+    assert _peers(tmp_path)["pending_rename_queue"] == [queued]
+    assert bool(held) is with_lock
