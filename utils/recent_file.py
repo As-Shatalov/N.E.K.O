@@ -31,6 +31,7 @@ Both helpers block on file IO. Call them from a worker thread
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -616,8 +617,7 @@ def read_retired_keys_unlocked(path: Any) -> dict[str, float]:
         # 条目畸形（键不是串门日记键、时间不是有限数）同样按「坏了」处理：不把它当成「写过」的证据
         if (
             not isinstance(key, str) or VISIT_DIARY_KEY_RE.fullmatch(key) is None
-            or isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or stamp != stamp
-            or stamp in (float("inf"), float("-inf"))
+            or isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not math.isfinite(stamp)
         ):
             raise ValueError(f"{RETIRED_KEYS_FILENAME} has a malformed entry")
     return data

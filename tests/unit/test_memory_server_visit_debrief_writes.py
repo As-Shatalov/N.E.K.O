@@ -901,3 +901,12 @@ def test_malformed_retired_entries_fail_closed(tmp_path, payload):
         json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError):
         recent_file.read_retired_keys(path)
+
+
+@pytest.mark.parametrize("stamp", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_retired_stamps_fail_closed(tmp_path, stamp):
+    path = str(tmp_path / "recent.json")
+    Path(recent_file.recent_sidecar_path(path, recent_file.RETIRED_KEYS_FILENAME)).write_text(
+        '{"%s": %s}' % (KEY, stamp), encoding="utf-8")
+    with pytest.raises(ValueError):
+        recent_file.read_retired_keys(path)
