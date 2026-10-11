@@ -858,7 +858,9 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     # 条件转移：「清除这个人」的作废步骤不拿这把锁、会把未定的 debrief 直接改成 forget，不能盖掉它
     # 期望值是整组芯片状态：芯片状态之间的变化（收尾时 mark_debrief_pending 的 None → ask_later 可能晚于芯片
     # 落盘、生成失败后再点是 generating → generating）不算被别人抢先；作废步骤写的 forget 仍拦得住
-    applied, found = await spool.update_state_if(_CHIP_CHOICES, debrief_choice="generating:diary")
+    # 同一次写把待投递标记补上：收尾那次有界的 mark_debrief_pending 没写成时，生成失败后重连也还能重放芯片
+    applied, found = await spool.update_state_if(_CHIP_CHOICES, debrief_choice="generating:diary",
+                                                 debrief_chip_pending=True)
     if not applied:
         return _already_chosen(found)
     try:

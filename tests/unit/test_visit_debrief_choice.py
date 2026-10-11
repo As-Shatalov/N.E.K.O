@@ -1243,3 +1243,13 @@ async def test_startup_notice_follows_the_locked_state(env, monkeypatch):
     assert await task is True
     statuses = [f for f in host.frames if f.get("type") == "status"]
     assert statuses == [] and [rid for rid, _ in host.blocks] == [debrief.preview_request_id(vid(1))]
+
+
+
+async def test_a_failed_generation_still_replays_the_chips_on_reconnect(env):
+    # 收尾时 mark_debrief_pending 没写成（标记为 false），生成又失败：重连后芯片照样重放
+    env.llm.replies = [TimeoutError()]
+    await visit(env, debrief_choice=None, debrief_chip_pending=False)
+    assert (await choose("diary"))[0] == 503
+    state = await state_of(env=env)
+    assert state["debrief_choice"] == "generating:diary" and state["debrief_chip_pending"] is True
