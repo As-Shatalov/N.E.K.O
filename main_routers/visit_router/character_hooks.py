@@ -152,6 +152,10 @@ async def name_block_reason(config_manager: Any, name: str) -> tuple[str, frozen
             logger.warning("visit retire: retry before reusing name %r failed: %r", name, exc)
             return NAME_BUSY, frozenset()
         state = await char_lifecycle.name_marker_state(config_dir, name)
+        if state == char_lifecycle.NAME_RETIRING and await char_lifecycle.is_name_renaming(config_dir, name):
+            # 退役还没补完、名字又挂在一笔改名上：照样挡住，但先按改名对账一次，永久歧义时
+            # 要答「请先删除其中一个」（已清完名册的退役不会让它解开，一直答「稍后再试」解不开）
+            state = char_lifecycle.NAME_RENAMING
     if state == char_lifecycle.NAME_RENAMING:
         try:
             # 改名迁移会等目标名下的退役补完：先补一次，能补完就不用等下次启动

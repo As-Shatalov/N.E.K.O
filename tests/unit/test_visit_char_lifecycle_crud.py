@@ -764,3 +764,20 @@ async def test_an_ambiguous_rename_reports_only_its_own_names(env, monkeypatch):
         character_hooks.NAME_AMBIGUOUS, frozenset({"Extra", "Old"}))
     assert await character_hooks.name_block_reason(cm, "Current") == (
         character_hooks.NAME_AMBIGUOUS, frozenset({"Other", "Current"}))
+
+
+async def test_an_ambiguous_rename_is_reported_while_its_name_also_has_a_roster_done_retirement(env, monkeypatch):
+    cm, _path, config_dir = env
+    await _seed(cm, config_dir)
+    ambiguous = {"old": "Other", "new": "Current", "uid": _uid(cm, "Current")}
+    await set_roster_marker(config_dir, "pending_rename", ambiguous)
+    # Current 下还有一条已清完名册的退役项，按 uid 的步骤一直补不完
+    await add_roster_marker_item(config_dir, "pending_retire", {**lc.retire_item("Current", "e" * 32), "roster_done": True})
+
+    async def stuck(*_a, **_k):
+        return False
+
+    monkeypatch.setattr(lc, "settle_retire", stuck)
+    # 名字照样挡住，但永久歧义要答「请先删除其中一个」，不能一直「稍后再试」（变异：先判退役就停必红）
+    assert await character_hooks.name_block_reason(cm, "Current") == (
+        character_hooks.NAME_AMBIGUOUS, frozenset({"Other", "Current"}))

@@ -685,6 +685,15 @@ async def names_retiring(config_dir: str | Path, names: Iterable[str]) -> bool:
         for item in retiring)
 
 
+async def is_name_renaming(config_dir: str | Path, name: str) -> bool:
+    """Whether a pending or queued rename holds ``name`` (unreadable roster: False)."""
+    try:
+        marker, queued = await read_roster_markers(config_dir, PENDING_RENAME, PENDING_RENAME_QUEUE)
+    except RosterCorruptError:
+        return False
+    return any(name in (rename_marker_names(item) or ()) for item in (marker, *_queued_renames(queued)))
+
+
 async def is_name_retiring(config_dir: str | Path, name: str) -> bool:
     """Whether a deleted character called ``name`` still has a ``pending_retire`` item (unreadable: False)."""
     return await name_marker_state(config_dir, name) == NAME_RETIRING
