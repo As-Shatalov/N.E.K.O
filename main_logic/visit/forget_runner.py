@@ -66,7 +66,6 @@ from main_logic.visit.subjects import (
     PeerRoster,
     RosterCorruptError,
     pending_rename_names,
-    read_roster_marker,
     read_roster_markers,
 )
 from memory.scoped_client import ScopedMemoryClient
