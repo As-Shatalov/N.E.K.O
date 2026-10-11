@@ -2888,8 +2888,10 @@ async def account_change(
                     logger.warning("visit: ending live visits before the account change failed: %r", exc)
             # 还在途的领凭证请求（场次可能已注销、请求仍在后台）读会话时必须仍是旧账号：先等它们结束再改会话
             await _settle_in_flight(_credential_requests, timeout, "credential requests")
-            # 已核过账号、正往页面推复盘块的也先推完：核完账号到写出去之间不会换成另一个账号
-            await _settle_in_flight(_account_bound_pushes, timeout, "debrief pushes")
+            # 已核过账号、正往页面推复盘块的也先推完：核完账号到写出去之间不会换成另一个账号。
+            # 至少等满推送的时限（调用方传了更短的 timeout 也一样）：放行时它们一定已结束或被截断
+            await _settle_in_flight(_account_bound_pushes, max(timeout, _ACCOUNT_BOUND_PUSH_MAX_S + 1.0),
+                                    "debrief pushes")
             yield
     finally:
         _account_changes -= 1
@@ -2933,7 +2935,8 @@ async def _settle_in_flight(futures: set[asyncio.Future], timeout: float, what: 
     pending = [f for f in futures if not f.done()]
     if not pending:
         return
-    # 只等不取消：领凭证请求已发出时取消也撤不回 Servers 那边的签发（与兑掉的邀请码）；推送写到一半也不该截断
+    # 只等不取消：领凭证请求已发出时取消也撤不回 Servers 那边的签发（与兑掉的邀请码）；
+    # 复盘推送由它自己的时限截断（hold_account_for_push），这里也不取消
     _done, still = await asyncio.wait(pending, timeout=max(0.0, timeout))
     if still:
         logger.warning("visit: account change proceeds with %d %s still in flight after %.0fs",

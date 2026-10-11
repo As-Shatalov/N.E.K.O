@@ -254,9 +254,10 @@ async def _replay_one(websocket: Any, lanlan_name: str, visit_id: str, owner: st
                     return False
                 return await _send_owed(websocket, lanlan_name, state, delivered, lang, own_visit_uid)
         except TimeoutError:
-            # 按住账号的时限到了（切号在等）：这一页这次不再重放，下次 bind 再来
-            logger.info("visit display: replay of %s cut off by the account hold limit", visit_id[:6])
-            return False
+            # 这一场按住账号的推送超过了时限：这场截断、下次 bind 再重放；接着试下一场
+            # （真在切号的话，下一场的 _pin_push 会直接给 False，开销很小）
+            logger.info("visit display: replay of %s took longer than the account hold limit; cut off", visit_id[:6])
+            return True
 
 
 async def _send_owed(websocket: Any, lanlan_name: str, state: dict, delivered: set, lang: Optional[str],

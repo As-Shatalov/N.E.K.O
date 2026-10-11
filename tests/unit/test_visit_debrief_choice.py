@@ -676,7 +676,7 @@ def test_payload_parsing():
     assert parse({**ok, "choice": "confirm", "seq": True})[4] == "invalid_seq"
     assert parse({**ok, "choice": "confirm", "seq": 0})[4] == "invalid_seq"
     # 发起页的角色名必填：不带 / 空 / 非字符串 / 过长都拒
-    for bad in (None, "", 7, "x" * 257):
+    for bad in (None, "", 7, "x" * 129, "A" + chr(10) + "B"):
         assert parse({**ok, "choice": "diary", "lanlan_name": bad})[4] == "invalid_lanlan_name"
     assert parse({"visit_id": vid(1), "choice": "diary"})[4] == "invalid_lanlan_name"
 
@@ -1499,10 +1499,15 @@ async def test_a_lost_transcript_still_greys_the_chips_when_cleanup_fails(env, m
 async def test_an_account_change_that_stops_waiting_for_a_push_says_so(env, monkeypatch):
     warnings = []
     monkeypatch.setattr(runtime.logger, "warning", lambda msg, *args: warnings.append(msg % args))
-    async with runtime.hold_account_for_push() as allowed:
-        assert allowed
+    monkeypatch.setattr(runtime, "_ACCOUNT_BOUND_PUSH_MAX_S", 0.01)
+    # 一次超过时限还没结束的推送（比如吞掉了取消）：切号等满之后放行，并留一行日志
+    stuck = asyncio.get_running_loop().create_future()
+    runtime._account_bound_pushes.add(stuck)
+    try:
         async with runtime.account_change(timeout=0.01):
             pass
+    finally:
+        runtime._account_bound_pushes.discard(stuck)
     assert any("1 debrief pushes still in flight" in w for w in warnings)
 
 
@@ -1562,7 +1567,8 @@ async def test_a_stuck_push_is_cut_off_at_the_account_hold_limit(env, monkeypatc
     ), 5)
     assert results == [False, False]
     assert await asyncio.wait_for(debrief.show_owed(env.host, vid(1), own_char="A", lang="zh"), 5) is False
-    assert await asyncio.wait_for(display_socket._replay_one(socket, "A", vid(1), OWN_A, set(), "zh"), 5) is False
+    # 重放这一场被截断：接着试下一场（True），这场留给下次 bind
+    assert await asyncio.wait_for(display_socket._replay_one(socket, "A", vid(1), OWN_A, set(), "zh"), 5) is True
     assert env.host.blocks == [] and env.host.frames == [] and socket.sent == []
     assert not runtime._account_bound_pushes
 
@@ -1597,3 +1603,31 @@ async def test_after_a_rename_the_new_page_gets_the_replayed_block_and_can_choos
     assert status == 200 and body["applied"] == "preview"
     assert (await debrief._choose(vid(1), "confirm", None, "A2")) == (200, {"ok": True, "applied": "diary"})
     assert (await state_of(env=env))["debrief_choice"] == "diary"
+
+
+async def test_an_account_change_with_a_short_timeout_still_outwaits_a_push(env, monkeypatch):
+    # 调用方给切号传了比推送时限还短的 timeout：等推送这一段仍至少等满推送时限
+    monkeypatch.setattr(runtime, "_ACCOUNT_BOUND_PUSH_MAX_S", 0.2)
+    switched = asyncio.Event()
+    release = asyncio.Event()
+
+    async def push():
+        async with runtime.hold_account_for_push() as allowed:
+            assert allowed
+            await asyncio.wait_for(release.wait(), 0.1)  # 0.1 s 后写完，比切号传的 0.01 s 长
+
+    async def switch():
+        async with runtime.account_change(timeout=0.01):
+            order.append(("switched", pushing.done()))
+            switched.set()
+
+    order = []
+    pushing = asyncio.ensure_future(push())
+    await asyncio.sleep(0)
+    change = asyncio.ensure_future(switch())
+    with pytest.raises(TimeoutError):
+        await pushing
+    await asyncio.wait_for(change, 5)
+    # 切号放行（改凭证）时，推送已经结束
+    assert order == [("switched", True)]
+    assert switched.is_set() and not runtime._account_bound_pushes

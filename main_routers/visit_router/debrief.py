@@ -173,8 +173,8 @@ async def _show_owed_locked(host: Any, visit_id: str, *, own_char: str, lang: Op
             return await _push_owed(host, visit_id, state, request_id, blocks, frame,
                                     own_char=own_char, interrupted=interrupted)
     except TimeoutError:
-        # 按住账号的时限到了（切号在等）：这次截断，标记留在 state.json，等 bind 重放
-        logger.info("visit %s: debrief push cut off by the account hold limit", visit_id[:6])
+        # 按住账号的推送超过了时限（_ACCOUNT_BOUND_PUSH_MAX_S）：这次截断，标记留在 state.json，等 bind 重放
+        logger.info("visit %s: debrief push took longer than the account hold limit; cut off", visit_id[:6])
         return False
 
 
@@ -984,12 +984,10 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     return 200, {"ok": True, "applied": "preview", "preview": pending}
 
 
-_LANLAN_NAME_MAX_CHARS = 256
-
-
 def _parse_choice(payload: Mapping[str, Any]) -> tuple[Optional[str], Optional[str], Optional[int],
                                                         Optional[str], Optional[str]]:
     """``(visit_id, choice, seq, lanlan_name, error code)``; ``lanlan_name`` is the requesting page's character."""
+    from main_routers.visit_router.http import _valid_name
     from utils.visit_wire import VISIT_ID_RE
 
     visit_id = payload.get("visit_id")
@@ -1002,7 +1000,8 @@ def _parse_choice(payload: Mapping[str, Any]) -> tuple[Optional[str], Optional[s
     if seq is not None and (isinstance(seq, bool) or not isinstance(seq, int) or seq < 1):
         return None, None, None, None, "invalid_seq"
     lanlan_name = payload.get("lanlan_name")
-    if not isinstance(lanlan_name, str) or not lanlan_name or len(lanlan_name) > _LANLAN_NAME_MAX_CHARS:
+    if not _valid_name(lanlan_name):
+        # 与串门其他端点同一套角色名校验（非空、可打印、上限 128）
         return None, None, None, None, "invalid_lanlan_name"
     return visit_id, choice, seq, lanlan_name, None
 
