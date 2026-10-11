@@ -296,16 +296,53 @@ def test_a_snapshot_rename_without_visit_data_writes_nothing(tmp_path):
     assert not (Path(target_cm.config_dir) / "visit_peers.json").exists()
 
 
-async def test_a_snapshot_rename_keeps_an_earlier_pending_rename(tmp_path):
+async def test_a_snapshot_rename_queues_behind_an_earlier_pending_rename(tmp_path):
     from main_logic.visit.subjects import set_roster_marker
 
     config_dir = tmp_path
     earlier = {"old": "X", "new": "Y", "uid": "e" * 32}
     await set_roster_marker(config_dir, "pending_rename", earlier)
-    # 标记只有一个位置：已有一笔没对完账的改名时不覆盖（变异：覆盖必红）
-    assert lc.record_renamed_characters_sync(config_dir, [{"old": "A", "new": "C", "uid": "c" * 32}]) == 0
+    item = {"old": "A", "new": "C", "uid": "c" * 32}
+    # 标记只有一个位置：已有一笔没对完账的改名时不覆盖（变异：覆盖必红），排进队列（变异：只记日志必红）
+    assert lc.record_renamed_characters_sync(config_dir, [item]) == 1
     peers = json.loads((config_dir / "visit_peers.json").read_text(encoding="utf-8"))
     assert peers["pending_rename"] == earlier
+    assert peers["pending_rename_queue"] == [item]
+    assert await lc.name_marker_state(config_dir, "A") == lc.NAME_RENAMING
+    assert await lc.name_marker_state(config_dir, "C") == lc.NAME_RENAMING
+
+
+async def test_a_snapshot_renaming_two_characters_migrates_both(tmp_path):
+    from tests.unit.visit_memory_test_helpers import PEER_X, PEER_Y, TAG_Y
+
+    config_dir = tmp_path
+    uid_a, uid_b = "a" * 32, "b" * 32
+    roster = await seed_roster(config_dir, own_char="A")
+    await seed_roster(config_dir, peer_uid=PEER_Y, tag=TAG_Y, own_char="B")
+    renamed = [{"old": "A", "new": "A2", "uid": uid_a}, {"old": "B", "new": "B2", "uid": uid_b}]
+    assert lc.record_renamed_characters_sync(config_dir, renamed) == 2
+    unsettled = await lc.reconcile_renames(config_dir, {"A2", "B2"}, {"A2": uid_a, "B2": uid_b})
+    # 变异：不按队列依次处理必红（第二个角色的条目留在旧名下）
+    assert unsettled == frozenset()
+    assert await roster.get_char_entry(PEER_X, "A2") is not None
+    assert await roster.get_char_entry(PEER_Y, "B2") is not None
+    assert await roster.get_char_entry(PEER_Y, "B") is None
+    peers = json.loads((config_dir / "visit_peers.json").read_text(encoding="utf-8"))
+    assert "pending_rename" not in peers and "pending_rename_queue" not in peers
+
+
+async def test_a_removed_character_with_a_queued_rename_retires_its_other_name(tmp_path):
+    from main_logic.visit.subjects import set_roster_marker
+
+    config_dir = tmp_path
+    uid = "c" * 32
+    await seed_roster(config_dir, own_char="A")
+    await set_roster_marker(config_dir, "pending_rename", {"old": "X", "new": "Y", "uid": "e" * 32})
+    lc.record_renamed_characters_sync(config_dir, [{"old": "A", "new": "C", "uid": uid}])
+    # 排队中的改名同样算作这个角色的另一个名字（变异：只看位置必红）
+    lc.record_removed_characters_sync(config_dir, [{"name": "C", "character_uid": uid}])
+    peers = json.loads((config_dir / "visit_peers.json").read_text(encoding="utf-8"))
+    assert {item["name"] for item in peers["pending_retire"]} == {"C", "A"}
 
 
 async def test_a_snapshot_rename_of_the_same_character_chains_onto_its_pending_rename(tmp_path, caplog):

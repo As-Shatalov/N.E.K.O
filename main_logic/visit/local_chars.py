@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 
 from utils.config_manager import get_config_manager
 from utils.config_manager.reserved_schema import get_character_uid
@@ -61,8 +62,12 @@ async def ensure_characters_readable() -> None:
     erase that enumerates "every local character" must not take those
     defaults for the real scope.
     """
-    path = str(get_config_manager().get_config_path("characters.json"))
-    await asyncio.to_thread(_check_characters_file, path)
+    await ensure_characters_file_readable(get_config_manager().get_config_path("characters.json"))
+
+
+async def ensure_characters_file_readable(path: Any) -> None:
+    """:func:`ensure_characters_readable` for the ``characters.json`` at ``path``."""
+    await asyncio.to_thread(_check_characters_file, str(path))
 
 
 async def load_local_characters() -> dict[str, str]:

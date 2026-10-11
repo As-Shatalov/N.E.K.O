@@ -722,3 +722,48 @@ async def test_startup_recovery_retires_the_target_name_before_the_rename_moves_
     assert not (tmp_path / "visit_spool" / f"{vid(3)}.state.json").exists()
     data = _peers(tmp_path)
     assert "pending_retire" not in data and "pending_rename" not in data
+
+
+async def test_startup_recovery_drains_the_queued_renames_of_a_cloudsave_import(tmp_path, _readable, monkeypatch):
+    from main_logic.visit import local_chars
+
+    async def configured():
+        return {"A2": CHAR_UID_A, "B2": CHAR_UID_B}
+
+    monkeypatch.setattr(local_chars, "load_local_characters", configured)
+    roster = await seed_roster(tmp_path, own_char="A")
+    await seed_roster(tmp_path, peer_uid=PEER_Y, tag=TAG_Y, own_char="B")
+    await make_visit(tmp_path, vid(2), [ln(1)], own_char="B", own_char_uid=CHAR_UID_B)
+    await set_roster_marker(tmp_path, "pending_rename", {"old": "A", "new": "A2", "uid": CHAR_UID_A})
+    gone = {"old": "G", "new": "G2", "uid": "f" * 32}
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", gone)
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", {"old": "B", "new": "B2", "uid": CHAR_UID_B})
+    report = await _recover(tmp_path, ["A2", "B2"], {}, list_char_names=None)
+    # 变异：启动对账不处理队列必红（B 的条目留在旧名下）
+    assert report.renamed is True
+    assert await roster.get_char_entry(PEER_X, "A2") is not None
+    assert await roster.get_char_entry(PEER_Y, "B2") is not None and await roster.get_char_entry(PEER_Y, "B") is None
+    assert await _state_char(tmp_path, vid(2)) == "B2"
+    data = _peers(tmp_path)
+    assert "pending_rename" not in data and "pending_rename_queue" not in data
+
+
+async def test_startup_recovery_drops_a_deleted_characters_queued_rename_behind_a_stuck_slot(
+    tmp_path, _readable, monkeypatch,
+):
+    from main_logic.visit import local_chars
+
+    async def configured():
+        return {"A2": CHAR_UID_A, "X": CHAR_UID_B}
+
+    monkeypatch.setattr(local_chars, "load_local_characters", configured)
+    await seed_roster(tmp_path, own_char="A")
+    # 位置上的改名永久歧义（新名 X 被另一个角色占着）：队列轮不到
+    stuck = {"old": "A", "new": "X", "uid": CHAR_UID_A}
+    await set_roster_marker(tmp_path, "pending_rename", stuck)
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", {"old": "G", "new": "G2", "uid": "f" * 32})
+    await _recover(tmp_path, ["A2", "X"], {}, list_char_names=None)
+    # 已删除角色的排队改名不用等位置：直接撤掉，G / G2 不再被占着（变异：不撤必红）
+    data = _peers(tmp_path)
+    assert data["pending_rename"] == stuck and "pending_rename_queue" not in data
+    assert await lc.name_marker_state(tmp_path, "G") == lc.NAME_FREE

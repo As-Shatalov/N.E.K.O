@@ -30,7 +30,7 @@ from __future__ import annotations
 from pathlib import Path, PurePath
 from typing import Any
 
-from main_logic.visit import char_lifecycle
+from main_logic.visit import char_lifecycle, local_chars
 from utils.logger_config import get_module_logger
 
 logger = get_module_logger(__name__, "Main")
@@ -52,6 +52,11 @@ def names_loader(config_manager: Any) -> char_lifecycle.LoadNames:
     """``LoadNames`` reading the character config through ``config_manager``."""
 
     async def load() -> tuple[set[str], dict[str, str] | None]:
+        config_path = getattr(config_manager, "get_config_path", None)
+        if callable(config_path):
+            # 普通读取在文件坏了时静默退回缓存 / 默认角色：拿它对账会把还在的角色当成已删除，
+            # 清掉标记却不迁移。读不出就抛出，调用方按「对不完账」处理（与启动对账一致）
+            await local_chars.ensure_characters_file_readable(config_path("characters.json"))
         return char_lifecycle.names_of(await config_manager.aload_characters())
 
     return load
@@ -149,12 +154,13 @@ async def name_block_reason(config_manager: Any, name: str) -> tuple[str, frozen
     if state == char_lifecycle.NAME_RENAMING:
         try:
             names, uid_of = await names_loader(config_manager)()
-            unsettled = await char_lifecycle.reconcile_rename(config_dir, names, uid_of)
+            unsettled = await char_lifecycle.reconcile_renames(config_dir, names, uid_of)
         except Exception as exc:  # noqa: BLE001 - 对不完账就挡住这个名字，标记留给启动对账
             logger.warning("visit rename: pending_rename not reconciled before reusing %r: %r", name, exc)
         else:
-            # 显式判断：ALL_NAMES（读不出）是另一个哨兵，不能被当成「请删除角色」
-            if isinstance(unsettled, frozenset) and unsettled:
+            # 显式判断：ALL_NAMES（读不出）是另一个哨兵，不能被当成「请删除角色」；名字只在队列里时，
+            # 挡住它的是前面那笔歧义改名，并非它自己，答「稍后再试」
+            if isinstance(unsettled, frozenset) and name in unsettled:
                 # 永久 ambiguous（另一个名字已被别的角色占着）：重试也解不开，只有删掉其中一个角色才行
                 logger.warning("visit rename: ambiguous pending_rename holds %r", name)
                 return NAME_AMBIGUOUS, unsettled

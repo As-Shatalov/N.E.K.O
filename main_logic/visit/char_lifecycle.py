@@ -68,6 +68,7 @@ from main_logic.visit.subjects import (
     add_roster_marker_item,
     add_roster_marker_item_sync,
     clear_roster_marker,
+    promote_roster_marker,
     read_roster_marker,
     read_roster_marker_sync,
     set_roster_marker_sync,
@@ -79,6 +80,7 @@ from utils.logger_config import get_module_logger
 logger = get_module_logger(__name__, "Main")
 
 PENDING_RENAME = "pending_rename"
+PENDING_RENAME_QUEUE = "pending_rename_queue"
 PENDING_RETIRE = "pending_retire"
 
 RetirePersona = Callable[[str], Awaitable[Any]]
@@ -235,6 +237,47 @@ async def reconcile_rename(
     return frozenset() if await clear_roster_marker(config_dir, PENDING_RENAME, marker) else ALL_NAMES
 
 
+async def promote_queued_rename(config_dir: str | Path) -> bool:
+    """Move the next queued rename into the empty ``pending_rename`` slot; True when one moved."""
+    return await promote_roster_marker(config_dir, PENDING_RENAME, PENDING_RENAME_QUEUE) is not None
+
+
+async def drop_deleted_queued_renames(config_dir: str | Path, uid_of: dict[str, str] | None) -> None:
+    """Drop the queued renames of characters no longer configured (needs ``uid_of``).
+
+    The same outcome as the slot's deleted branch: nothing moves, the
+    delete's retirement handles the data. Done without waiting for the slot,
+    which an ambiguous rename may hold for good.
+    """
+    if uid_of is None:
+        return
+    configured = set(uid_of.values())
+    for item in _queued_renames(await read_roster_marker(config_dir, PENDING_RENAME_QUEUE)):
+        uid = item.get("uid") if isinstance(item, dict) else None
+        if isinstance(uid, str) and uid and uid not in configured:
+            logger.warning("visit recovery: queued rename %r names a deleted character, dropped", item)
+            await remove_roster_marker_item(config_dir, PENDING_RENAME_QUEUE, item)
+
+
+async def reconcile_renames(config_dir: Path, names: set[str], uid_of: dict[str, str] | None = None) -> Any:
+    """:func:`reconcile_rename`, then each queued rename in turn while the slot keeps clearing.
+
+    A cloudsave import that renamed several characters queues all but the
+    first (``pending_rename_queue``); the slot takes them one at a time.
+    Queued renames of deleted characters are dropped first. Returns what the
+    last reconciliation returned.
+    """
+    await drop_deleted_queued_renames(config_dir, uid_of)
+    unsettled = await reconcile_rename(config_dir, names, uid_of)
+    while unsettled == frozenset() and await promote_queued_rename(config_dir):
+        unsettled = await reconcile_rename(config_dir, names, uid_of)
+    return unsettled
+
+
+def _queued_renames(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
 async def begin_rename(
     config_dir: str | Path, old: str, new: str, character_uid: str | None, *,
     names: set[str], uid_of: dict[str, str] | None,
@@ -299,7 +342,7 @@ def retire_item(name: str, character_uid: str | None) -> dict:
 
 async def _settle_own_rename(
     config_dir: Path, name: str, character_uid: str | None, load_names: LoadNames,
-) -> None:
+) -> tuple[str, ...]:
     """Reconcile a pending rename of the character about to be deleted; raise when it cannot be.
 
     Retirement goes by the character's current name only: entries a failed
@@ -307,14 +350,19 @@ async def _settle_own_rename(
     character taking that name later would inherit them. An unsettleable
     rename (unreadable spools) raises :class:`RenamePendingElsewhere`; an
     ambiguous one (the other name was taken by another character meanwhile)
-    lets the delete go ahead, nothing being separable any more.
+    lets the delete go ahead, nothing being separable any more. Returns the
+    other names of a queued rename that still could not take the slot (an
+    ambiguous one holds it): they are retired with the character, no other
+    local character holding them.
     """
     marker = await read_roster_marker(config_dir, PENDING_RENAME)
-    if not _rename_names_of(marker, name, character_uid):
-        return
+    queued = _queued_renames(await read_roster_marker(config_dir, PENDING_RENAME_QUEUE))
+    if not _rename_names_of(marker, name, character_uid) and not any(
+            _rename_names_of(item, name, character_uid) for item in queued):
+        return ()
     try:
         names, uid_of = await load_names()
-        unsettled = await reconcile_rename(config_dir, names, uid_of)
+        unsettled = await reconcile_renames(config_dir, names, uid_of)
     except Exception as exc:  # noqa: BLE001 - 对不完账就拒绝这次删除，标记留给启动对账
         raise RenamePendingElsewhere("this character's rename is still being migrated") from exc
     if unsettled is ALL_NAMES:
@@ -323,6 +371,15 @@ async def _settle_own_rename(
         # 另一个名字已被别的角色占用：两边的条目分不开了，删掉这个角色不会让情况更糟；
         # 它的 uid 一消失，下次对账就按「已删除」清掉标记
         logger.warning("visit retire: ambiguous pending_rename of %r left as is, delete goes ahead", name)
+    # 还排在队里（位置被一笔永久歧义的改名占着）：它的另一个名字随角色一起退役，
+    # 之后轮到这一笔时按「已删除」清掉
+    held = set(names) - {name}
+    return tuple(dict.fromkeys(
+        other
+        for item in _queued_renames(await read_roster_marker(config_dir, PENDING_RENAME_QUEUE))
+        for other in _rename_names_of(item, name, character_uid)
+        if other != name and other not in held
+    ))
 
 
 async def begin_retire(
@@ -339,8 +396,11 @@ async def begin_retire(
     config_dir = Path(config_dir)
     if not await has_visit_data(config_dir, character_uid):
         return None
+    others: tuple[str, ...] = ()
     if load_names is not None:
-        await _settle_own_rename(config_dir, name, character_uid, load_names)
+        others = await _settle_own_rename(config_dir, name, character_uid, load_names)
+    for other in others:
+        await add_roster_marker_item(config_dir, PENDING_RETIRE, retire_item(other, character_uid))
     item = retire_item(name, character_uid)
     await add_roster_marker_item(config_dir, PENDING_RETIRE, item)
     return item
@@ -470,12 +530,14 @@ async def name_marker_state(config_dir: str | Path, name: str) -> str:
     try:
         retiring = await read_roster_marker(config_dir, PENDING_RETIRE)
         renaming = await read_roster_marker(config_dir, PENDING_RENAME)
+        queued = _queued_renames(await read_roster_marker(config_dir, PENDING_RENAME_QUEUE))
     except RosterCorruptError as exc:
         logger.warning("visit lifecycle: roster unreadable, name %r not checked: %s", name, exc)
         return NAME_UNREADABLE
     if isinstance(retiring, list) and any((_item_fields(item) or ("", None))[0] == name for item in retiring):
         return NAME_RETIRING
-    if isinstance(renaming, dict) and name in (renaming.get("old"), renaming.get("new")):
+    if any(isinstance(marker, dict) and name in (marker.get("old"), marker.get("new"))
+           for marker in (renaming, *queued)):
         return NAME_RENAMING
     return NAME_FREE
 
@@ -519,18 +581,20 @@ def record_removed_characters_sync(
     config_dir = Path(config_dir)
     kept = set(kept_local_names)
     try:
-        rename_marker = read_roster_marker_sync(config_dir, PENDING_RENAME)
+        rename_markers = [read_roster_marker_sync(config_dir, PENDING_RENAME),
+                          *_queued_renames(read_roster_marker_sync(config_dir, PENDING_RENAME_QUEUE))]
     except RosterCorruptError:
-        rename_marker = None  # 名册读不出：写标记那一步同样会失败，由回调方记日志
+        rename_markers = []  # 名册读不出：写标记那一步同样会失败，由回调方记日志
     added = 0
     for entry in removed:
         fields = _item_fields(retire_item(entry.get("name"), entry.get("character_uid")))
         if fields is None or not _has_visit_files_sync(config_dir, fields[1]):
             continue
         name, uid = fields
-        names = [name] + [
-            other for other in _rename_names_of(rename_marker, name, uid) if other != name and other not in kept
-        ]
+        names = list(dict.fromkeys([name] + [
+            other for marker in rename_markers for other in _rename_names_of(marker, name, uid)
+            if other != name and other not in kept
+        ]))
         for retiring in names:
             added += bool(add_roster_marker_item_sync(config_dir, PENDING_RETIRE, retire_item(retiring, uid)))
     return added
@@ -543,10 +607,12 @@ def record_renamed_characters_sync(config_dir: str | Path, renamed: Iterable[Map
     ``{old, new, uid}`` of every local character the snapshot renamed (on
     another device). Startup recovery then reconciles the marker by uid like
     any rename: the roster entries and spools follow the character to its new
-    name (or stay, when the import rolled back). The marker has one slot, so
-    only the first rename is recorded when there are several, and none when
-    another rename is still pending. Machines without visit data get nothing;
-    returns the number of markers written.
+    name (or stay, when the import rolled back). The marker has one slot:
+    a rename finding it taken by another character waits in
+    ``pending_rename_queue`` and takes the slot once it clears; one finding it
+    taken by the same character's unfinished rename is left to that one
+    (recovery sees the character under a third name and moves both). Machines
+    without visit data get nothing; returns the number of renames recorded.
     """
     config_dir = Path(config_dir)
     written = 0
@@ -564,8 +630,10 @@ def record_renamed_characters_sync(config_dir: str | Path, renamed: Iterable[Map
             logger.info("visit rename: cloudsave renamed %r to %r on top of pending %r; recovery chains it",
                         old, new, existing)
         else:
-            logger.warning("visit rename: cloudsave renamed %r to %r but pending_rename %r is still pending; "
-                           "visit data stays under the old name", old, new, existing)
+            # 标记只有一个位置：排进队列，启动对账在这一笔清掉之后依次处理（同一次导入改了几个角色）
+            written += bool(add_roster_marker_item_sync(
+                config_dir, PENDING_RENAME_QUEUE, {"old": old, "new": new, "uid": uid}))
+            logger.info("visit rename: cloudsave renamed %r to %r queued behind pending %r", old, new, existing)
     return written
 
 

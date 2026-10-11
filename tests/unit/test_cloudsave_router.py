@@ -1946,6 +1946,8 @@ async def _visit_download_env(monkeypatch, target_name="本地角色"):
         bootstrap_local_cloudsave_environment(target_cm)
         _write_runtime_state(source_cm, character_name="云端角色")
         _write_runtime_state(target_cm, character_name=target_name)
+        # 启动时会补发 character_uid；对账前的严格读取不认缺 uid 的角色
+        target_cm.backfill_character_uids()
 
         from utils.cloudsave_runtime import export_cloudsave_character_unit
 

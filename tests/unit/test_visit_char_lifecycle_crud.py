@@ -589,6 +589,77 @@ async def test_deleting_another_character_ignores_an_unsettled_rename(env, monke
     assert _peers(config_dir)["pending_rename"] == {"old": "Old", "new": "New", "uid": uid}
 
 
+async def _queue_behind(config_dir, slot):
+    """Move the current ``pending_rename`` into ``pending_rename_queue`` and put ``slot`` in its place."""
+    data = _peers(config_dir)
+    data["pending_rename_queue"] = [data["pending_rename"]]
+    data["pending_rename"] = slot
+    (config_dir / "visit_peers.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+async def test_a_queued_rename_is_reconciled_before_its_name_is_reused(env, monkeypatch):
+    cm, _path, config_dir = env
+    roster, _uid_old, _persona, unlock = await _failed_rename(cm, config_dir, monkeypatch)
+    # 云快照一次改了几个角色：Old -> New 排在一笔已删除角色的改名之后
+    await _queue_behind(config_dir, {"old": "Gone", "new": "Gone2", "uid": "f" * 32})
+    unlock()
+    # 变异：只对账位置上那一笔必红（Old 一直被队列占着）
+    status, body = await _add(cm, "Old")
+    assert status == 200 and body["success"] is True
+    data = _peers(config_dir)
+    assert "pending_rename" not in data and "pending_rename_queue" not in data
+    assert await roster.get_char_entry(PEER_X, "Old") is None
+    assert await roster.get_char_entry(PEER_X, "New") is not None
+
+
+async def test_a_name_queued_behind_an_ambiguous_rename_is_busy_not_ambiguous(env, monkeypatch):
+    cm, _path, config_dir = env
+    _roster, _uid_old, _persona, unlock = await _failed_rename(cm, config_dir, monkeypatch)
+    # 位置上是一笔永久歧义的改名（Other 被别的角色占着），Old -> New 排在它后面
+    ambiguous = {"old": "Other", "new": "Current", "uid": _uid(cm, "Current")}
+    await _queue_behind(config_dir, ambiguous)
+    unlock()
+    # 挡住 Old 的不是它自己的歧义：答「稍后再试」，不能让用户去删 Other / Current（变异：不看名字必红）
+    assert await character_hooks.name_block_reason(cm, "Old") == (character_hooks.NAME_BUSY, frozenset())
+    assert await character_hooks.name_block_reason(cm, "Other") == (
+        character_hooks.NAME_AMBIGUOUS, frozenset({"Other", "Current"}))
+
+
+async def test_deleting_a_character_whose_rename_is_stuck_in_the_queue_retires_its_other_name(env, monkeypatch):
+    cm, _path, config_dir = env
+    roster, uid, _persona, unlock = await _failed_rename(cm, config_dir, monkeypatch)
+    await _queue_behind(config_dir, {"old": "Other", "new": "Current", "uid": _uid(cm, "Current")})
+    unlock()
+    # 排队的改名轮不到（位置被歧义占着）：删 New 不能被永远挡住，旧名 Old 随它一起退役（变异：不退役 Old 必红）
+    status, body = await _delete(cm, "New")
+    assert status == 200 and body["success"] is True
+    assert "New" not in cm.load_characters()["猫娘"]
+    assert _peers(config_dir)["pending_retire"] == [lc.retire_item("Old", uid)]
+    assert await roster.get_char_entry(PEER_X, "New") is None
+    assert await VisitSpool(config_dir, vid(1)).read_state() is None
+    # 新建 Old 前先补完它的退役：不继承任何条目
+    status, body = await _add(cm, "Old")
+    assert status == 200 and await roster.get_char_entry(PEER_X, "Old") is None
+    assert "pending_retire" not in _peers(config_dir)
+
+
+async def test_reconciling_on_demand_refuses_a_fallback_character_config(env, monkeypatch):
+    cm, path, config_dir = env
+    _roster, _uid_old, _persona, unlock = await _failed_rename(cm, config_dir, monkeypatch)
+    unlock()
+    marker = _peers(config_dir)["pending_rename"]
+    original = Path(path).read_text(encoding="utf-8")
+    # 配置文件坏了：普通读取会退回缓存 / 默认角色，拿它对账可能把 New 当成已删除、清掉标记不迁移
+    Path(path).write_text("{broken", encoding="utf-8")
+    try:
+        # 变异：不先严格读取必红（按退回的配置对完账、放行）
+        assert await character_hooks.name_block_reason(cm, "Old") == (character_hooks.NAME_BUSY, frozenset())
+        assert _peers(config_dir)["pending_rename"] == marker
+        assert (await VisitSpool(config_dir, vid(1)).read_state())["own_char"] == "Old"
+    finally:
+        Path(path).write_text(original, encoding="utf-8")
+
+
 async def test_unsubscribe_refuses_a_character_whose_rename_cannot_be_settled(tmp_path, monkeypatch):
     config = _unsubscribe_config(tmp_path)
     await _seed_lan(config.config_dir, monkeypatch)

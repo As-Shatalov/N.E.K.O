@@ -546,6 +546,36 @@ async def remove_roster_marker_item(config_dir: str | Path, key: str, item: Any)
     return await asyncio.to_thread(_edit_marker_list_sync, path, key, item, False)
 
 
+def _promote_marker_sync(path: Path, slot_key: str, queue_key: str) -> Any:
+    with path_lock(path):
+        data = _read_top_level_sync_unlocked(path)
+        queue = data.get(queue_key)
+        if data.get(slot_key) is not None or not queue:
+            return None
+        if not isinstance(queue, list):
+            raise RosterCorruptError(f"{path.name}: {queue_key!r} is not a list")
+        item, *rest = queue
+        data[slot_key] = copy.deepcopy(item)
+        if rest:
+            data[queue_key] = rest
+        else:
+            del data[queue_key]
+        atomic_write_json(path, data)
+        return copy.deepcopy(item)
+
+
+async def promote_roster_marker(config_dir: str | Path, slot_key: str, queue_key: str) -> Any:
+    """Move the first item of the list ``queue_key`` into the empty slot ``slot_key``; return it.
+
+    ``None`` when the slot is still taken or the queue is empty (nothing is
+    written). One write, so a crash never loses or duplicates the item. A
+    queue that is not a list, or an unreadable roster, raises
+    :class:`RosterCorruptError`.
+    """
+    path = Path(config_dir) / VISIT_PEERS_FILENAME
+    return await asyncio.to_thread(_promote_marker_sync, path, slot_key, queue_key)
+
+
 class PeerRoster:
     """The local peer roster of one community account (``accounts[own_uid]``).
 

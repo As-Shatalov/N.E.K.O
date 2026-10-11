@@ -19,7 +19,8 @@ PR-08 ``recovery.py``. :func:`visit_spool_recovery` is started with
 ``asyncio.create_task`` after startup (PR-09b) and runs, in order:
 
 1. the retirement of deleted characters (``pending_retire``), then the
-   character-rename reconciliation (``visit_peers.json.pending_rename``), so
+   character-rename reconciliation (``visit_peers.json.pending_rename``, then
+   each rename a cloudsave import queued in ``pending_rename_queue``), so
    a rename never moves entries into a name whose leftovers are still to be
    retired, and forgets resolve roster entries under their current name;
 2. unfinished local forgets (clearing sentinels, then revocation logs);
@@ -58,6 +59,8 @@ from main_logic.visit.char_lifecycle import (
     ALL_NAMES as _ALL_NAMES,
     MARKER_CHANGED as _MARKER_CHANGED,
     RetirePersona,
+    drop_deleted_queued_renames,
+    promote_queued_rename,
     reconcile_rename as _reconcile_rename,
     replay_retires,
 )
@@ -1411,7 +1414,11 @@ async def visit_spool_recovery(
             logger.error("visit recovery: retirement replay failed: %r", exc)
             report.retired = False
         try:
+            await drop_deleted_queued_renames(config_dir, uid_of)
             unsettled = await _reconcile_rename_guarded(config_dir, names, uid_of, lifecycle_guard, load_names)
+            # 云快照一次改了几个角色的名字：其余的排在队列里，位置清掉后依次轮到
+            while unsettled == frozenset() and await promote_queued_rename(config_dir):
+                unsettled = await _reconcile_rename_guarded(config_dir, names, uid_of, lifecycle_guard, load_names)
         except Exception as exc:  # noqa: BLE001 - 补录各段互不连累
             logger.error("visit recovery: rename reconciliation failed: %r", exc)
             unsettled = _ALL_NAMES
