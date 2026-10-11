@@ -1373,12 +1373,17 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
     if any(not text for text in texts):
         raise HTTPException(status_code=422, detail="each fact text must contain 1..60 characters")
     key = f"visit-facts:{req.visit_id}"
+    facts_hash = hashlib.sha256(json.dumps(texts, ensure_ascii=False).encode("utf-8")).hexdigest()
     unavailable = HTTPException(status_code=503, detail="visit facts not confirmed; retry later")
     async with idempotency.key_lock(lanlan_name, key):
         try:
             record = await idempotency.read_key(lanlan_name, key)
         except (idempotency.IdempotencyStateError, OSError) as exc:
             raise unavailable from exc
+        stored_hash = record.get("content_hash") if record is not None else None
+        if stored_hash is not None and stored_hash != facts_hash:
+            # 同一场只有一份事实（客户端重试用落盘的同一份）：内容变了是调用方的错，不能报成已写
+            raise HTTPException(status_code=422, detail="visit_id reused with different facts")
         if record is not None and record.get("state") in idempotency.TERMINAL_KEY_STATES:
             return {"ok": True, "written": int(record.get("written") or 0),
                     "deduped": int(record.get("deduped") or 0), "duplicate": True}
@@ -1398,11 +1403,13 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
                 deduped = max(len(texts) - already, 0)
                 await idempotency.update_key(
                     lanlan_name, key,
-                    idempotency.transition(idempotency.KEY_STATE_DONE, written=already, deduped=deduped),
+                    idempotency.transition(idempotency.KEY_STATE_DONE, written=already, deduped=deduped,
+                                           content_hash=facts_hash),
                 )
                 return {"ok": True, "written": already, "deduped": deduped, "duplicate": True}
             await idempotency.update_key(
-                lanlan_name, key, idempotency.transition(idempotency.KEY_STATE_PENDING, kind="visit_facts"),
+                lanlan_name, key,
+                idempotency.transition(idempotency.KEY_STATE_PENDING, kind="visit_facts", content_hash=facts_hash),
             )
             created: list[dict] = []
             if texts:

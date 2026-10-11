@@ -607,3 +607,23 @@ async def test_visit_facts_skip_semantic_arbitration(env, monkeypatch):
     monkeypatch.setattr(env.fs, "_apersist_new_facts", spy)
     await _facts(env, ["在邻居家看了星星"])
     assert seen["semantic_dedup"] is False
+
+
+# ── 评审第 2 轮 ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("settle", ["done", "pending"])
+async def test_visit_facts_reject_a_changed_fact_list(env, settle):
+    from fastapi import HTTPException
+
+    from app.memory_server import idempotency
+
+    await _facts(env, ["在邻居家看了星星"])
+    if settle == "pending":
+        data = json.loads(Path(idempotency.keys_path(NAME)).read_text(encoding="utf-8"))
+        data[f"visit-facts:{VISIT}"]["state"] = "pending"
+        Path(idempotency.keys_path(NAME)).write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(HTTPException) as info:
+        await _facts(env, ["改过的事实"])
+    assert info.value.status_code == 422
+    assert [r["text"] for r in _pool(env) if r.get("visit_id") == VISIT] == ["在邻居家看了星星"]

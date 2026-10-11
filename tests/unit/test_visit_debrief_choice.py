@@ -771,3 +771,49 @@ async def test_stopping_cancels_a_retry_that_is_already_running(env):
     finally:
         internal.get_internal_http_client = original
     assert debrief.pending_commit_retries() == {}
+
+
+# ── 评审第 2 轮 ──────────────────────────────────────────────────────────
+
+
+async def test_a_locally_failed_retry_is_armed_again(env, monkeypatch):
+    await visit(env)
+    await preview(env)
+    env.memory.script["cache"] = [(503, {})]
+    await choose("confirm")
+    real = debrief.run_commit
+
+    async def broken(visit_id, trigger):
+        raise OSError("state.json locked")
+
+    monkeypatch.setattr(debrief, "run_commit", broken)
+    await fire(env)
+    assert await armed(env) == debrief._LOCAL_FAILURE_RETRY_S
+    monkeypatch.setattr(debrief, "run_commit", real)
+    env.clock.now += debrief._LOCAL_FAILURE_RETRY_S
+    await fire(env)
+    assert (await state_of(env=env))["debrief_choice"] == "diary"
+
+
+async def test_bind_replay_rereads_the_state_under_the_visit_lock(env, monkeypatch):
+    await visit(env)
+    await preview(env)
+    stale = await state_of(env=env)
+    assert await choose("forget") == (200, {"ok": True, "applied": "forget"})
+
+    async def snapshot(_name):
+        return [stale]
+
+    monkeypatch.setattr(display_socket, "_pending_debriefs", snapshot)
+
+    class Socket:
+        def __init__(self):
+            setattr(self, VISIT_SOCKET_BOUND_ATTR, True)
+            self.sent = []
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+    socket = Socket()
+    await display_socket._replay_chips(socket, "A")
+    assert socket.sent == []

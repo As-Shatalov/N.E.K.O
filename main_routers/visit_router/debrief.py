@@ -545,7 +545,12 @@ def schedule_commit_retry(visit_id: str, next_at: float, *, epoch: Optional[int]
     _timers[visit_id] = task
 
 
+_LOCAL_FAILURE_RETRY_S = 600
+"""Next retry after a retry that failed locally (``state.json`` unreadable / unwritable, ...)."""
+
+
 async def _retry_at(visit_id: str, next_at: float) -> None:
+    epoch = _timer_epoch
     try:
         await _sleep(max(0.0, next_at - _now()))
     except asyncio.CancelledError:
@@ -559,8 +564,12 @@ async def _retry_at(visit_id: str, next_at: float) -> None:
         await run_commit(visit_id, "timer")
     except asyncio.CancelledError:
         raise
-    except Exception as exc:  # noqa: BLE001 - state.json 读不出等：下次启动补录再排
-        logger.warning("visit %s: diary retry failed: %r", visit_id[:6], exc)
+    except Exception as exc:  # noqa: BLE001 - state.json 一时读写不了等：不能就此断掉自动重试
+        logger.warning("visit %s: diary retry failed locally, again in %ds: %r",
+                       visit_id[:6], _LOCAL_FAILURE_RETRY_S, exc)
+        # 写入不设重试上限：本地失败同样再排一次（停止 / 回滚之后代次过期，不再排）
+        if visit_id not in _timers:
+            schedule_commit_retry(visit_id, _now() + _LOCAL_FAILURE_RETRY_S, epoch=epoch)
     finally:
         _running.discard(me)
 
