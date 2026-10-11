@@ -149,7 +149,11 @@ async def reconcile_rename(
     the direction is decided by which name that uid has now. Without a uid,
     by which of the two names exists. When neither name exists the
     character was deleted (its data is retired by uid): the marker is
-    dropped. An empty set means no rename is pending; ``{old, new}`` that
+    dropped. When the uid now has a third name (a cloudsave import renamed
+    it again while this marker held the slot) and neither old name is reused,
+    entries under both names move to the current one. A migration into a
+    name that still has a ``pending_retire`` item waits for that retirement
+    (the marker is kept). An empty set means no rename is pending; ``{old, new}`` that
     the marker is kept as genuinely ambiguous (only those two names wait);
     ``None`` that the roster or marker is unreadable (everything waits).
     ``undo_moves=False`` (the rename transaction itself, which migrates only
@@ -186,13 +190,33 @@ async def reconcile_rename(
         forward = new in current and not reused
         backward = old in current and not forward and not reused
         deleted = not current
+        # 这个角色又被改到第三个名字（云快照导入带来的改名，标记位被这笔占着、没能另记）：
+        # 旧名与新名下的条目都还是它的，一起迁到它现在的名字
+        moved = len(current) == 1 and not current & {old, new} and not reused
     else:
         forward = new in names and old not in names
         backward = old in names and new not in names
         deleted = old not in names and new not in names
+        moved = False
+    target = new if forward else next(iter(current)) if moved else old if backward and undo_moves else None
+    if target is not None:
+        try:
+            retiring = await read_roster_marker(config_dir, PENDING_RETIRE)
+        except RosterCorruptError as exc:
+            logger.error("visit recovery: roster unreadable, rename not reconciled: %s", exc)
+            return ALL_NAMES
+        if isinstance(retiring, list) and any((_item_fields(item) or ("", None))[0] == target for item in retiring):
+            # 目标名字下还有已删除角色的残留没退役完：先迁进去，之后按名字退役会连这个角色的条目一起删。
+            # 留着标记等退役补完（启动恢复先补退役、再对账）
+            logger.warning("visit recovery: pending_rename %r -> %r waits for the retirement of %r", old, new, target)
+            return frozenset({old, new})
     if forward:
         await roster.rename_char(old, new)
         await VisitSpool.rename_own_char(config_dir, old, new)
+    elif moved:
+        for name in (old, new):
+            await roster.rename_char(name, target)
+            await VisitSpool.rename_own_char(config_dir, name, target)
     elif backward and not undo_moves:
         # 事务自己收尾：迁移只在提交之后做，回滚时什么都没动过。不能反向改写——新名下
         # 若有已删除角色的残留数据，会被错挂到这个角色名下
@@ -535,6 +559,10 @@ def record_renamed_characters_sync(config_dir: str | Path, renamed: Iterable[Map
         ok, existing = set_roster_marker_sync(config_dir, PENDING_RENAME, {"old": old, "new": new, "uid": uid})
         if ok:
             written += 1
+        elif isinstance(existing, dict) and existing.get("uid") == uid:
+            # 这个角色自己的上一笔改名还没对完账：对账见它到了第三个名字，会把两个旧名下的条目一起迁过去
+            logger.info("visit rename: cloudsave renamed %r to %r on top of pending %r; recovery chains it",
+                        old, new, existing)
         else:
             logger.warning("visit rename: cloudsave renamed %r to %r but pending_rename %r is still pending; "
                            "visit data stays under the old name", old, new, existing)

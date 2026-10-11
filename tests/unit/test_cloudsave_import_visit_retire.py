@@ -308,6 +308,24 @@ async def test_a_snapshot_rename_keeps_an_earlier_pending_rename(tmp_path):
     assert peers["pending_rename"] == earlier
 
 
+async def test_a_snapshot_rename_of_the_same_character_chains_onto_its_pending_rename(tmp_path, caplog):
+    from main_logic.visit.subjects import set_roster_marker
+    from tests.unit.visit_memory_test_helpers import PEER_X
+
+    config_dir = tmp_path
+    uid = "c" * 32
+    roster = await seed_roster(config_dir, own_char="A")
+    earlier = {"old": "A", "new": "B", "uid": uid}
+    await set_roster_marker(config_dir, "pending_rename", earlier)
+    # 同一个角色 A -> B 还没对完账，快照又把它改成 C：标记位不覆盖，对账见它到了第三个名字再一并迁
+    with caplog.at_level("INFO", logger=lc.logger.name):
+        assert lc.record_renamed_characters_sync(config_dir, [{"old": "B", "new": "C", "uid": uid}]) == 0
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    assert await lc.reconcile_rename(config_dir, {"C"}, {"C": uid}) == frozenset()
+    assert await roster.get_char_entry(PEER_X, "A") is None
+    assert await roster.get_char_entry(PEER_X, "C") is not None
+
+
 def test_a_snapshot_rename_onto_a_name_another_local_character_held_is_not_migrated(pair):
     _source_cm, target_cm = pair
     uid = _local_uid(target_cm)

@@ -18,9 +18,10 @@ Design: ``docs/design/visit-infrastructure.md`` section 3.7.3 item 7 and
 PR-08 ``recovery.py``. :func:`visit_spool_recovery` is started with
 ``asyncio.create_task`` after startup (PR-09b) and runs, in order:
 
-1. the character-rename reconciliation (``visit_peers.json.pending_rename``),
-   first, so forgets resolve roster entries under their current name, then
-   the retirement of deleted characters (``pending_retire``);
+1. the retirement of deleted characters (``pending_retire``), then the
+   character-rename reconciliation (``visit_peers.json.pending_rename``), so
+   a rename never moves entries into a name whose leftovers are still to be
+   retired, and forgets resolve roster entries under their current name;
 2. unfinished local forgets (clearing sentinels, then revocation logs);
 3. startup cleanup: only leftover ``.outbox.jsonl`` files are deleted;
 4. ``VisitSpool.sweep`` (7 days / 20 MB, pending uploads and unsettled
@@ -1395,24 +1396,30 @@ async def visit_spool_recovery(
         names, uid_of = await load_names()
         # 本机其他猫的名字同样受保护：对端把自己叫成「本机的另一只猫」时不能顶替成说话人标签
         local_names = frozenset(names)
-        unsettled = await _reconcile_rename_guarded(config_dir, names, uid_of, lifecycle_guard, load_names)
     except Exception as exc:  # noqa: BLE001 - 补录各段互不连累
-        logger.error("visit recovery: rename reconciliation failed: %r", exc)
-        unsettled = _ALL_NAMES
-    names_settled = unsettled is not _ALL_NAMES
-    report.renamed = unsettled == frozenset()
-    if names_settled:
+        logger.error("visit recovery: character config unreadable, rename / retirement deferred: %r", exc)
+        load_names = None
+    if load_names is not None:
         try:
             # 删除提交后退役没做完（失败 / 崩溃）的角色：补完它的场次、名册条目与串门人设，
-            # 否则同名新角色会收到旧芯片、名字一直被占着
+            # 否则同名新角色会收到旧芯片、名字一直被占着。先于改名对账：改名（含云快照导入
+            # 带来的改名）可能把别的角色的条目迁进这个名字，之后再按名字退役会把它们一起删掉
             report.retired = await replay_retires(
                 config_dir, load_names, retire_persona=retire_persona, config_lock=config_lock,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("visit recovery: retirement replay failed: %r", exc)
             report.retired = False
+        try:
+            unsettled = await _reconcile_rename_guarded(config_dir, names, uid_of, lifecycle_guard, load_names)
+        except Exception as exc:  # noqa: BLE001 - 补录各段互不连累
+            logger.error("visit recovery: rename reconciliation failed: %r", exc)
+            unsettled = _ALL_NAMES
     else:
         report.retired = False
+        unsettled = _ALL_NAMES
+    names_settled = unsettled is not _ALL_NAMES
+    report.renamed = unsettled == frozenset()
     if names_settled:
         try:
             # 还没对账清楚的改名只涉及它的两个名字：清除重放对这两个名字自己会推迟

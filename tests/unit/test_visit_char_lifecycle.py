@@ -457,9 +457,10 @@ async def _recover(tmp_path, names, mapping, **kw):
     async def resolve(uid):
         return mapping.get(uid)
 
+    kw.setdefault("list_char_names", list_names)
     return await visit_spool_recovery(
         chips, None, config_dir=tmp_path, is_live=lambda _v: False, resolve_char_name=resolve,
-        list_char_names=list_names, client=FakeMemoryServer().client(), **kw,
+        client=FakeMemoryServer().client(), **kw,
     )
 
 
@@ -640,3 +641,84 @@ async def test_import_removal_that_rolled_back_is_only_dropped(tmp_path, _readab
     assert report.retired is True and personas.calls == []
     assert (spool_dir / f"{vid(1)}.state.json").exists()
     assert await read_roster_marker(tmp_path, "pending_retire") is None
+
+
+# ── 改名对账：改到第三个名字 / 目标名还在退役 ─────────────────────────
+
+
+async def _data_under_both_names(tmp_path):
+    """Roster and spool entries of ``CHAR_UID_A`` under both ``A`` and ``A2`` (a migration cut halfway)."""
+    roster = await _visit_data(tmp_path)
+    await seed_roster(tmp_path, peer_uid=PEER_Y, tag=TAG_Y, own_char="A2")
+    await make_visit(tmp_path, vid(3), [ln(1)], own_char="A2", own_char_uid=CHAR_UID_A)
+    await set_roster_marker(tmp_path, "pending_rename", {"old": "A", "new": "A2", "uid": CHAR_UID_A})
+    return roster
+
+
+async def test_a_rename_chained_to_a_third_name_moves_both_old_names(tmp_path):
+    roster = await _data_under_both_names(tmp_path)
+    # 标记 A -> A2 没对完账时，云快照又把这个 uid 改成 A3（标记位被占，没能另记）
+    unsettled = await lc.reconcile_rename(tmp_path, {"A3", "B"}, {"A3": CHAR_UID_A, "B": CHAR_UID_B})
+    # 变异：没有第三名字分支必红（永久歧义、两个旧名下的条目没人迁）
+    assert unsettled == frozenset()
+    assert await roster.get_char_entry(PEER_X, "A") is None and await roster.get_char_entry(PEER_Y, "A2") is None
+    assert await roster.get_char_entry(PEER_X, "A3") is not None
+    assert await roster.get_char_entry(PEER_Y, "A3") is not None
+    assert await _state_char(tmp_path, vid(1)) == "A3" and await _state_char(tmp_path, vid(3)) == "A3"
+    assert await _state_char(tmp_path, vid(2)) == "B"
+    assert "pending_rename" not in _peers(tmp_path)
+
+
+async def test_a_chained_rename_whose_old_name_is_reused_stays_ambiguous(tmp_path):
+    roster = await _data_under_both_names(tmp_path)
+    # 旧名 A 已被另一个角色用上：名册只按名字存，迁走会把它的记录也带走（变异：去掉复用判断必红）
+    unsettled = await lc.reconcile_rename(tmp_path, {"A3", "A"}, {"A3": CHAR_UID_A, "A": CHAR_UID_B})
+    assert unsettled == frozenset({"A", "A2"})
+    assert await roster.get_char_entry(PEER_X, "A") is not None
+    assert await roster.get_char_entry(PEER_X, "A3") is None
+    assert _peers(tmp_path)["pending_rename"] == {"old": "A", "new": "A2", "uid": CHAR_UID_A}
+
+
+async def test_a_rename_waits_while_its_target_name_is_still_retiring(tmp_path):
+    roster = await _visit_data(tmp_path)
+    marker = {"old": "A", "new": "A2", "uid": CHAR_UID_A}
+    await set_roster_marker(tmp_path, "pending_rename", marker)
+    await add_roster_marker_item(tmp_path, "pending_retire", lc.retire_item("A2", CHAR_UID_B))
+    # 先迁进 A2、之后按名字退役 A2 会把迁来的条目一起删：等退役补完（变异：不等必红）
+    assert await lc.reconcile_rename(tmp_path, {"A2"}, {"A2": CHAR_UID_A}) == frozenset({"A", "A2"})
+    assert await roster.get_char_entry(PEER_X, "A") is not None
+    assert await _state_char(tmp_path, vid(1)) == "A"
+    assert _peers(tmp_path)["pending_rename"] == marker
+    # 退役项与改名无关的名字不挡迁移
+    await remove_roster_marker_item(tmp_path, "pending_retire", lc.retire_item("A2", CHAR_UID_B))
+    await add_roster_marker_item(tmp_path, "pending_retire", lc.retire_item("Gone", CHAR_UID_B))
+    assert await lc.reconcile_rename(tmp_path, {"A2"}, {"A2": CHAR_UID_A}) == frozenset()
+    assert await roster.get_char_entry(PEER_X, "A2") is not None
+
+
+async def test_startup_recovery_retires_the_target_name_before_the_rename_moves_into_it(
+    tmp_path, _readable, monkeypatch,
+):
+    from main_logic.visit import local_chars
+
+    async def configured():
+        return {"A2": CHAR_UID_A}
+
+    # 生产路径按 uid 读配置（名字相同、uid 不同的退役项才分得清）
+    monkeypatch.setattr(local_chars, "load_local_characters", configured)
+    roster = await _visit_data(tmp_path)
+    # 云快照一次导入里：删掉了叫 A2 的旧角色（uid B），又把 uid A 从 A 改成 A2
+    await seed_roster(tmp_path, peer_uid=PEER_Y, tag=TAG_Y, own_char="A2")
+    await make_visit(tmp_path, vid(3), [ln(1)], own_char="A2", own_char_uid=CHAR_UID_B)
+    await add_roster_marker_item(tmp_path, "pending_retire", lc.retire_item("A2", CHAR_UID_B))
+    await set_roster_marker(tmp_path, "pending_rename", {"old": "A", "new": "A2", "uid": CHAR_UID_A})
+    report = await _recover(tmp_path, ["A2"], {CHAR_UID_A: "A2"}, retire_persona=Personas(tmp_path),
+                            list_char_names=None)
+    # 变异：先对账改名必红（要么迁进去的条目被退役删掉，要么改名一直等着）
+    assert report.retired is True and report.renamed is True
+    assert await roster.get_char_entry(PEER_Y, "A2") is None                 # 旧角色的残留退役了
+    assert await roster.get_char_entry(PEER_X, "A2") is not None             # 改名迁来的条目还在
+    assert await _state_char(tmp_path, vid(1)) == "A2"
+    assert not (tmp_path / "visit_spool" / f"{vid(3)}.state.json").exists()
+    data = _peers(tmp_path)
+    assert "pending_retire" not in data and "pending_rename" not in data
