@@ -948,7 +948,10 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
                                                      debrief_pending=None, debrief_chip_pending=False)
         if not applied:
             return _already_chosen(found)
-        await spool.delete_if_settled()
+        try:
+            await spool.delete_if_settled()
+        except Exception as exc:  # noqa: BLE001 - 已落成 abandoned、芯片不再重放：清理留给之后的清扫，置灰帧照发
+            logger.info("visit %s: settled files not removed yet: %s", visit_id[:6], type(exc).__name__)
         # 已打开的页面上芯片还亮着：让它置灰（choice='abandoned'）
         await _send(state, _state_frame(visit_id, "chosen", chips_request_id(visit_id), choice="abandoned"))
         return 404, {"error": "unknown_or_expired"}

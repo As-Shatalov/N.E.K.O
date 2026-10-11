@@ -2885,9 +2885,9 @@ async def account_change(
                 except Exception as exc:  # noqa: BLE001 - 收尾失败不挡登出 / 登录；没封存的留给下次启动补录
                     logger.warning("visit: ending live visits before the account change failed: %r", exc)
             # 还在途的领凭证请求（场次可能已注销、请求仍在后台）读会话时必须仍是旧账号：先等它们结束再改会话
-            await _settle_credential_requests(timeout)
+            await _settle_in_flight(_credential_requests, timeout, "credential requests")
             # 已核过账号、正往页面推复盘块的也先推完：核完账号到写出去之间不会换成另一个账号
-            await _settle_account_bound_pushes(timeout)
+            await _settle_in_flight(_account_bound_pushes, timeout, "debrief pushes")
             yield
     finally:
         _account_changes -= 1
@@ -2924,17 +2924,17 @@ async def hold_account_for_push():
         _account_bound_pushes.discard(held)
 
 
-async def _settle_account_bound_pushes(timeout: float) -> None:
-    pending = [f for f in _account_bound_pushes if not f.done()]
-    if pending:
-        await asyncio.wait(pending, timeout=max(0.0, timeout))
 
-
-async def _settle_credential_requests(timeout: float) -> None:
-    pending = [t for t in _credential_requests if not t.done()]
-    if pending:
-        # 只等不取消：请求已发出时取消也撤不回 Servers 那边的签发（与兑掉的邀请码）
-        await asyncio.wait(pending, timeout=max(0.0, timeout))
+async def _settle_in_flight(futures: set[asyncio.Future], timeout: float, what: str) -> None:
+    """Wait (bounded) for the in-flight ``futures`` an account change must not overtake; never cancels them."""
+    pending = [f for f in futures if not f.done()]
+    if not pending:
+        return
+    # 只等不取消：领凭证请求已发出时取消也撤不回 Servers 那边的签发（与兑掉的邀请码）；推送写到一半也不该截断
+    _done, still = await asyncio.wait(pending, timeout=max(0.0, timeout))
+    if still:
+        logger.warning("visit: account change proceeds with %d %s still in flight after %.0fs",
+                       len(still), what, timeout)
 
 
 def _seals_in_background() -> list["VisitRuntime"]:

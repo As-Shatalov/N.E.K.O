@@ -1466,3 +1466,29 @@ async def test_a_cached_preview_is_not_returned_after_a_rename(env, monkeypatch)
 
     monkeypatch.setattr(local_chars, "resolve_char_name", resolve)
     assert await choose("diary") == (404, {"error": "unknown_or_expired"})
+
+
+# ── 自动评审第 15 轮（可选建议） ─────────────────────────────────────────
+
+
+async def test_a_lost_transcript_still_greys_the_chips_when_cleanup_fails(env, monkeypatch):
+    async def cleanup_fails(self):
+        raise OSError("spool dir locked")
+
+    await visit(env)
+    VisitSpool(env.tmp, vid(1)).jsonl_path.unlink()
+    monkeypatch.setattr(VisitSpool, "delete_if_settled", cleanup_fails)
+    assert await choose("diary") == (404, {"error": "unknown_or_expired"})
+    assert (await state_of(env=env))["debrief_choice"] == "abandoned"
+    chosen = [f for f in env.host.frames if f.get("phase") == "chosen"]
+    assert chosen and chosen[-1]["choice"] == "abandoned"
+
+
+async def test_an_account_change_that_stops_waiting_for_a_push_says_so(env, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(runtime.logger, "warning", lambda msg, *args: warnings.append(msg % args))
+    async with runtime.hold_account_for_push() as allowed:
+        assert allowed
+        async with runtime.account_change(timeout=0.01):
+            pass
+    assert any("1 debrief pushes still in flight" in w for w in warnings)
