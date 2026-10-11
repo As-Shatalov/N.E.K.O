@@ -599,7 +599,9 @@ def retire_removed_keyed_entries(path: Any, old: Any, new: Any) -> list[str]:
     BEFORE the caller replaces (or deletes, ``new=[]``) the recent file: a
     crash between the two leaves the key recorded and the entry possibly
     still there, both evidence that it was written. A key already recorded
-    keeps its first ``retired_at``. Returns the newly retired keys.
+    keeps its first ``retired_at``. A sidecar that cannot be read is left
+    untouched (its readers keep failing closed) rather than replaced by an
+    incomplete one. Returns the newly retired keys.
     """
     if old is None:
         old = _read_current_payload_unlocked(path)
@@ -609,8 +611,9 @@ def retire_removed_keyed_entries(path: Any, old: Any, new: Any) -> list[str]:
     try:
         data = read_retired_keys_unlocked(path)
     except (OSError, ValueError, RecursionError):
-        # 旁路坏了 / 读不出：不能因此挡住 recent.json 的写入，从这几条重新记起
-        data = {}
+        # 旁路坏了 / 读不出：不挡 recent.json 的写入，但也不拿一份只含这几条的新旁路盖掉它——
+        # 那会丢掉旧键的证据，之后同键重试就把已移出的日记写回去。保留原样，带键读取继续 fail closed
+        return []
     now = time.time()
     added = sorted(key for key in removed if key not in data)
     if not added:

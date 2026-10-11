@@ -705,9 +705,13 @@ def test_a_deeply_nested_sidecar_does_not_block_recent_writes(tmp_path):
     recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("d", K1)]))
     sidecar = recent_file.recent_sidecar_path(path, recent_file.RETIRED_KEYS_FILENAME)
     Path(sidecar).write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+    before = Path(sidecar).read_bytes()
     recent_file.write_recent_payload(path, [])
     assert json.loads(Path(path).read_text(encoding="utf-8")) == []
-    assert K1 in recent_file.read_retired_keys(path)
+    # 坏旁路原样保留（不拿只含这一条的新旁路盖掉旧证据），带键读取继续 fail closed
+    assert Path(sidecar).read_bytes() == before
+    with pytest.raises((ValueError, RecursionError)):
+        recent_file.read_retired_keys(path)
 
 
 # ── 评审第 7 轮 ──────────────────────────────────────────────────────────
@@ -792,3 +796,13 @@ async def test_scoped_history_refuses_reserved_key_prefixes(env, key):
     with pytest.raises(HTTPException) as info:
         await env.routes._process_scoped_history(NAME, req)
     assert info.value.status_code == 422 and "reserved" in str(info.value.detail)
+
+
+
+async def test_a_damaged_sidecar_keeps_keyed_writes_failing_closed(env):
+    # 旁路坏了：带键 /cache 返回 503，不把可能已被移出的日记写回去
+    sidecar = recent_file.recent_sidecar_path(env.recent_path, recent_file.RETIRED_KEYS_FILENAME)
+    Path(env.recent_path).write_text("[]", encoding="utf-8")
+    Path(sidecar).write_text("{not json", encoding="utf-8")
+    status, _ = await _cache(env, _diary_request())
+    assert status == 503 and _keyed(env) == []
