@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -85,7 +84,6 @@ _WRITE_TIMEOUT_S = 15.0
 """Bound of one write request (the keyed /cache write stores to two places)."""
 
 _PEER_SPEAKERS = ("peer_cat", "peer_human")
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.S)
 
 DiaryLLM = Callable[[str], Awaitable[str]]
 """Prompt in, reply text out; raises on failure."""
@@ -154,16 +152,24 @@ def _clean(text: str, *, family_names: Iterable[str], neutral_term: str) -> str:
     return escape_visit_block_text(text).strip()
 
 
+def _first_json_object(text: str) -> Any:
+    # 从每个 "{" 起试着解析一个完整对象：模型在 JSON 前后多说了带花括号的话也不会把整段吞进去
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    while start != -1:
+        try:
+            data, _end = decoder.raw_decode(text, start)
+        except ValueError:
+            start = text.find("{", start + 1)
+            continue
+        if isinstance(data, dict) and "diary" in data:
+            return data
+        start = text.find("{", start + 1)
+    raise DiaryGenerationFailed("reply has no JSON object with a diary")
+
+
 def _parse_reply(raw: str) -> tuple[str, list[str]]:
-    match = _JSON_OBJECT_RE.search(str(raw or ""))
-    if match is None:
-        raise DiaryGenerationFailed("reply has no JSON object")
-    try:
-        data = json.loads(match.group(0))
-    except ValueError as exc:
-        raise DiaryGenerationFailed("reply is not valid JSON") from exc
-    if not isinstance(data, dict):
-        raise DiaryGenerationFailed("reply is not a JSON object")
+    data = _first_json_object(str(raw or ""))
     diary = data.get("diary")
     facts = data.get("facts")
     if not isinstance(diary, str):

@@ -1660,16 +1660,9 @@ class CompressedRecentHistoryManager:
         with recent_file.recent_file_access(
             file_path, expected_generation=expected_generation,
         ) as file_path:
-            status, history = self._load_history_unlocked(file_path, lanlan_name)
-            if status == RECENT_READ_UNREADABLE:
-                raise RuntimeError(f"recent history of {lanlan_name!r} unreadable")
-            pending = recent_file.get_recent_pending_unlocked(file_path)
-            present = recent_file.keyed_entry_keys(messages_to_dict(list(history) + list(pending)))
-            if key in present:
-                return 'present'
-            # 旁路读不出就不猜：抛错让带键写入 503、留着 pending 等重试
-            if key in recent_file.read_retired_keys_unlocked(file_path):
-                return 'retired'
+            presence, history, pending = self._keyed_presence_unlocked(file_path, lanlan_name, key)
+            if presence != 'absent':
+                return presence
             merged = list(history) + list(pending) + list(new_messages)
             recent_file.write_recent_payload_unlocked(file_path, messages_to_dict(merged))
             # 之前挂着的未落盘批次随这次一起写进去了
@@ -1677,19 +1670,30 @@ class CompressedRecentHistoryManager:
             self._cache_history_view(file_path, lanlan_name, merged)
             return 'written'
 
+    def _keyed_presence_unlocked(self, file_path, lanlan_name, key) -> tuple[str, list, list]:
+        """``('present'|'retired'|'absent', history, pending)`` of ``key``. The caller holds the file lock.
+
+        The single place both :meth:`keyed_state` and :meth:`append_keyed`
+        decide from, so the time-index step and the recent step never judge
+        "already written" differently. Raises when the file or the retired-key
+        sidecar cannot be read (never guessed as absent).
+        """
+        status, history = self._load_history_unlocked(file_path, lanlan_name)
+        if status == RECENT_READ_UNREADABLE:
+            raise RuntimeError(f"recent history of {lanlan_name!r} unreadable")
+        pending = recent_file.get_recent_pending_unlocked(file_path)
+        if key in recent_file.keyed_entry_keys(messages_to_dict(list(history) + list(pending))):
+            return 'present', history, pending
+        # 旁路读不出就不猜：抛错让带键写入 503、留着 pending 等重试
+        if key in recent_file.read_retired_keys_unlocked(file_path):
+            return 'retired', history, pending
+        return 'absent', history, pending
+
     def _keyed_state_locked(self, file_path, lanlan_name, key, expected_generation=None) -> str:
         with recent_file.recent_file_access(
             file_path, expected_generation=expected_generation,
         ) as file_path:
-            status, history = self._load_history_unlocked(file_path, lanlan_name)
-            if status == RECENT_READ_UNREADABLE:
-                raise RuntimeError(f"recent history of {lanlan_name!r} unreadable")
-            pending = recent_file.get_recent_pending_unlocked(file_path)
-            if key in recent_file.keyed_entry_keys(messages_to_dict(list(history) + list(pending))):
-                return 'present'
-            if key in recent_file.read_retired_keys_unlocked(file_path):
-                return 'retired'
-            return 'absent'
+            return self._keyed_presence_unlocked(file_path, lanlan_name, key)[0]
 
     async def keyed_state(self, lanlan_name, key: str) -> str:
         """``'present'`` / ``'retired'`` / ``'absent'`` for ``key`` in this character's recent file; never writes.

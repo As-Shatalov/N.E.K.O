@@ -1154,3 +1154,10 @@ async def test_an_account_switch_while_resolving_the_name_blocks_the_push(env, m
     monkeypatch.setattr(local_chars, "resolve_char_name", resolve_then_switch)
     assert await debrief._render(state, debrief.chip_blocks(vid(1), "zh"), debrief.chips_request_id(vid(1))) is False
     assert env.host.blocks == []
+
+
+def test_the_diary_reply_parser_ignores_braces_around_the_json():
+    reply = '好的 {先说一句} 这是结果：{"diary": "今天很开心。", "facts": ["看了星星"]} 希望你喜欢 {完}'
+    assert debrief_writers._parse_reply(reply) == ("今天很开心。", ["看了星星"])
+    with pytest.raises(debrief_writers.DiaryGenerationFailed):
+        debrief_writers._parse_reply("{没有日记}")
