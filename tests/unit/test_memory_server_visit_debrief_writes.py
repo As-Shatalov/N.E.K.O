@@ -847,3 +847,12 @@ async def test_ordinary_history_updates_drop_reserved_metadata(tmp_path, monkeyp
     mgr = _recent_manager(path)
     await mgr.update_history([_keyed_entry("别的话", KEY)], NAME, compress=False)
     assert recent_file.keyed_entry_keys(json.loads(Path(path).read_text(encoding="utf-8"))) == set()
+
+
+
+def test_stripping_covers_every_message_shape():
+    stored = messages_to_dict([_keyed_entry("x", KEY)])[0]          # 落盘形态 data.metadata
+    flat = {"role": "assistant", "content": "y", "metadata": {"idempotency_key": KEY}}
+    obj = _keyed_entry("z", KEY)
+    recent_file.strip_idempotency_metadata([stored, flat, obj])
+    assert recent_file.keyed_entry_keys([stored, flat, messages_to_dict([obj])[0]]) == set()

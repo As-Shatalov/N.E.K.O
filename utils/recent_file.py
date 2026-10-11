@@ -551,9 +551,15 @@ def strip_idempotency_metadata(messages: Any) -> None:
     already written" and settle a later real keyed write without storing it.
     """
     for message in messages or ():
-        meta = message.get("metadata") if isinstance(message, dict) else getattr(message, "metadata", None)
-        if isinstance(meta, dict) and RECENT_IDEMPOTENCY_META_KEY in meta:
-            meta.pop(RECENT_IDEMPOTENCY_META_KEY, None)
+        if isinstance(message, dict):
+            # 与 _entry_key 认的形态对齐：顶层 metadata，或落盘形态的 data.metadata（本模块是叶子，不引 llm_client）
+            data = message.get("data")
+            metas = [message.get("metadata"), data.get("metadata") if isinstance(data, dict) else None]
+        else:
+            metas = [getattr(message, "metadata", None)]
+        for meta in metas:
+            if isinstance(meta, dict):
+                meta.pop(RECENT_IDEMPOTENCY_META_KEY, None)
 
 
 def keyed_entry_keys(payload: Any) -> set[str]:
