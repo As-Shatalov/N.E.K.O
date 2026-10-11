@@ -1271,3 +1271,16 @@ async def test_deleting_the_fresh_holder_waits_while_the_handing_rename_waits_fo
     uid_of = {"A": CHAR_UID_B, "B": CHAR_UID_A}
     with pytest.raises(lc.RenamePendingElsewhere):
         await lc.begin_retire(tmp_path, "A", CHAR_UID_B, load_names=_loader(set(uid_of), uid_of))
+
+
+async def test_chained_names_appended_after_the_current_one_by_a_rolled_back_import_are_ignored(tmp_path):
+    roster = await _visit_data(tmp_path)
+    # X -> A 没对完账、角色已在 D（一次导入记下的 chained）；又一次导入想把它从 D 改到 C、
+    # 删掉 C 原来的主人，但回滚了：它还在 D，C 仍归另一个角色。C 不再算它的
+    # （变异：照算必红，永久歧义、名字一直被挡）
+    await set_roster_marker(tmp_path, "pending_rename",
+                            {"old": "X", "new": "A", "uid": CHAR_UID_A, "chained": ["D", "C"]})
+    uid_of = {"D": CHAR_UID_A, "C": CHAR_UID_B}
+    assert await lc.reconcile_rename(tmp_path, set(uid_of), uid_of) == frozenset()
+    assert await roster.get_char_entry(PEER_X, "D") is not None
+    assert "pending_rename" not in _peers(tmp_path)

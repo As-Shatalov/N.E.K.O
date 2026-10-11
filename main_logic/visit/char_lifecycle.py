@@ -206,6 +206,9 @@ async def reconcile_rename(
             # （或它又改回来了），不再算它的，也不拿来判断复用。已经开始迁过（migrated）就不行：
             # 条目可能已挪进某个 chained 名字，得一起迁回来
             held = (old, new)
+        elif len(current) == 1 and marker.get("migrated") is not True and next(iter(current)) in held[2:]:
+            # 同理，角色还停在一个 chained 中间名字上：之后追加的名字来自回滚了的导入，不再算它的
+            held = held[:held.index(next(iter(current))) + 1]
         reused = any(name in uid_of and uid_of[name] != uid and name not in handed for name in held)
         forward = new in current and not reused
         backward = old in current and not forward and not reused
