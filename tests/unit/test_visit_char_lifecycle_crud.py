@@ -747,3 +747,20 @@ async def test_unsubscribe_refuses_a_character_whose_rename_cannot_be_settled(tm
     assert status == 500 and body["code"] == "LOCAL_CONFIG_CLEANUP_FAILED"
     assert steam_calls == [] and config.saved == [] and config.characters == before
     assert _peers(config.config_dir)["pending_rename"] == marker
+
+
+async def test_an_ambiguous_rename_reports_only_its_own_names(env, monkeypatch):
+    cm, _path, config_dir = env
+    await _seed(cm, config_dir)
+    status, _body = await _add(cm, "Extra")
+    assert status == 200
+    # 两笔互不相干的改名都永久歧义（各自的另一个名字被别的角色占着）
+    first = {"old": "Other", "new": "Current", "uid": _uid(cm, "Current")}
+    second = {"old": "Extra", "new": "Old", "uid": _uid(cm, "Old")}
+    await set_roster_marker(config_dir, "pending_rename", first)
+    await add_roster_marker_item(config_dir, "pending_rename_queue", second)
+    # 只报挂着这个名字的那一笔：提示不能让用户去删另一笔里不相干的角色（变异：报全部未决名字必红）
+    assert await character_hooks.name_block_reason(cm, "Old") == (
+        character_hooks.NAME_AMBIGUOUS, frozenset({"Extra", "Old"}))
+    assert await character_hooks.name_block_reason(cm, "Current") == (
+        character_hooks.NAME_AMBIGUOUS, frozenset({"Other", "Current"}))

@@ -317,7 +317,7 @@ async def drop_malformed_queued_renames(config_dir: str | Path) -> None:
 
 async def reconcile_renames(
     config_dir: Path, names: set[str], uid_of: dict[str, str] | None = None,
-    reconcile: Callable[[], Awaitable[Any]] | None = None,
+    reconcile: Callable[[], Awaitable[Any]] | None = None, pending_groups: list[frozenset[str]] | None = None,
 ) -> Any:
     """:func:`reconcile_rename` for the slot and every queued rename; return the names still unsettled.
 
@@ -332,6 +332,8 @@ async def reconcile_renames(
     all settled), or ``ALL_NAMES`` when the roster is unreadable.
     ``reconcile`` (startup recovery: under the character's lifecycle guard)
     replaces the plain :func:`reconcile_rename` of the slot.
+    ``pending_groups`` (optional) receives the names of each rename still
+    pending, one set per rename.
     """
     await drop_malformed_queued_renames(config_dir)
     await drop_deleted_queued_renames(config_dir, uid_of)
@@ -365,6 +367,8 @@ async def reconcile_renames(
             if not unsettled:
                 continue
             pending |= unsettled
+            if pending_groups is not None:
+                pending_groups.append(unsettled)
         # 这笔还挂着（永久歧义 / 在等退役）：挪到队尾，让队列里其它角色的改名照常对账
         if await rotate_roster_marker(config_dir, PENDING_RENAME, PENDING_RENAME_QUEUE, marker) is None:
             break
