@@ -1247,6 +1247,9 @@ from utils.recent_file import VISIT_DIARY_KEY_RE as _KEYED_CACHE_KEY_RE  # noqa:
 
 # The only keyed private ``/cache`` writes: one visit's diary entry (``visit-debrief:{visit_id}``).
 
+_RESERVED_KEY_PREFIXES = ("visit-debrief:", "visit-facts:")
+"""Key prefixes owned by keyed ``/cache`` and ``visit_facts`` (refused on ``/scoped_history``)."""
+
 _VISIT_FACT_IMPORTANCE = 4
 """Below the reflection threshold (5): visit facts are recalled but never synthesized."""
 
@@ -1302,6 +1305,10 @@ async def _cache_keyed(lanlan_name: str, raw_history: str, input_history: list, 
             record = await idempotency.read_key(lanlan_name, key)
         except (idempotency.IdempotencyStateError, OSError):
             return _keyed_unconfirmed("idempotency state unreadable; retry later")
+        if record is not None and record.get("kind") != "cache":
+            # 键记录文件与带键 /scoped_history 共用：别的端点写下的同名键不能当成本端点「已写过」
+            return JSONResponse({"status": "error", "message": "idempotency_key belongs to another endpoint"},
+                                status_code=422)
         stored_hash = record.get("content_hash") if record is not None else None
         if stored_hash is not None and stored_hash != content_hash:
             # 同一场的日记只有一份（客户端重试用落盘的同一份正文）：内容变了是调用方的错，不是可重试的失败；
@@ -1383,6 +1390,8 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
             record = await idempotency.read_key(lanlan_name, key)
         except (idempotency.IdempotencyStateError, OSError) as exc:
             raise unavailable from exc
+        if record is not None and record.get("kind") != "visit_facts":
+            raise HTTPException(status_code=422, detail="idempotency key belongs to another endpoint")
         stored_hash = record.get("content_hash") if record is not None else None
         if stored_hash is not None and stored_hash != facts_hash:
             # 同一场只有一份事实（客户端重试用落盘的同一份）：内容变了是调用方的错，不能报成已写
@@ -1432,7 +1441,8 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
             deduped = max(len(texts) - written, 0)
             await idempotency.update_key(
                 lanlan_name, key,
-                idempotency.transition(idempotency.KEY_STATE_DONE, written=written, deduped=deduped),
+                idempotency.transition(idempotency.KEY_STATE_DONE, written=written, deduped=deduped,
+                                       kind="visit_facts"),
             )
         except Exception as exc:  # noqa: BLE001 - 没确认：键留 pending，503 让调用方用同一 visit_id 重试
             logger.warning(f"[MemoryServer] visit_facts {lanlan_name}: not confirmed: {exc!r}")
@@ -2728,6 +2738,9 @@ async def _process_scoped_history(lanlan_name: str, req: ScopedHistoryRequest):
             detail="memory_server not fully initialized (limited mode or startup incomplete)",
         )
     if req.idempotency_key is not None:
+        if req.idempotency_key.startswith(_RESERVED_KEY_PREFIXES):
+            # 与 /cache 带键写入、visit_facts 共用同一份键记录：这两种前缀只属于它们
+            raise HTTPException(status_code=422, detail="idempotency_key uses a reserved prefix")
         _reject_owner_signal_on_keyed_request(req)
     if req.segments is not None:
         return await _process_scoped_history_segments(lanlan_name, req)

@@ -474,7 +474,7 @@ async def test_pending_key_after_a_saved_batch_reports_the_real_count(env):
 
     await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
     data = json.loads(Path(idempotency.keys_path(NAME)).read_text(encoding="utf-8"))
-    data[f"visit-facts:{VISIT}"] = {"state": "pending", "written_at": 1.0}
+    data[f"visit-facts:{VISIT}"] = {"state": "pending", "written_at": 1.0, "kind": "visit_facts"}
     Path(idempotency.keys_path(NAME)).write_text(json.dumps(data), encoding="utf-8")
     body = await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
     assert body == {"ok": True, "written": 2, "deduped": 0, "duplicate": True}
@@ -491,7 +491,7 @@ async def test_archived_facts_of_the_visit_still_count(env):
     active.write_text("[]", encoding="utf-8")
     env.fs._facts.pop(NAME, None)
     data = json.loads(Path(idempotency.keys_path(NAME)).read_text(encoding="utf-8"))
-    data[f"visit-facts:{VISIT}"] = {"state": "pending", "written_at": 1.0}
+    data[f"visit-facts:{VISIT}"] = {"state": "pending", "written_at": 1.0, "kind": "visit_facts"}
     Path(idempotency.keys_path(NAME)).write_text(json.dumps(data), encoding="utf-8")
     body = await _facts(env, ["在邻居家看了星星"])
     assert body["duplicate"] is True and body["written"] == 1
@@ -593,7 +593,7 @@ async def test_strict_load_counts_an_interrupted_archive_row_once(env):
     Path(env.fs._facts_archive_path(NAME)).write_text(active.read_text(encoding="utf-8"), encoding="utf-8")
     assert len([r for r in _pool(env) if r.get("visit_id") == VISIT]) == 2
     data = json.loads(Path(idempotency.keys_path(NAME)).read_text(encoding="utf-8"))
-    data[f"visit-facts:{VISIT}"] = {"state": "pending", "written_at": 1.0}
+    data[f"visit-facts:{VISIT}"] = {"state": "pending", "written_at": 1.0, "kind": "visit_facts"}
     Path(idempotency.keys_path(NAME)).write_text(json.dumps(data), encoding="utf-8")
     assert (await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"]))["written"] == 2
 
@@ -750,3 +750,45 @@ def test_only_well_formed_diary_entries_count_as_retired_evidence(tmp_path):
     assert recent_file.keyed_entry_keys([human, odd]) == set()
     recent_file.write_recent_payload(path, [])
     assert not os.path.exists(recent_file.recent_sidecar_path(path, recent_file.RETIRED_KEYS_FILENAME))
+
+
+# ── 评审第 9 轮 ──────────────────────────────────────────────────────────
+
+
+def test_an_undecodable_old_recent_file_does_not_block_its_replacement(tmp_path):
+    path = tmp_path / "recent.json"
+    path.write_bytes(b'[{"idempotency_key": "\xff\xfe"}]')
+    recent_file.write_recent_payload(str(path), [])
+    assert json.loads(path.read_text(encoding="utf-8")) == []
+
+
+async def test_keys_of_another_endpoint_are_not_taken_as_written(env):
+    from fastapi import HTTPException
+
+    from app.memory_server import idempotency
+
+    # 带键 /scoped_history 先用了同名键并已终态：/cache 与 visit_facts 都不能把它当成自己写过
+    for key in (KEY, f"visit-facts:{VISIT}"):
+        await idempotency.update_key(NAME, key, idempotency.transition(
+            idempotency.KEY_STATE_DONE, request={"wire_keys": []}))
+    status, _ = await _cache(env, _diary_request())
+    assert status == 422 and _recent_entries(env) == []
+    with pytest.raises(HTTPException) as info:
+        await _facts(env, ["在邻居家看了星星"])
+    assert info.value.status_code == 422
+
+
+@pytest.mark.parametrize("key", [KEY, f"visit-facts:{VISIT}"])
+async def test_scoped_history_refuses_reserved_key_prefixes(env, key):
+    from fastapi import HTTPException
+
+    from app.memory_server.routes import ScopedHistoryRequest
+
+    req = ScopedHistoryRequest(
+        input_history=json.dumps([{"role": "user", "content": "hi"}]),
+        subject={"subject_kind": "group_chat", "subject_id": "neko_visit:" + "a" * 24},
+        idempotency_key=key,
+    )
+    with pytest.raises(HTTPException) as info:
+        await env.routes._process_scoped_history(NAME, req)
+    assert info.value.status_code == 422 and "reserved" in str(info.value.detail)

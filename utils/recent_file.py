@@ -554,6 +554,10 @@ def _read_current_payload_unlocked(path: Any) -> Any:
             text = handle.read()
     except FileNotFoundError:
         return []
+    except (OSError, ValueError):
+        # 旧文件读不出 / 不是合法 UTF-8：比对不出移出了哪些键，但不能因此挡住替换它的写入
+        # （云存档下载正是用来覆盖坏掉的 recent.json）
+        return []
     if _KEY_MARKER not in text:
         # 绝大多数文件没有带键条目：不解析就知道没有要退役的键
         return []
