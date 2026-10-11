@@ -898,6 +898,24 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
             raise
 
 
+async def _caller_still_current(state: Mapping[str, Any], own_char: str) -> bool:
+    """Whether the page that sent this request may still get the preview text in the response.
+
+    ``own_char`` is the name the request was resolved under: when the
+    character was renamed meanwhile (its old name maybe given to another
+    cat) or the account changed, the preview is not returned to that page.
+    It is persisted and was pushed by uid to the character's current page;
+    the bind replay shows it there. No await follows a True answer before
+    the response is returned.
+    """
+    from main_routers.visit_router.accounts import own_visit_uid
+
+    if await _own_char(state) != own_char:
+        return False
+    # 账号放在最后核（解析名字有 await）
+    return await own_visit_uid() == state["own_uid"]
+
+
 async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> tuple[int, dict]:
     from main_logic.visit import debrief_writers
     from main_routers.visit_router.accounts import own_visit_uid
@@ -905,8 +923,8 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     visit_id = spool.visit_id
     current = state["debrief_choice"]
     if current == "preview:diary":
-        # 预览已落盘：只复用，不再生成。前面解析角色名有 await：回给页面前再核一次账号
-        if await own_visit_uid() != state["own_uid"]:
+        # 预览已落盘：只复用，不再生成。前面的 await 里改了名 / 换了账号就不回给这一页
+        if not await _caller_still_current(state, own_char):
             return 404, {"error": "unknown_or_expired"}
         return 200, {"ok": True, "applied": "preview", "preview": dict(state["debrief_pending"])}
     if current not in _CHIP_CHOICES:
@@ -950,6 +968,9 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     lang = _lang()
     await _render(state, preview_blocks(visit_id, pending, lang), preview_request_id(visit_id))
     await _send(state, _state_frame(visit_id, "preview", preview_request_id(visit_id)))
+    if not await _caller_still_current(state, own_char):
+        # 生成期间改了名（旧名字可能已归另一只猫）：预览已按 uid 推给它现在的页面，不再回给发起请求的旧页面
+        return 404, {"error": "unknown_or_expired"}
     return 200, {"ok": True, "applied": "preview", "preview": pending}
 
 

@@ -1080,7 +1080,9 @@ async def test_a_rename_during_generation_sends_the_preview_to_the_renamed_chara
 
     env.llm = generate_then_rename
     await visit(env)
-    assert (await choose("diary"))[0] == 200
+    # 发起请求的是旧名字的页面：预览不回给它（Codex 第 20 轮），按 uid 推给改名后的角色
+    assert await choose("diary") == (404, {"error": "unknown_or_expired"})
+    assert (await state_of(env=env))["debrief_choice"] == "preview:diary"
     assert hosts["A"].blocks == [] and hosts["A"].frames == []
     assert hosts["A2"].block(debrief.preview_request_id(vid(1)))
 
@@ -1446,3 +1448,21 @@ async def test_a_manual_confirm_while_committing_resets_the_backoff(env):
 
     assert retry["attempts"] == 1
     assert await armed(env) == VISIT_DEBRIEF_COMMIT_BACKOFF_S[0]
+
+
+# ── Codex 第 20 轮 ───────────────────────────────────────────────────────
+
+
+async def test_a_cached_preview_is_not_returned_after_a_rename(env, monkeypatch):
+    from main_logic.visit import local_chars
+
+    await visit(env)
+    await preview(env)
+    calls = {"n": 0}
+
+    async def resolve(uid):
+        calls["n"] += 1
+        return "A" if calls["n"] == 1 else "A2"  # 进锁时还叫 A，回给页面前已改名
+
+    monkeypatch.setattr(local_chars, "resolve_char_name", resolve)
+    assert await choose("diary") == (404, {"error": "unknown_or_expired"})
