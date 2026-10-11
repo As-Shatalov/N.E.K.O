@@ -108,6 +108,15 @@ def _fresh_cloudsave_router_module():
     sys.modules.pop("main_routers.cloudsave_router", None)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_character_config_lock(monkeypatch):
+    # 下载会拿角色配置变更锁：每个用例各用一把新锁，否则模块级的锁会被绑到本用例的事件循环上，
+    # 之后别的测试文件（各自的事件循环）再争用它就会报 "bound to a different event loop"
+    from utils import character_memory
+
+    monkeypatch.setattr(character_memory, "character_config_mutation_lock", asyncio.Lock())
+
+
 def _make_config_manager(tmp_root: Path):
     with patch.object(ConfigManager, "_get_documents_directory", return_value=tmp_root), patch.object(
         ConfigManager,
