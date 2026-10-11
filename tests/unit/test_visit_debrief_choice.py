@@ -1565,3 +1565,35 @@ async def test_a_stuck_push_is_cut_off_at_the_account_hold_limit(env, monkeypatc
     assert await asyncio.wait_for(display_socket._replay_one(socket, "A", vid(1), OWN_A, set(), "zh"), 5) is False
     assert env.host.blocks == [] and env.host.frames == [] and socket.sent == []
     assert not runtime._account_bound_pushes
+
+
+async def test_after_a_rename_the_new_page_gets_the_replayed_block_and_can_choose(env, monkeypatch):
+    # 改名后旧页面的块点不动（上一条），合法路径不受影响：新名字的页面 bind 时按 uid 拿到重放的块，并完成选择
+    from main_logic.visit import local_chars
+
+    await visit(env)
+
+    async def renamed(uid):
+        return "A2" if uid == CHAR_UID_A else None
+
+    monkeypatch.setattr(local_chars, "resolve_char_name", renamed)
+
+    class Socket:
+        def __init__(self):
+            setattr(self, VISIT_SOCKET_BOUND_ATTR, True)
+            self.sent = []
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+    old_page, new_page = Socket(), Socket()
+    await display_socket._replay_chips(old_page, "A")
+    await display_socket._replay_chips(new_page, "A2")
+    assert old_page.sent == []
+    replayed = [f for f in new_page.sent if f.get("type") == "chat_blocks"]
+    assert [f["request_id"] for f in replayed] == [debrief.chips_request_id(vid(1))]
+    assert replayed[0]["metadata"]["source_name"] == "A2"
+    status, body = await debrief._choose(vid(1), "diary", None, "A2")
+    assert status == 200 and body["applied"] == "preview"
+    assert (await debrief._choose(vid(1), "confirm", None, "A2")) == (200, {"ok": True, "applied": "diary"})
+    assert (await state_of(env=env))["debrief_choice"] == "diary"
