@@ -55,6 +55,7 @@ __all__ = [
     "keyed_entry_keys",
     "prune_retired_keys",
     "read_keyed_payload",
+    "strip_idempotency_metadata",
     "read_retired_keys",
     "read_retired_keys_unlocked",
     "retire_removed_keyed_entries",
@@ -540,6 +541,19 @@ def _entry_key(entry: Any) -> str | None:
     if kind != "ai" or not isinstance(key, str) or VISIT_DIARY_KEY_RE.fullmatch(key) is None:
         return None
     return key
+
+
+def strip_idempotency_metadata(messages: Any) -> None:
+    """Drop the reserved ``idempotency_key`` metadata from caller-supplied messages (in place).
+
+    Only the keyed ``/cache`` path stamps it, on the server side; anything a
+    caller sent on another write path would otherwise read as "this diary was
+    already written" and settle a later real keyed write without storing it.
+    """
+    for message in messages or ():
+        meta = message.get("metadata") if isinstance(message, dict) else getattr(message, "metadata", None)
+        if isinstance(meta, dict) and RECENT_IDEMPOTENCY_META_KEY in meta:
+            meta.pop(RECENT_IDEMPOTENCY_META_KEY, None)
 
 
 def keyed_entry_keys(payload: Any) -> set[str]:

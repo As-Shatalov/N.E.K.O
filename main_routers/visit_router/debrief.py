@@ -175,6 +175,9 @@ async def _show_owed_locked(host: Any, visit_id: str, *, own_char: str, lang: Op
     if await own_visit_uid() != state.get("own_uid"):
         # 读 state 的这段 await 里登出 / 换了账号：不把这一场的预览正文推给现在登录的账号
         return False
+    if await _own_char(state) != own_char:
+        # 补录拿到名字之后、等锁期间改了名（旧名字可能已归另一只猫）：不推给那个名字的页面，等 bind 重放
+        return False
     try:
         shown = bool(await host.render_chat_blocks(blocks, request_id=request_id, source_name=own_char))
     except Exception as exc:  # noqa: BLE001 - 页面不在：标记留在 state.json，等下次 bind 重放

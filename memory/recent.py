@@ -1731,6 +1731,8 @@ class CompressedRecentHistoryManager:
         )
 
     async def update_history(self, new_messages, lanlan_name, detailed=False, compress=True, on_compress_done=None):
+        # 普通写入不带串门日记的幂等键（只有 append_keyed 由服务端盖上）：调用方带来的一律去掉
+        recent_file.strip_idempotency_metadata(new_messages)
         file_path, admission_generation = self._capture_recent_operation_admission(
             lanlan_name,
         )

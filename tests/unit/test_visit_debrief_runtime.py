@@ -171,8 +171,15 @@ async def test_render_chips_recovery_callback(monkeypatch):
 
     class _Spool:
         async def read_state(self):
-            return {"visit_id": "v" * 22, "debrief_choice": "ask_later", "own_uid": "uid-own"}
+            return {"visit_id": "v" * 22, "debrief_choice": "ask_later", "own_uid": "uid-own",
+                    "own_char_uid": "char-host"}
 
+    async def resolve(uid):
+        return {"char-host": "Host"}.get(uid)
+
+    from main_logic.visit import local_chars
+
+    monkeypatch.setattr(local_chars, "resolve_char_name", resolve)
     # 场次归属的真实读盘见 test_visit_socket_bind 的补录用例
     monkeypatch.setattr(debrief, "_visit_owner", owner)
     # 投递哪一块按 state.json 的当前选择定（芯片 / 预览块 / 失败块，见 test_visit_debrief_choice）

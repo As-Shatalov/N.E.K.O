@@ -1129,6 +1129,12 @@ async def cache_conversation(request: HistoryRequest, lanlan_name: str):
         try:
             input_history = convert_to_messages(json.loads(request.input_history))
             if not input_history:
+                if _KEYED_CACHE_KEY_RE.fullmatch(str(request.idempotency_key or "").strip()) is not None:
+                    # 带键写入不能走「空批次就算已缓存」的捷径：调用方会把日记这一步当成写成了
+                    return JSONResponse(
+                        {"status": "error", "message": "keyed cache writes need a non-empty batch"},
+                        status_code=422,
+                    )
                 return {"status": "cached", "count": 0}
             theater_episode_batch = (
                 len(input_history) == 1
@@ -1146,6 +1152,11 @@ async def cache_conversation(request: HistoryRequest, lanlan_name: str):
                 return await _cache_keyed(
                     lanlan_name, request.input_history, input_history, idempotency_key,
                 )
+            # 不带串门日记键的写入：调用方带进来的 idempotency_key metadata 一律去掉，
+            # 否则一条普通消息就能冒充「这篇日记已写过」
+            from utils.recent_file import strip_idempotency_metadata
+
+            strip_idempotency_metadata(input_history)
             if idempotency_key and not theater_episode_batch:
                 # Only a theater episode write is idempotent: it upserts one
                 # capsule per Session and the key fences retracted attempts.

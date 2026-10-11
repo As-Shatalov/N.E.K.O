@@ -685,7 +685,7 @@ async def test_recovery_sends_no_chips_when_the_interrupted_notice_failed(monkey
 
     fake.send_frame = refuse
     monkeypatch.setattr(host_port.ManagerHost, "for_character", classmethod(lambda cls, name: fake))
-    assert await debrief.render_chips(vid(20), own_char="Host", status="interrupted") is False
+    assert await debrief.render_chips(vid(20), own_char=NAME, status="interrupted") is False
     assert fake.blocks == []
 
 
@@ -789,7 +789,7 @@ async def test_recovery_skips_a_visit_of_another_account(monkeypatch, tmp_path):
 
     await _pending(tmp_path, 21, finalized="crash", own_uid=OWN_B)
     fake = await _recovery_host(monkeypatch)
-    assert await debrief.render_chips(vid(21), own_char="Host", status="interrupted") is False
+    assert await debrief.render_chips(vid(21), own_char=NAME, status="interrupted") is False
     assert fake.frames == [] and fake.blocks == []
 
 
@@ -798,7 +798,7 @@ async def test_recovery_of_the_current_account_still_renders(monkeypatch, tmp_pa
 
     await _pending(tmp_path, 22, finalized="crash")
     fake = await _recovery_host(monkeypatch)
-    assert await debrief.render_chips(vid(22), own_char="Host", status="interrupted") is True
+    assert await debrief.render_chips(vid(22), own_char=NAME, status="interrupted") is True
     assert [b[1] for b in fake.blocks] == [chips_request_id(vid(22))]
 
 
@@ -806,7 +806,7 @@ async def test_recovery_with_unreadable_state_sends_nothing(monkeypatch, tmp_pat
     from main_routers.visit_router import debrief
 
     fake = await _recovery_host(monkeypatch)
-    assert await debrief.render_chips(vid(23), own_char="Host", status=None) is False
+    assert await debrief.render_chips(vid(23), own_char=NAME, status=None) is False
     assert fake.frames == [] and fake.blocks == []
 
 
@@ -822,7 +822,7 @@ async def test_recovery_account_change_during_the_notice_sends_no_chip(monkeypat
 
     monkeypatch.setattr(accounts, "own_visit_uid", switching)
     fake = await _recovery_host(monkeypatch)
-    assert await debrief.render_chips(vid(24), own_char="Host", status="interrupted") is False
+    assert await debrief.render_chips(vid(24), own_char=NAME, status="interrupted") is False
     assert fake.blocks == []
 
 

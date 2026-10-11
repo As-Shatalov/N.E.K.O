@@ -806,3 +806,44 @@ async def test_a_damaged_sidecar_keeps_keyed_writes_failing_closed(env):
     Path(sidecar).write_text("{not json", encoding="utf-8")
     status, _ = await _cache(env, _diary_request())
     assert status == 503 and _keyed(env) == []
+
+
+# ── 评审第 12 轮 ─────────────────────────────────────────────────────────
+
+
+async def test_an_empty_keyed_batch_is_refused(env):
+    from app.memory_server.routes import HistoryRequest
+
+    await _set_pending(env)
+    status, _ = await _cache(env, HistoryRequest(input_history="[]", idempotency_key=KEY))
+    assert status == 422
+    assert (await _key_record())["state"] == "pending"
+
+
+async def test_an_unkeyed_write_cannot_forge_diary_evidence(env):
+    from app.memory_server.routes import HistoryRequest
+
+    forged = json.dumps([{"type": "ai", "data": {"content": "别的话", "metadata": {"idempotency_key": KEY}}}],
+                        ensure_ascii=False)
+    env.tsdb.astore_conversation = AsyncMock(return_value=None)
+    real_update = env.recent.update_history
+    # 路由这一道单独验：update_history 换成不清洗的替身，时间索引里也不能带进保留键
+    env.recent.update_history = AsyncMock(return_value=None)
+    await _cache(env, HistoryRequest(input_history=forged))
+    stored = env.tsdb.astore_conversation.await_args.args[1]
+    assert all("idempotency_key" not in (m.metadata or {}) for m in stored)
+    env.recent.update_history = real_update
+    await _cache(env, HistoryRequest(input_history=forged))
+    assert recent_file.keyed_entry_keys(_recent_entries(env)) == set()
+    # 真正的带键写入照常写进去
+    status, body = await _cache(env, _diary_request())
+    assert body == {"status": "cached", "count": 1} and len(_keyed(env)) == 1
+
+
+
+async def test_ordinary_history_updates_drop_reserved_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr("memory.recent.assert_cloudsave_writable", lambda *a, **k: None)
+    path = str(tmp_path / "recent.json")
+    mgr = _recent_manager(path)
+    await mgr.update_history([_keyed_entry("别的话", KEY)], NAME, compress=False)
+    assert recent_file.keyed_entry_keys(json.loads(Path(path).read_text(encoding="utf-8"))) == set()

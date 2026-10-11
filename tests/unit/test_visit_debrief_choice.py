@@ -1037,3 +1037,20 @@ async def test_a_lost_transcript_greys_the_open_chips(env):
     await choose("diary")
     chosen = [f for f in env.host.frames if f.get("phase") == "chosen"][-1]
     assert chosen["request_id"] == debrief.chips_request_id(vid(1)) and chosen["choice"] == "abandoned"
+
+
+async def test_startup_replay_follows_a_rename_made_meanwhile(env):
+    # 补录拿到旧名字 "A" 之后角色改了名：不把这一场的块推给现在叫 "A" 的页面
+    from main_logic.visit import local_chars
+
+    await visit(env)
+    await preview(env)
+    env.host.blocks.clear()
+
+    async def renamed(uid):
+        return "A2"
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(local_chars, "resolve_char_name", renamed)
+        assert await debrief.show_owed(env.host, vid(1), own_char="A", lang="zh") is False
+    assert env.host.blocks == []
