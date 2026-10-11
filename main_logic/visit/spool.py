@@ -178,7 +178,11 @@ class SpoolStateUnreadable(RuntimeError):
 
 
 class _NotApplied(Exception):
-    """Raised inside a state mutation to abort it without writing (see ``update_state_if``)."""
+    """Raised inside a state mutation to abort it without writing; carries the state it saw (``update_state_if``)."""
+
+    def __init__(self, state: dict) -> None:
+        super().__init__("debrief_choice moved on")
+        self.state = state
 
 
 class SpoolBusy(RuntimeError):
@@ -1398,28 +1402,26 @@ class VisitSpool:
         await asyncio.to_thread(self._update_state_sync, mutate)
         return changed
 
-    async def update_state_if(self, expected_choice: Any, **changes: Any) -> dict | None:
-        """Apply ``changes`` only while ``debrief_choice`` is still ``expected_choice``; None when it moved on.
+    async def update_state_if(self, expected_choice: Any, **changes: Any) -> tuple[bool, dict]:
+        """Apply ``changes`` only while ``debrief_choice`` is still ``expected_choice``.
+
+        Returns ``(True, new state)``, or ``(False, the state found)`` without
+        writing when the choice moved on.
 
         For transitions that race with writers outside the debrief lock (the
         void step of "forget this person" turns undecided debriefs into
         ``forget``): an unconditional write after a long await would overwrite
         that newer terminal choice.
         """
-        applied = False
-
         def mutate(state: dict) -> None:
-            nonlocal applied
             if state["debrief_choice"] != expected_choice:
-                raise _NotApplied
+                raise _NotApplied(copy.deepcopy(state))
             state.update(copy.deepcopy(changes))
-            applied = True
 
         try:
-            result = await asyncio.to_thread(self._update_state_sync, mutate)
-        except _NotApplied:
-            return None
-        return result if applied else None
+            return True, await asyncio.to_thread(self._update_state_sync, mutate)
+        except _NotApplied as lost:
+            return False, lost.state
 
     async def update_state(self, **changes: Any) -> dict:
         """Read-modify-write ``state.json`` with ``changes``; the result is validated."""

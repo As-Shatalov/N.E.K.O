@@ -276,7 +276,8 @@ async def test_unreadable_recent_answers_503(env, monkeypatch):
     Path(env.recent_path).write_text("[]", encoding="utf-8")
     monkeypatch.setattr(recent_file, "read_recent_text_unlocked", unreadable)
     status, _ = await _cache(env, _diary_request())
-    assert status == 503 and (await _key_record())["state"] == "pending"
+    # 先核存储、读不出就 503：键记录一次都没写（不是 done）
+    assert status == 503 and await _key_record() is None
 
 
 async def test_keyed_cache_accepts_assistant_messages_only(env):
@@ -856,3 +857,21 @@ def test_stripping_covers_every_message_shape():
     obj = _keyed_entry("z", KEY)
     recent_file.strip_idempotency_metadata([stored, flat, obj])
     assert recent_file.keyed_entry_keys([stored, flat, messages_to_dict([obj])[0]]) == set()
+
+
+
+async def test_existing_evidence_is_reported_even_when_bookkeeping_writes_are_blocked(env, monkeypatch):
+    # 云存档维护期：簿记写被挡。recent 里已有本键条目时照样如实回 duplicate，不报 503
+    from app.memory_server import idempotency
+
+    await _cache(env, _diary_request())
+    data = json.loads(Path(idempotency.keys_path(NAME)).read_text(encoding="utf-8"))
+    data[KEY]["state"] = "pending"
+    Path(idempotency.keys_path(NAME)).write_text(json.dumps(data), encoding="utf-8")
+
+    def blocked(*_a, **_k):
+        raise RuntimeError("cloudsave maintenance")
+
+    monkeypatch.setattr("app.memory_server.idempotency.assert_cloudsave_writable", blocked)
+    status, body = await _cache(env, _diary_request())
+    assert (status, body["duplicate"]) == (200, True) and len(_keyed(env)) == 1

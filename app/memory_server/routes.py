@@ -1329,25 +1329,35 @@ async def _cache_keyed(lanlan_name: str, raw_history: str, input_history: list, 
         if record is not None and record.get("state") in idempotency.TERMINAL_KEY_STATES:
             return {"status": "cached", "duplicate": True, "count": 0}
         try:
-            await idempotency.update_key(
-                lanlan_name, key,
-                idempotency.transition(idempotency.KEY_STATE_PENDING, content_hash=content_hash, kind="cache"),
-            )
             async with runtime._get_settle_lock(lanlan_name):
-                # recent 里已有本键条目、或它已被移出（退役旁路）：写过的正面证据，两处都不再写——
-                # 云存档恢复连 time_indexed.db 一起回滚时，也不把用户恢复掉的日记补回时间索引
+                # 先看存储里的证据：recent 里已有本键条目、或它已被移出（退役旁路），就是写过——
+                # 两处都不再写（云存档恢复连 time_indexed.db 一起回滚时，也不把恢复掉的日记补回时间索引），
+                # 也不先做任何簿记写：云存档维护期写被挡时照样能如实回 duplicate
                 outcome = await runtime.recent_history_manager.keyed_state(lanlan_name, key)
                 if outcome == "absent":
+                    await idempotency.update_key(
+                        lanlan_name, key,
+                        idempotency.transition(idempotency.KEY_STATE_PENDING, content_hash=content_hash,
+                                               kind="cache"),
+                    )
                     had_row = await runtime.time_manager.ahas_conversation(session_id, lanlan_name)
                     if not had_row:
                         await runtime.time_manager.astore_conversation_strict(
                             session_id, input_history, lanlan_name,
                         )
                     outcome = await runtime.recent_history_manager.append_keyed(input_history, lanlan_name, key)
-            await idempotency.update_key(lanlan_name, key, idempotency.transition(idempotency.KEY_STATE_DONE))
+            if outcome == "written":
+                await idempotency.update_key(lanlan_name, key, idempotency.transition(idempotency.KEY_STATE_DONE))
         except Exception as exc:  # noqa: BLE001 - 任一处没确认落盘：键留 pending，503 让调用方重试
             logger.warning(f"[MemoryServer] keyed cache {lanlan_name}: not confirmed: {exc!r}")
             return _keyed_unconfirmed("keyed write not confirmed; retry later")
+        if outcome != "written":
+            # 已写过：补记 done 只为少做一次核对，记不上（维护期等）也不影响如实回 duplicate
+            try:
+                await idempotency.update_key(lanlan_name, key, idempotency.transition(
+                    idempotency.KEY_STATE_DONE, content_hash=content_hash, kind="cache"))
+            except Exception as exc:  # noqa: BLE001
+                logger.info(f"[MemoryServer] keyed cache {lanlan_name}: done not recorded: {exc!r}")
     if outcome != "written":
         return {"status": "cached", "duplicate": True, "count": 0}
     logger.info(f"[MemoryServer] cache: {lanlan_name} keyed +{len(input_history)} 条消息")

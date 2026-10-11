@@ -238,8 +238,13 @@ async def _replay_one(websocket: Any, lanlan_name: str, visit_id: str, owner: st
             return True
         if state is None or not state.get("debrief_chip_pending") or state.get("own_uid") != owner:
             return True
+        from main_logic.visit import local_chars
+
+        if await local_chars.resolve_char_name(state["own_char_uid"]) != lanlan_name:
+            # 等锁期间这只猫改了名（旧名字可能已归另一只猫）：这条连接已不是它的页面，留给它新名字的 bind 重放
+            return True
         if await own_visit_uid() != owner:
-            # 等锁期间（另一页正在生成 / 提交）登出或换了账号：这一页不再收上一个账号的块
+            # 等锁期间（另一页正在生成 / 提交）登出或换了账号：这一页不再收上一个账号的块（账号最后核）
             return False
         return await _send_owed(websocket, lanlan_name, state, delivered, lang, own_visit_uid)
 

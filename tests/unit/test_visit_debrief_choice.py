@@ -1132,8 +1132,9 @@ async def test_a_due_retry_superseded_by_a_manual_attempt_stands_down(env):
             break
         await asyncio.sleep(0.01)
     assert lock._waiters
-    # 那次手动尝试暂时失败：持久化了更新的排期（并排了自己的新定时）
+    # 那次手动尝试暂时失败：持久化了更新的排期并排了自己的新定时
     await VisitSpool(env.tmp, vid(1)).update_state(debrief_retry={"attempts": 2, "next_at": 1120.0})
+    debrief.schedule_commit_retry(vid(1), 1120.0)
     lock.release()
     await timer
     # 旧定时作废：不再立刻发请求
@@ -1161,3 +1162,39 @@ def test_the_diary_reply_parser_ignores_braces_around_the_json():
     assert debrief_writers._parse_reply(reply) == ("今天很开心。", ["看了星星"])
     with pytest.raises(debrief_writers.DiaryGenerationFailed):
         debrief_writers._parse_reply("{没有日记}")
+
+
+
+async def test_bind_replay_rechecks_the_character_after_waiting_for_the_lock(env, monkeypatch):
+    from main_logic.visit import local_chars
+
+    await visit(env)
+    await preview(env)
+
+    class Socket:
+        def __init__(self):
+            setattr(self, VISIT_SOCKET_BOUND_ATTR, True)
+            self.sent = []
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+    names = {"now": "A"}
+
+    async def resolve(uid):
+        return names["now"] if uid == CHAR_UID_A else None
+
+    monkeypatch.setattr(local_chars, "resolve_char_name", resolve)
+    socket = Socket()
+    lock = debrief._visit_lock(vid(1))
+    await lock.acquire()
+    replay = asyncio.ensure_future(display_socket._replay_chips(socket, "A"))
+    for _ in range(500):
+        if lock._waiters:
+            break
+        await asyncio.sleep(0.01)
+    assert lock._waiters
+    names["now"] = "A2"  # 等锁期间改了名，"A" 这个名字已归别的猫
+    lock.release()
+    await replay
+    assert socket.sent == []

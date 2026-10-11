@@ -586,8 +586,7 @@ def _cancel_timer(visit_id: str) -> None:
         task.cancel()
 
 
-def schedule_commit_retry(visit_id: str, next_at: float, *, epoch: Optional[int] = None,
-                          persisted: bool = True) -> None:
+def schedule_commit_retry(visit_id: str, next_at: float, *, epoch: Optional[int] = None) -> None:
     """(Re)arm the one in-process retry of a ``committing:diary`` visit at wall time ``next_at``.
 
     ``epoch`` (from a commit that started earlier): when :func:`cancel_commit_timers`
@@ -596,7 +595,7 @@ def schedule_commit_retry(visit_id: str, next_at: float, *, epoch: Optional[int]
     if epoch is not None and epoch != _timer_epoch:
         return
     _cancel_timer(visit_id)
-    task = asyncio.ensure_future(_retry_at(visit_id, float(next_at), persisted=persisted))
+    task = asyncio.ensure_future(_retry_at(visit_id, float(next_at)))
     _timers[visit_id] = task
 
 
@@ -604,7 +603,7 @@ _LOCAL_FAILURE_RETRY_S = 600
 """Next retry after a retry that failed locally (``state.json`` unreadable / unwritable, ...)."""
 
 
-async def _retry_at(visit_id: str, next_at: float, *, persisted: bool = True) -> None:
+async def _retry_at(visit_id: str, next_at: float) -> None:
     epoch = _timer_epoch
     try:
         await _sleep(max(0.0, next_at - _now()))
@@ -616,9 +615,9 @@ async def _retry_at(visit_id: str, next_at: float, *, persisted: bool = True) ->
         del _timers[visit_id]
     _running.add(me)
     try:
-        # 按持久化的 next_at 排的定时：醒来后在锁内确认这仍是当前的排期。等锁期间一次手动「写入」
-        # 已暂时失败、排了更新的 next_at 时，这次不再立刻重试（否则绕过退避、还会顶掉新定时）
-        await run_commit(visit_id, "timer", expect_next_at=next_at if persisted else None)
+        # 醒来后在锁内确认没有更新的定时：等锁期间一次手动「写入」已暂时失败、排了新定时时，
+        # 这次不再立刻重试（否则绕过退避、还会顶掉新定时）。所有定时（含本地失败补排的）都适用
+        await run_commit(visit_id, "timer")
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - state.json 一时读写不了等：不能就此断掉自动重试
@@ -626,7 +625,7 @@ async def _retry_at(visit_id: str, next_at: float, *, persisted: bool = True) ->
                        visit_id[:6], _LOCAL_FAILURE_RETRY_S, exc)
         # 写入不设重试上限：本地失败同样再排一次（停止 / 回滚之后代次过期，不再排）
         if visit_id not in _timers:
-            schedule_commit_retry(visit_id, _now() + _LOCAL_FAILURE_RETRY_S, epoch=epoch, persisted=False)
+            schedule_commit_retry(visit_id, _now() + _LOCAL_FAILURE_RETRY_S, epoch=epoch)
     finally:
         _running.discard(me)
 
@@ -674,7 +673,7 @@ async def resume_diary_commit(spool: Any, state: Mapping[str, Any]) -> None:
 # ── 两步提交（端点、定时重试、启动补录共用） ─────────────────────────────
 
 
-async def run_commit(visit_id: str, trigger: str, *, expect_next_at: Optional[float] = None) -> tuple[int, dict]:
+async def run_commit(visit_id: str, trigger: str) -> tuple[int, dict]:
     """Run (or continue) the two-step write of ``visit_id`` under its lock; ``(http status, body)``.
 
     The only place a diary is written: the ``confirm`` endpoint, the retry
@@ -683,11 +682,10 @@ async def run_commit(visit_id: str, trigger: str, *, expect_next_at: Optional[fl
     armed; permanent → ``commit_failed:diary`` with the failure block.
     """
     async with _visit_lock(visit_id):
-        return await _run_commit_locked(visit_id, trigger, expect_next_at=expect_next_at)
+        return await _run_commit_locked(visit_id, trigger)
 
 
-async def _run_commit_locked(visit_id: str, trigger: str, *,
-                             expect_next_at: Optional[float] = None) -> tuple[int, dict]:
+async def _run_commit_locked(visit_id: str, trigger: str) -> tuple[int, dict]:
     epoch = _timer_epoch
     spool = _spool(visit_id)
     state = await spool.read_state()
@@ -695,12 +693,9 @@ async def _run_commit_locked(visit_id: str, trigger: str, *,
         return 404, {"error": "unknown_or_expired"}
     if state["debrief_choice"] != "committing:diary":
         return _not_committing(state)
-    if expect_next_at is not None:
-        retry = state["debrief_retry"]
-        current = float(retry["next_at"]) if isinstance(retry, Mapping) else 0.0
-        if current != float(expect_next_at):
-            # 排期已被更新的一次尝试换掉：这次作废，新的定时会按它自己的 next_at 来
-            return 409, {"error": "superseded"}
+    if trigger == "timer" and visit_id in _timers:
+        # 这次定时醒来后（已从 _timers 摘掉自己）又排进了更新的定时：排期被换掉，这次作废
+        return 409, {"error": "superseded"}
     # 两步写入期间按住这个角色的生命周期：改名 / 删除 400，不会一步写在旧名字下、一步写在新名字下
     async with _hold_lifecycle([state["own_char_uid"]]):
         return await _commit_held(visit_id, trigger, spool, state, epoch)
@@ -760,14 +755,6 @@ async def _commit_held(visit_id: str, trigger: str, spool: Any, state: Mapping[s
     return 502, {"error": "commit_failed", "step": result.step, "status": int(result.status),
                  "written": written_of(state["debrief_writes"]),
                  "unconfirmed": unconfirmed_of(state["debrief_writes"])}
-
-
-async def _moved_on(spool: Any) -> tuple[int, dict]:
-    """Answer for a conditional transition that lost to another writer (e.g. "forget this person")."""
-    state = await spool.read_state()
-    if state is None:
-        return 404, {"error": "unknown_or_expired"}
-    return _already_chosen(state)
 
 
 def _already_chosen(state: Mapping[str, Any]) -> tuple[int, dict]:
@@ -836,10 +823,9 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
             return 200, {"ok": True, "applied": "abandoned", "written": written, "unconfirmed": unconfirmed}
         # confirm
         if current == "preview:diary":
-            moved = await spool.update_state_if("preview:diary", debrief_choice="committing:diary")
-            if moved is None:
-                return await _moved_on(spool)
-            state = moved
+            applied, state = await spool.update_state_if("preview:diary", debrief_choice="committing:diary")
+            if not applied:
+                return _already_chosen(state)
         elif current == "commit_failed:diary":
             if seq != state["debrief_commit_error"]["seq"]:
                 # 点的是旧版失败块（或绕过前端不带 seq）：以新块为准，不重新提交
@@ -857,7 +843,7 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
         except Exception:
             # 本地失败（state.json 一时写不了等）：上面已撤掉定时，补排一次，不让它停在 committing
             if visit_id not in _timers:
-                schedule_commit_retry(visit_id, _now() + _LOCAL_FAILURE_RETRY_S, epoch=epoch, persisted=False)
+                schedule_commit_retry(visit_id, _now() + _LOCAL_FAILURE_RETRY_S, epoch=epoch)
             raise
 
 
@@ -875,8 +861,9 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     if current not in _CHIP_CHOICES:
         return _already_chosen(state)
     # 条件转移：「清除这个人」的作废步骤不拿这把锁、会把未定的 debrief 直接改成 forget，不能盖掉它
-    if await spool.update_state_if(current, debrief_choice="generating:diary") is None:
-        return await _moved_on(spool)
+    applied, found = await spool.update_state_if(current, debrief_choice="generating:diary")
+    if not applied:
+        return _already_chosen(found)
     try:
         preview = await debrief_writers.generate_diary_preview(
             spool, llm=_diary_llm(), own_char=own_char, family_names=await _family_names(),
@@ -884,9 +871,10 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     except debrief_writers.NothingToRecord:
         # 芯片只在 spool 有句子时出：走到这里是 spool 事后丢了。与「记忆开却无转录」同一终态（已放弃），
         # 不再每次 bind 重放一个点了必然 404 的芯片
-        if await spool.update_state_if("generating:diary", debrief_choice="abandoned", debrief_pending=None,
-                                       debrief_chip_pending=False) is None:
-            return await _moved_on(spool)
+        applied, found = await spool.update_state_if("generating:diary", debrief_choice="abandoned",
+                                                     debrief_pending=None, debrief_chip_pending=False)
+        if not applied:
+            return _already_chosen(found)
         await spool.delete_if_settled()
         # 已打开的页面上芯片还亮着：让它置灰（choice='abandoned'）
         await _send(state, _state_frame(visit_id, "chosen", chips_request_id(visit_id), choice="abandoned"))
@@ -897,9 +885,10 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     pending = preview.to_pending()
     # 预览、状态与待投递标记一次原子写：之后 bind 重放的就是这一份。只在仍处于 generating 时写：
     # 生成期间「清除这个人」已把这场作废（forget）时，不能把这个人的日记与事实重新落盘
-    if await spool.update_state_if("generating:diary", debrief_pending=pending, debrief_choice="preview:diary",
-                                   debrief_chip_pending=True) is None:
-        return await _moved_on(spool)
+    applied, found = await spool.update_state_if("generating:diary", debrief_pending=pending,
+                                                 debrief_choice="preview:diary", debrief_chip_pending=True)
+    if not applied:
+        return _already_chosen(found)
     if await own_visit_uid() != state["own_uid"]:
         # 生成期间登出 / 换了账号：预览已落盘、等那个账号回来 bind 时重放，不推给现在这一页、也不回给它
         return 404, {"error": "unknown_or_expired"}
