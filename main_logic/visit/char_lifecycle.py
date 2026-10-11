@@ -395,13 +395,24 @@ async def begin_rename(
 
     Runs inside the rename transaction (under the character-config lock),
     with ``names`` / ``uid_of`` read from the config before the rename. An
-    earlier marker is reconciled first; when it cannot be (ambiguous,
-    unreadable spools) :class:`RenamePendingElsewhere` is raised and nothing
-    is written. An unreadable roster raises :class:`RosterCorruptError`.
+    earlier marker is reconciled first, and the whole queue when this
+    character has a queued rename; when it cannot be (ambiguous, unreadable
+    spools, this character's own rename still pending)
+    :class:`RenamePendingElsewhere` is raised and nothing is written. An unreadable roster raises :class:`RosterCorruptError`.
     """
     config_dir = Path(config_dir)
     if not await has_visit_data(config_dir):
         return None
+    # 这个角色自己还有一笔排在队里的改名（云快照导入记下的）：位置那笔对得完不代表它也对完了。
+    # 先把整个队列对一遍；它还挂着就拒绝这次改名，否则那笔只记着旧的两个名字，新名字没人占着
+    if await _own_rename_pending(config_dir, old, character_uid, queued_only=True):
+        try:
+            await reconcile_renames(config_dir, names, uid_of)
+        except Exception as exc:  # noqa: BLE001 - 对不完账就拒绝这次改名，标记留给启动对账
+            logger.warning("visit rename: queued rename of %r not reconciled: %r", old, exc)
+            raise RenamePendingElsewhere("this character's queued rename is still being migrated") from exc
+        if await _own_rename_pending(config_dir, old, character_uid, queued_only=False):
+            raise RenamePendingElsewhere("this character's queued rename is still being migrated")
     marker: dict[str, str] = {"old": old, "new": new}
     if character_uid:
         marker["uid"] = character_uid
@@ -697,6 +708,13 @@ async def is_name_renaming(config_dir: str | Path, name: str) -> bool:
 async def is_name_retiring(config_dir: str | Path, name: str) -> bool:
     """Whether a deleted character called ``name`` still has a ``pending_retire`` item (unreadable: False)."""
     return await name_marker_state(config_dir, name) == NAME_RETIRING
+
+
+async def _own_rename_pending(config_dir: Path, name: str, character_uid: str | None, *, queued_only: bool) -> bool:
+    """Whether a rename of this character is queued (or, unless ``queued_only``, in the slot either)."""
+    slot, queued = await read_roster_markers(config_dir, PENDING_RENAME, PENDING_RENAME_QUEUE)
+    markers = [*_queued_renames(queued)] if queued_only else [slot, *_queued_renames(queued)]
+    return any(_rename_names_of(item, name, character_uid) for item in markers)
 
 
 def _rename_names_of(marker: Any, name: str, character_uid: str | None) -> tuple[str, ...]:

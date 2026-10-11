@@ -1110,3 +1110,41 @@ async def test_a_rename_waiting_for_the_retirement_of_its_third_name_reports_tha
     # 等的目标名一起报出去，名字占用据此答「稍后再试」（变异：只报 old / new 必红，会被当成永久歧义）
     assert unsettled == frozenset({"A", "B", "C"})
     assert await lc.names_retiring(tmp_path, unsettled) is True
+
+
+async def test_renaming_a_character_settles_its_queued_rename_first(tmp_path):
+    roster = await seed_roster(tmp_path, own_char="A")
+    await seed_roster(tmp_path, peer_uid=PEER_Y, tag=TAG_Y, own_char="P")
+    # 位置上是另一个角色对得完的 P -> Q，这个角色（现在叫 B）的 A -> B 排在队里
+    await set_roster_marker(tmp_path, "pending_rename", {"old": "P", "new": "Q", "uid": "e" * 32})
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", {"old": "A", "new": "B", "uid": CHAR_UID_A})
+    uid_of = {"B": CHAR_UID_A, "Q": "e" * 32}
+    marker = await lc.begin_rename(tmp_path, "B", "C", CHAR_UID_A, names=set(uid_of), uid_of=uid_of)
+    # 排队那笔先迁完，再记这次改名（变异：只对账位置必红，A -> B 留在队里只占着旧的两个名字）
+    assert marker == {"old": "B", "new": "C", "uid": CHAR_UID_A}
+    assert await roster.get_char_entry(PEER_X, "B") is not None and await roster.get_char_entry(PEER_X, "A") is None
+    data = _peers(tmp_path)
+    assert data["pending_rename"] == marker and "pending_rename_queue" not in data
+
+
+async def test_renaming_a_character_whose_queued_rename_stays_pending_is_refused(tmp_path):
+    await seed_roster(tmp_path, own_char="A")
+    await seed_roster(tmp_path, peer_uid=PEER_Y, tag=TAG_Y, own_char="P")
+    await set_roster_marker(tmp_path, "pending_rename", {"old": "P", "new": "Q", "uid": "e" * 32})
+    queued = {"old": "A", "new": "B", "uid": CHAR_UID_A}
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", queued)
+    # 这个角色的 A -> B 永久歧义（A 被别的角色占着）：B -> C 不能越过它记下（变异：只对账位置必红）
+    uid_of = {"A": CHAR_UID_B, "B": CHAR_UID_A, "Q": "e" * 32}
+    with pytest.raises(lc.RenamePendingElsewhere):
+        await lc.begin_rename(tmp_path, "B", "C", CHAR_UID_A, names=set(uid_of), uid_of=uid_of)
+    assert _peers(tmp_path)["pending_rename"] == queued
+
+
+async def test_renaming_without_a_queued_rename_of_its_own_is_unchanged(tmp_path):
+    await seed_roster(tmp_path, own_char="A")
+    other = {"old": "P", "new": "Q", "uid": "e" * 32}
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", other)
+    # 队里只有别的角色的改名：照旧直接记这次改名，不碰队列
+    marker = await lc.begin_rename(tmp_path, "A", "A2", CHAR_UID_A, names={"A"}, uid_of={"A": CHAR_UID_A})
+    assert marker == {"old": "A", "new": "A2", "uid": CHAR_UID_A}
+    assert _peers(tmp_path)["pending_rename_queue"] == [other]
