@@ -1099,3 +1099,14 @@ async def test_replay_goes_on_after_one_item_fails_to_write(tmp_path, monkeypatc
     # 一项写不进去不能中断整轮重放：后面的照常补（变异：不逐项接住必红）
     assert await lc.replay_retires(tmp_path, _loader({"B"}, {"B": CHAR_UID_B}), retire_persona=None) is False
     assert settled == [second]
+
+
+async def test_a_rename_waiting_for_the_retirement_of_its_third_name_reports_that_name(tmp_path):
+    await seed_roster(tmp_path, own_char="A")
+    await set_roster_marker(tmp_path, "pending_rename", {"old": "A", "new": "B", "uid": CHAR_UID_A})
+    # 角色现在叫 C，C 下还有已删除角色的残留没退役完：改名在等，不是歧义
+    await add_roster_marker_item(tmp_path, "pending_retire", lc.retire_item("C", CHAR_UID_B))
+    unsettled = await lc.reconcile_rename(tmp_path, {"C"}, {"C": CHAR_UID_A})
+    # 等的目标名一起报出去，名字占用据此答「稍后再试」（变异：只报 old / new 必红，会被当成永久歧义）
+    assert unsettled == frozenset({"A", "B", "C"})
+    assert await lc.names_retiring(tmp_path, unsettled) is True

@@ -243,7 +243,8 @@ async def reconcile_rename(
             # 目标名字下还有已删除角色的残留没退役完：先迁进去，之后按名字退役会连这个角色的条目一起删。
             # 留着标记等退役补完（启动恢复先补退役、再对账）
             logger.warning("visit recovery: pending_rename %r -> %r waits for the retirement of %r", old, new, target)
-            return frozenset(held)
+            # 目标名可能是第三个名字（不在 held 里）：一起报出去，名字占用才认得出这是「在等退役」而不是歧义
+            return frozenset(held) | {target}
     if (forward or moved) and not migrated and (from_cloudsave or len(held) > 2):
         # 迁移是几次各自独立的写入：中途失败时标记还在、条目已经挪了一部分。先记下「已开始迁」，
         # 之后角色再被改回旧名时按普通改名反向迁回（含 chained 名字），不能当成导入回滚直接撤标记
