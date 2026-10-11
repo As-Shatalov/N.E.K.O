@@ -71,6 +71,8 @@ from main_logic.visit.subjects import (
     promote_roster_marker,
     read_roster_marker,
     read_roster_marker_sync,
+    read_roster_markers,
+    read_roster_markers_sync,
     replace_roster_marker_sync,
     set_roster_marker_sync,
     remove_roster_marker_item,
@@ -366,8 +368,8 @@ async def _settle_own_rename(
     ambiguous one holds it): they are retired with the character, no other
     local character holding them.
     """
-    marker = await read_roster_marker(config_dir, PENDING_RENAME)
-    queued = _queued_renames(await read_roster_marker(config_dir, PENDING_RENAME_QUEUE))
+    marker, queued = await read_roster_markers(config_dir, PENDING_RENAME, PENDING_RENAME_QUEUE)
+    queued = _queued_renames(queued)
     if not _rename_names_of(marker, name, character_uid) and not any(
             _rename_names_of(item, name, character_uid) for item in queued):
         return ()
@@ -539,9 +541,11 @@ async def name_marker_state(config_dir: str | Path, name: str) -> str:
     until the file is readable again.
     """
     try:
-        retiring = await read_roster_marker(config_dir, PENDING_RETIRE)
-        renaming = await read_roster_marker(config_dir, PENDING_RENAME)
-        queued = _queued_renames(await read_roster_marker(config_dir, PENDING_RENAME_QUEUE))
+        # 一次读出三个标记：分开读可能拼出从未存在过的状态（读完位置后恢复刚好把队首挪进位置、
+        # 再读队列已空），把排队中的名字误判成空闲
+        retiring, renaming, queued = await read_roster_markers(
+            config_dir, PENDING_RETIRE, PENDING_RENAME, PENDING_RENAME_QUEUE)
+        queued = _queued_renames(queued)
     except RosterCorruptError as exc:
         logger.warning("visit lifecycle: roster unreadable, name %r not checked: %s", name, exc)
         return NAME_UNREADABLE
@@ -602,8 +606,8 @@ def record_removed_characters_sync(
     config_dir = Path(config_dir)
     kept = set(kept_local_names)
     try:
-        rename_markers = [read_roster_marker_sync(config_dir, PENDING_RENAME),
-                          *_queued_renames(read_roster_marker_sync(config_dir, PENDING_RENAME_QUEUE))]
+        slot, queued = read_roster_markers_sync(config_dir, PENDING_RENAME, PENDING_RENAME_QUEUE)
+        rename_markers = [slot, *_queued_renames(queued)]
     except RosterCorruptError:
         rename_markers = []  # 名册读不出：写标记那一步同样会失败，由回调方记日志
     added = 0
@@ -679,8 +683,8 @@ def record_handed_over_names_sync(
     if not fresh or not _may_exist(config_dir / VISIT_PEERS_FILENAME):
         return 0
     updated = 0
-    slot = read_roster_marker_sync(config_dir, PENDING_RENAME)
-    queued = _queued_renames(read_roster_marker_sync(config_dir, PENDING_RENAME_QUEUE))
+    slot, queued = read_roster_markers_sync(config_dir, PENDING_RENAME, PENDING_RENAME_QUEUE)
+    queued = _queued_renames(queued)
     for key, marker in [(PENDING_RENAME, slot)] + [(PENDING_RENAME_QUEUE, item) for item in queued]:
         if not isinstance(marker, dict) or marker.get("uid") in gone:
             continue

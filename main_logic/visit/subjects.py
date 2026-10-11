@@ -447,6 +447,22 @@ def read_roster_marker_sync(config_dir: str | Path, key: str) -> Any:
     return copy.deepcopy(data.get(key))
 
 
+def read_roster_markers_sync(config_dir: str | Path, *keys: str) -> tuple[Any, ...]:
+    """Deep copies of several top-level markers from one locked read (``None`` for an absent key)."""
+    data = _read_top_level_sync(Path(config_dir) / VISIT_PEERS_FILENAME)
+    return tuple(copy.deepcopy(data.get(key)) for key in keys)
+
+
+async def read_roster_markers(config_dir: str | Path, *keys: str) -> tuple[Any, ...]:
+    """:func:`read_roster_marker` for several keys at once, all from the same state of the file.
+
+    Separate reads could pair a slot read before a recovery promoted the
+    next queued marker with a queue read after it, a state that never
+    existed. An unreadable roster raises :class:`RosterCorruptError`.
+    """
+    return await asyncio.to_thread(read_roster_markers_sync, config_dir, *keys)
+
+
 def _clear_marker_sync(path: Path, key: str, expected: Any) -> bool:
     with path_lock(path):
         try:

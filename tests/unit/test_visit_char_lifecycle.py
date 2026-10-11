@@ -506,6 +506,28 @@ async def test_name_marker_state_covers_both_markers(tmp_path):
     assert await lc.name_marker_state(tmp_path, "B") == lc.NAME_FREE
 
 
+async def test_name_marker_state_reads_every_marker_from_one_state_of_the_roster(tmp_path, monkeypatch):
+    from main_logic.visit import subjects
+
+    slot = {"old": "X", "new": "Y", "uid": CHAR_UID_B}
+    queued = {"old": "A", "new": "A2", "uid": CHAR_UID_A}
+    await set_roster_marker(tmp_path, "pending_rename", slot)
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", queued)
+    real = subjects.read_roster_marker
+
+    async def racing(config_dir, key):
+        value = await real(config_dir, key)
+        if key == "pending_rename":
+            # 启动恢复恰好在两次读之间清掉位置、把队首挪进来
+            await subjects.clear_roster_marker(config_dir, "pending_rename", slot)
+            await subjects.promote_roster_marker(config_dir, "pending_rename", "pending_rename_queue")
+        return value
+
+    monkeypatch.setattr(lc, "read_roster_marker", racing)
+    # 变异：分开读三个标记必红（读到旧位置 + 已空的队列，把排队中的 A 判成空闲）
+    assert await lc.name_marker_state(tmp_path, "A") == lc.NAME_RENAMING
+
+
 async def test_name_marker_state_of_an_unreadable_roster_is_unknown_not_held(tmp_path):
     (tmp_path / "visit_peers.json").write_text("{broken", encoding="utf-8")
     assert await lc.name_marker_state(tmp_path, "A") == lc.NAME_UNREADABLE
