@@ -1253,3 +1253,90 @@ async def test_a_failed_generation_still_replays_the_chips_on_reconnect(env):
     assert (await choose("diary"))[0] == 503
     state = await state_of(env=env)
     assert state["debrief_choice"] == "generating:diary" and state["debrief_chip_pending"] is True
+
+
+# ── Codex 第 18 轮 ───────────────────────────────────────────────────────
+
+
+def _lifecycle_held() -> bool:
+    return bool(runtime._visit_bg_tasks.get(CHAR_UID_A))
+
+
+@pytest.fixture
+def watched(env, monkeypatch):
+    """Record, at every account check and every push, whether the character lifecycle is held."""
+    from main_routers.visit_router import accounts
+
+    seen: list[tuple[str, bool]] = []
+    send, render = env.host.send_frame, env.host.render_chat_blocks
+
+    async def watched_send(payload):
+        seen.append(("push", _lifecycle_held()))
+        return await send(payload)
+
+    async def watched_render(blocks, **kw):
+        seen.append(("push", _lifecycle_held()))
+        return await render(blocks, **kw)
+
+    async def own_uid():
+        seen.append(("account", _lifecycle_held()))
+        return env.account
+
+    env.host.send_frame = watched_send
+    env.host.render_chat_blocks = watched_render
+    monkeypatch.setattr(accounts, "own_visit_uid", own_uid)
+    return seen
+
+
+async def test_choice_pushes_hold_the_character_lifecycle(env, watched):
+    await visit(env)
+    await preview(env)
+    pushes = [held for kind, held in watched if kind == "push"]
+    assert pushes and all(pushes)
+    # 每次推送前的账号核对也在按住期间做：核完到推出去之间改不了名
+    assert all(watched[i - 1] == ("account", True) for i, (kind, _) in enumerate(watched) if kind == "push")
+    assert not _lifecycle_held()
+
+
+async def test_startup_replay_holds_the_character_lifecycle(env, watched):
+    await visit(env, finalized="crash")
+    assert await debrief.show_owed(env.host, vid(1), own_char="A", lang="zh", interrupted=True) is True
+    assert [kind for kind, _ in watched][:3] == ["account", "push", "account"]
+    assert watched and all(held for _, held in watched)
+    assert not _lifecycle_held()
+
+
+async def test_bind_replay_holds_the_character_lifecycle(env, watched):
+    await visit(env)
+
+    class Socket:
+        def __init__(self):
+            setattr(self, VISIT_SOCKET_BOUND_ATTR, True)
+            self.sent = []
+
+        async def send_text(self, payload):
+            self.sent.append((json.loads(payload), _lifecycle_held()))
+
+    socket = Socket()
+    watched.clear()
+    await display_socket._replay_one(socket, "A", vid(1), OWN_A, set(), "zh")
+    assert socket.sent and all(held for _, held in socket.sent)
+    assert watched == [("account", True)]
+    assert not _lifecycle_held()
+
+
+async def test_a_push_is_skipped_when_the_lifecycle_cannot_be_held(env, monkeypatch):
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def unreadable(_uids):
+        raise OSError("characters.json unreadable")
+        yield  # pragma: no cover
+
+    await visit(env)
+    state = await state_of(env=env)
+    monkeypatch.setattr(debrief, "_hold_lifecycle", unreadable)
+    assert await debrief._render(state, debrief.chip_blocks(vid(1), "zh"), debrief.chips_request_id(vid(1))) is False
+    assert await debrief._send(state, {"type": "visit_debrief"}) is False
+    assert await debrief.show_owed(env.host, vid(1), own_char="A", lang="zh") is False
+    assert env.host.blocks == [] and env.host.frames == []

@@ -52,6 +52,7 @@ current choice owes (:func:`owed_block`).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 import weakref
@@ -164,6 +165,16 @@ async def _show_owed_locked(host: Any, visit_id: str, *, own_char: str, lang: Op
     if owed is None:
         return False
     request_id, blocks, frame = owed
+    async with contextlib.AsyncExitStack() as stack:
+        # 核名字、核账号到推送都按住这个角色的生命周期：中途改名（旧名字归了另一只猫）进不来
+        if not await _pin_lifecycle(stack, state):
+            return False
+        return await _push_owed(host, visit_id, state, request_id, blocks, frame,
+                                own_char=own_char, interrupted=interrupted)
+
+
+async def _push_owed(host: Any, visit_id: str, state: Mapping[str, Any], request_id: str, blocks: list[dict],
+                     frame: Optional[dict], *, own_char: str, interrupted: bool) -> bool:
     from main_routers.visit_router.accounts import own_visit_uid
 
     if await _own_char(state) != own_char:
@@ -504,13 +515,29 @@ async def _owner_signed_in(owner: str) -> bool:
     return await own_visit_uid() == owner
 
 
+async def _pin_lifecycle(stack: contextlib.AsyncExitStack, state: Mapping[str, Any]) -> bool:
+    """Hold the visit character's lifecycle on ``stack`` (rename / delete answer 400); False when it cannot be held.
+
+    Pushes resolve the character's current name, check the account and send
+    while this is held, so no rename can slip in between and hand the freed
+    name (and its page) to another cat.
+    """
+    try:
+        await stack.enter_async_context(_hold_lifecycle([state["own_char_uid"]]))
+    except Exception as exc:  # noqa: BLE001 - 角色配置读不出：这次不推，标记留在 state.json 等 bind 重放
+        logger.info("visit debrief: lifecycle not held, push skipped: %s", type(exc).__name__)
+        return False
+    return True
+
+
 async def _target(state: Mapping[str, Any]) -> Optional[tuple[str, Any]]:
     """``(current name, host)`` of the visit's character, resolved now from ``own_char_uid``.
 
     None when another community account is signed in, the character is gone,
-    or it has no manager. Resolved at push time, never from a name looked up
-    before an await: a rename meanwhile (the freed name maybe reused by
-    another cat) must not send this visit's diary to that cat's page.
+    or it has no manager. Called with the character lifecycle held
+    (:func:`_pin_lifecycle`) through the push: a rename meanwhile (the freed
+    name maybe reused by another cat) must not send this visit's diary to
+    that cat's page.
     """
     name = await _own_char(state)
     # 账号放在最后核：解析名字会读角色配置（有 await），期间换了账号也拦得住
@@ -521,22 +548,28 @@ async def _target(state: Mapping[str, Any]) -> Optional[tuple[str, Any]]:
 
 
 async def _send(state: Mapping[str, Any], frame: dict) -> bool:
-    target = await _target(state)
-    if target is None:
-        return False
-    return await target[1].send_frame(frame)
+    async with contextlib.AsyncExitStack() as stack:
+        if not await _pin_lifecycle(stack, state):
+            return False
+        target = await _target(state)
+        if target is None:
+            return False
+        return await target[1].send_frame(frame)
 
 
 async def _render(state: Mapping[str, Any], blocks: list[dict], request_id: str) -> bool:
-    target = await _target(state)
-    if target is None:
-        return False
-    name, host = target
-    try:
-        return bool(await host.render_chat_blocks(blocks, request_id=request_id, source_name=name))
-    except Exception as exc:  # noqa: BLE001 - 页面不在：标记留在 state.json，等 bind 重放
-        logger.info("visit debrief: block %s not shown: %s", request_id, type(exc).__name__)
-        return False
+    async with contextlib.AsyncExitStack() as stack:
+        if not await _pin_lifecycle(stack, state):
+            return False
+        target = await _target(state)
+        if target is None:
+            return False
+        name, host = target
+        try:
+            return bool(await host.render_chat_blocks(blocks, request_id=request_id, source_name=name))
+        except Exception as exc:  # noqa: BLE001 - 页面不在：标记留在 state.json，等 bind 重放
+            logger.info("visit debrief: block %s not shown: %s", request_id, type(exc).__name__)
+            return False
 
 
 def _lang() -> str:
