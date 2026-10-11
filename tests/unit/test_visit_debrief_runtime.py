@@ -421,7 +421,15 @@ async def test_startup_replay_rechecks_the_account_before_rendering(monkeypatch)
     class _Spool:
         async def read_state(self):
             account["uid"] = "uid-other"  # 读 state 的这段 await 里换了账号
-            return {"visit_id": "v" * 22, "debrief_choice": "ask_later", "own_uid": "uid-own"}
+            return {"visit_id": "v" * 22, "debrief_choice": "ask_later", "own_uid": "uid-own",
+                    "own_char_uid": "char-host"}
+
+    async def resolve(uid):
+        return {"char-host": "Host"}.get(uid)
+
+    from main_logic.visit import local_chars
+
+    monkeypatch.setattr(local_chars, "resolve_char_name", resolve)
 
     async def owner(_visit_id):
         return "uid-own"

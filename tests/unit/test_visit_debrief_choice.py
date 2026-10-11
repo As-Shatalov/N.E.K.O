@@ -1083,3 +1083,74 @@ async def test_a_rename_during_generation_sends_the_preview_to_the_renamed_chara
     assert (await choose("diary"))[0] == 200
     assert hosts["A"].blocks == [] and hosts["A"].frames == []
     assert hosts["A2"].block(debrief.preview_request_id(vid(1)))
+
+
+# ── Codex 第 14 轮 ───────────────────────────────────────────────────────
+
+
+async def test_a_person_forget_during_generation_is_not_overwritten(env):
+    # 生成日记期间「清除这个人」把这场作废成 forget：生成完不能把这个人的日记与事实重新落盘
+    async def generate_while_forgotten(prompt):
+        await VisitSpool(env.tmp, vid(1)).mark_forget()
+        return GOOD_REPLY
+
+    env.llm = generate_while_forgotten
+    await visit(env)
+    assert await choose("diary") == (409, {"error": "already_chosen", "choice": "forget", "completed": True})
+    state = await state_of(env=env)
+    assert state["debrief_choice"] == "forget" and state["debrief_pending"] is None
+    assert env.host.blocks == []
+
+
+async def test_a_forget_racing_the_confirm_is_kept(env, monkeypatch):
+    await visit(env)
+    await preview(env)
+    real = VisitSpool.update_state_if
+
+    async def forget_first(self, expected, **changes):
+        if changes.get("debrief_choice") == "committing:diary":
+            await self.mark_forget()  # 作废步骤抢在「写入」的状态转移之前
+        return await real(self, expected, **changes)
+
+    monkeypatch.setattr(VisitSpool, "update_state_if", forget_first)
+    assert (await choose("confirm"))[0] == 409
+    assert (await state_of(env=env))["debrief_choice"] == "forget" and env.memory.calls == []
+
+
+async def test_a_due_retry_superseded_by_a_manual_attempt_stands_down(env):
+    await visit(env)
+    await preview(env)
+    env.memory.script["cache"] = [(503, {})]
+    await choose("confirm")
+    assert await armed(env) == 30
+    lock = debrief._visit_lock(vid(1))
+    await lock.acquire()  # 一次手动「写入」正持锁
+    timer = list(debrief.pending_commit_retries().values())[-1]
+    env.sleeps[-1][1].set()  # 到点的定时摘掉自己，排在锁外等
+    for _ in range(50):
+        if lock._waiters:
+            break
+        await asyncio.sleep(0.01)
+    assert lock._waiters
+    # 那次手动尝试暂时失败：持久化了更新的排期（并排了自己的新定时）
+    await VisitSpool(env.tmp, vid(1)).update_state(debrief_retry={"attempts": 2, "next_at": 1120.0})
+    lock.release()
+    await timer
+    # 旧定时作废：不再立刻发请求
+    assert env.memory.steps().count("cache") == 1
+    assert (await state_of(env=env))["debrief_retry"] == {"attempts": 2, "next_at": 1120.0}
+
+
+async def test_an_account_switch_while_resolving_the_name_blocks_the_push(env, monkeypatch):
+    from main_logic.visit import local_chars
+
+    await visit(env)
+    state = await state_of(env=env)
+
+    async def resolve_then_switch(uid):
+        env.account = OWN_B  # 解析名字（读角色配置）的这段 await 里换了账号
+        return "A"
+
+    monkeypatch.setattr(local_chars, "resolve_char_name", resolve_then_switch)
+    assert await debrief._render(state, debrief.chip_blocks(vid(1), "zh"), debrief.chips_request_id(vid(1))) is False
+    assert env.host.blocks == []
