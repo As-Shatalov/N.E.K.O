@@ -817,3 +817,31 @@ async def test_bind_replay_rereads_the_state_under_the_visit_lock(env, monkeypat
     socket = Socket()
     await display_socket._replay_chips(socket, "A")
     assert socket.sent == []
+
+
+async def test_bind_replay_rechecks_the_account_after_waiting_for_the_lock(env, monkeypatch):
+    await visit(env)
+    await preview(env)
+
+    class Socket:
+        def __init__(self):
+            setattr(self, VISIT_SOCKET_BOUND_ATTR, True)
+            self.sent = []
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+    socket = Socket()
+    lock = debrief._visit_lock(vid(1))
+    await lock.acquire()
+    replay = asyncio.ensure_future(display_socket._replay_chips(socket, "A"))
+    for _ in range(500):
+        if lock._waiters:
+            break
+        await asyncio.sleep(0.01)
+    assert lock._waiters, "the replay must be waiting for the visit lock"
+    # 等锁期间换了账号
+    env.account = OWN_B
+    lock.release()
+    await replay
+    assert socket.sent == []

@@ -632,7 +632,7 @@ async def test_replay_stops_when_the_account_changes_midway(monkeypatch, tmp_pat
 
     async def switching():
         calls["n"] += 1
-        return OWN_A if calls["n"] <= 2 else OWN_B      # 扫描时 + 第一块发前仍是 A，之后换成 B
+        return OWN_A if calls["n"] <= 3 else OWN_B      # 扫描时、逐场检查、拿锁后复查仍是 A，之后换成 B
 
     monkeypatch.setattr(accounts, "own_visit_uid", switching)
     socket = VisitSocket([])
@@ -709,7 +709,7 @@ async def test_crash_notice_then_account_change_sends_no_chip(monkeypatch, tmp_p
 
     async def switching():
         calls["n"] += 1
-        return OWN_A if calls["n"] <= 2 else OWN_B      # 扫描与提示前是 A，写完提示后换成 B
+        return OWN_A if calls["n"] <= 3 else OWN_B      # 扫描、逐场检查、拿锁后复查是 A，写完提示后换成 B
 
     monkeypatch.setattr(accounts, "own_visit_uid", switching)
     socket = VisitSocket([])

@@ -238,6 +238,9 @@ async def _replay_one(websocket: Any, lanlan_name: str, visit_id: str, owner: st
             return True
         if state is None or not state.get("debrief_chip_pending") or state.get("own_uid") != owner:
             return True
+        if await own_visit_uid() != owner:
+            # 等锁期间（另一页正在生成 / 提交）登出或换了账号：这一页不再收上一个账号的块
+            return False
         return await _send_owed(websocket, lanlan_name, state, delivered, lang, own_visit_uid)
 
 
