@@ -36,7 +36,7 @@ visit data is not consistent with the character config:
   ``visit_reports/`` stay. The memory_server staging of unfinished digests
   lives under ``memory_dir/<character>/`` and goes with the character's
   memory directory in the delete transaction itself. While an item is
-  pending, a new character may not take its name (:func:`is_name_retiring`).
+  pending, a new character may not take its name (:func:`name_marker_state`).
   A delete of a character whose own rename is still unreconciled settles
   that rename first (otherwise the entries left under its other name would
   outlive it), and a cloudsave import that removes local characters records
@@ -426,25 +426,6 @@ async def replay_retires(
     return clean
 
 
-async def is_name_retiring(config_dir: str | Path, name: str) -> bool:
-    """Whether a deleted character called ``name`` still has a ``pending_retire`` item.
-
-    A new character may not take the name meanwhile: the roster keys entries
-    by name, so the pending retirement would delete the new character's
-    entries (or leave the old ones under it). An unreadable roster answers
-    False: it blocks no character creation (the retirement cannot run
-    either until the file is readable again).
-    """
-    try:
-        marker = await read_roster_marker(config_dir, PENDING_RETIRE)
-    except RosterCorruptError as exc:
-        logger.warning("visit retire: roster unreadable, name %r not checked: %s", name, exc)
-        return False
-    return isinstance(marker, list) and any(
-        (_item_fields(item) or ("", None))[0] == name for item in marker
-    )
-
-
 NAME_FREE = "free"
 NAME_RETIRING = "retiring"
 NAME_RENAMING = "renaming"
@@ -458,7 +439,8 @@ async def name_marker_state(config_dir: str | Path, name: str) -> str:
     ``NAME_RENAMING``: it is the old or the new name of an unreconciled
     rename (the roster entries under it are not settled yet).
     ``NAME_UNREADABLE``: the roster cannot be read, so nothing is known;
-    callers creating characters let it pass (see :func:`is_name_retiring`).
+    callers creating characters let it pass: the retirement cannot run either
+    until the file is readable again.
     """
     try:
         retiring = await read_roster_marker(config_dir, PENDING_RETIRE)
@@ -471,6 +453,11 @@ async def name_marker_state(config_dir: str | Path, name: str) -> str:
     if isinstance(renaming, dict) and name in (renaming.get("old"), renaming.get("new")):
         return NAME_RENAMING
     return NAME_FREE
+
+
+async def is_name_retiring(config_dir: str | Path, name: str) -> bool:
+    """Whether a deleted character called ``name`` still has a ``pending_retire`` item (unreadable: False)."""
+    return await name_marker_state(config_dir, name) == NAME_RETIRING
 
 
 def _rename_names_of(marker: Any, name: str, character_uid: str | None) -> tuple[str, ...]:

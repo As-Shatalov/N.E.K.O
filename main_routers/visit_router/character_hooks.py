@@ -113,7 +113,11 @@ async def name_blocked(config_manager: Any, name: str) -> bool:
     character would inherit the entries left under it, and the rename could
     never be told apart from it again). The caller holds the character-config
     lock, so the pending marker is retried once first (a transient failure
-    clears without a restart). An unreadable roster blocks nothing.
+    clears without a restart). An unreadable roster blocks nothing, and
+    neither does a rename that is ambiguous for good (its other name was
+    taken by another character): both names are configured then, so only an
+    overwrite reaches here, and like a delete it cannot make the already
+    mixed entries any worse.
     """
     config_dir = _config_dir(config_manager)
     if config_dir is None:
@@ -129,8 +133,13 @@ async def name_blocked(config_manager: Any, name: str) -> bool:
     if state == char_lifecycle.NAME_RENAMING:
         try:
             names, uid_of = await names_loader(config_manager)()
-            await char_lifecycle.reconcile_rename(config_dir, names, uid_of)
+            unsettled = await char_lifecycle.reconcile_rename(config_dir, names, uid_of)
         except Exception as exc:  # noqa: BLE001 - 对不完账就挡住这个名字，标记留给启动对账
             logger.warning("visit rename: pending_rename not reconciled before reusing %r: %r", name, exc)
+        else:
+            if unsettled:
+                # 永久 ambiguous（另一个名字已被别的角色占着）：重试也解不开，与删除路径一样放行
+                logger.warning("visit rename: ambiguous pending_rename holds %r, not blocking", name)
+                return False
         state = await char_lifecycle.name_marker_state(config_dir, name)
     return state in (char_lifecycle.NAME_RETIRING, char_lifecycle.NAME_RENAMING)
