@@ -241,17 +241,22 @@ async def _replay_one(websocket: Any, lanlan_name: str, visit_id: str, owner: st
             return True
         from main_logic.visit import local_chars
 
-        async with contextlib.AsyncExitStack() as stack:
-            # 核名字、核账号到投递都按住这只猫的生命周期与登录账号：中途改名（旧名字归了另一只猫）、切号都进不来
-            if not await debrief._pin_push(stack, state):
-                return True
-            if await local_chars.resolve_char_name(state["own_char_uid"]) != lanlan_name:
-                # 等锁期间这只猫改了名（旧名字可能已归另一只猫）：这条连接已不是它的页面，留给它新名字的 bind 重放
-                return True
-            if await own_visit_uid() != owner:
-                # 等锁期间（另一页正在生成 / 提交）登出或换了账号：这一页不再收上一个账号的块（账号最后核）
-                return False
-            return await _send_owed(websocket, lanlan_name, state, delivered, lang, own_visit_uid)
+        try:
+            async with contextlib.AsyncExitStack() as stack:
+                # 核名字、核账号到投递都按住这只猫的生命周期与登录账号：中途改名（旧名字归了另一只猫）、切号都进不来
+                if not await debrief._pin_push(stack, state):
+                    return True
+                if await local_chars.resolve_char_name(state["own_char_uid"]) != lanlan_name:
+                    # 等锁期间这只猫改了名（旧名字可能已归另一只猫）：这条连接已不是它的页面，留给它新名字的 bind 重放
+                    return True
+                if await own_visit_uid() != owner:
+                    # 等锁期间（另一页正在生成 / 提交）登出或换了账号：这一页不再收上一个账号的块（账号最后核）
+                    return False
+                return await _send_owed(websocket, lanlan_name, state, delivered, lang, own_visit_uid)
+        except TimeoutError:
+            # 按住账号的时限到了（切号在等）：这一页这次不再重放，下次 bind 再来
+            logger.info("visit display: replay of %s cut off by the account hold limit", visit_id[:6])
+            return False
 
 
 async def _send_owed(websocket: Any, lanlan_name: str, state: dict, delivered: set, lang: Optional[str],

@@ -146,6 +146,8 @@ _RENEW_RETRY_BASE_S = 5.0
 _RENEW_RETRY_MAX_S = 60.0
 _VOICE_STATUS_THROTTLE_S = 5.0
 _ACCOUNT_CHANGE_SEAL_WAIT_S = 30.0  # 登出 / 切换社区账号前等在飞串门封存上传文件的上限
+# 按住账号的一次复盘推送（核账号 + 写出）最长多久：必须短于切号的等待，切号放行时它一定已结束或被截断
+_ACCOUNT_BOUND_PUSH_MAX_S = 10.0
 
 # ═════════════════════════════════════════════════════════════════════
 # 依赖注入
@@ -2907,9 +2909,10 @@ async def hold_account_for_push():
     Yields False while a logout / account switch is in progress (the caller
     skips the push; bind replays it to the account that owns the visit).
     Otherwise the push checks the account and writes inside the block, and
-    :func:`account_change` waits for it (bounded like credential requests)
-    before the session changes, so no switch lands between the check and
-    the write.
+    :func:`account_change` waits for it before the session changes, so no
+    switch lands between the check and the write. The block is cut off
+    (``TimeoutError``) after ``_ACCOUNT_BOUND_PUSH_MAX_S``, shorter than
+    that wait: a push never writes after the credentials changed.
     """
     if _account_changes:
         yield False
@@ -2917,12 +2920,12 @@ async def hold_account_for_push():
     held = asyncio.get_running_loop().create_future()
     _account_bound_pushes.add(held)
     try:
-        yield True
+        async with asyncio.timeout(_ACCOUNT_BOUND_PUSH_MAX_S):
+            yield True
     finally:
         if not held.done():
             held.set_result(None)
         _account_bound_pushes.discard(held)
-
 
 
 async def _settle_in_flight(futures: set[asyncio.Future], timeout: float, what: str) -> None:

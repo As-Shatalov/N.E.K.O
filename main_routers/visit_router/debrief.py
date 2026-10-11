@@ -165,12 +165,17 @@ async def _show_owed_locked(host: Any, visit_id: str, *, own_char: str, lang: Op
     if owed is None:
         return False
     request_id, blocks, frame = owed
-    async with contextlib.AsyncExitStack() as stack:
-        # 核名字、核账号到推送都按住这只猫的生命周期与登录账号：中途改名（旧名字归了另一只猫）、切号都进不来
-        if not await _pin_push(stack, state):
-            return False
-        return await _push_owed(host, visit_id, state, request_id, blocks, frame,
-                                own_char=own_char, interrupted=interrupted)
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            # 核名字、核账号到推送都按住这只猫的生命周期与登录账号：中途改名（旧名字归了另一只猫）、切号都进不来
+            if not await _pin_push(stack, state):
+                return False
+            return await _push_owed(host, visit_id, state, request_id, blocks, frame,
+                                    own_char=own_char, interrupted=interrupted)
+    except TimeoutError:
+        # 按住账号的时限到了（切号在等）：这次截断，标记留在 state.json，等 bind 重放
+        logger.info("visit %s: debrief push cut off by the account hold limit", visit_id[:6])
+        return False
 
 
 async def _push_owed(host: Any, visit_id: str, state: Mapping[str, Any], request_id: str, blocks: list[dict],
@@ -823,7 +828,7 @@ def _not_committing(state: Mapping[str, Any]) -> tuple[int, dict]:
 # ── POST /api/visit/debrief/choice ───────────────────────────────────────
 
 
-async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, dict]:
+async def _choose(visit_id: str, choice: str, seq: Optional[int], lanlan_name: str) -> tuple[int, dict]:
     from main_logic.visit.spool import is_digestable
     from main_routers.visit_router.accounts import own_visit_uid
 
@@ -838,7 +843,9 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
                 or state["finalized"] is None):
             return 404, {"error": "unknown_or_expired"}
         own_char = await _own_char(state)
-        if not own_char:
+        if not own_char or own_char != lanlan_name:
+            # 发起页不是这只猫现在的页面：改名后旧名字归了另一只猫，旧页面上残留的块点下去，
+            # 不把这一场的预览回给那一页、也不替它改这一场的选择
             return 404, {"error": "unknown_or_expired"}
         current = state["debrief_choice"]
         if choice == "diary":
@@ -977,19 +984,27 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     return 200, {"ok": True, "applied": "preview", "preview": pending}
 
 
-def _parse_choice(payload: Mapping[str, Any]) -> tuple[Optional[str], Optional[str], Optional[int], Optional[str]]:
+_LANLAN_NAME_MAX_CHARS = 256
+
+
+def _parse_choice(payload: Mapping[str, Any]) -> tuple[Optional[str], Optional[str], Optional[int],
+                                                        Optional[str], Optional[str]]:
+    """``(visit_id, choice, seq, lanlan_name, error code)``; ``lanlan_name`` is the requesting page's character."""
     from utils.visit_wire import VISIT_ID_RE
 
     visit_id = payload.get("visit_id")
     if not isinstance(visit_id, str) or VISIT_ID_RE.fullmatch(visit_id) is None:
-        return None, None, None, "visit_id_format"
+        return None, None, None, None, "visit_id_format"
     choice = payload.get("choice")
     if choice not in CHOICES:
-        return None, None, None, "invalid_choice"
+        return None, None, None, None, "invalid_choice"
     seq = payload.get("seq")
     if seq is not None and (isinstance(seq, bool) or not isinstance(seq, int) or seq < 1):
-        return None, None, None, "invalid_seq"
-    return visit_id, choice, seq, None
+        return None, None, None, None, "invalid_seq"
+    lanlan_name = payload.get("lanlan_name")
+    if not isinstance(lanlan_name, str) or not lanlan_name or len(lanlan_name) > _LANLAN_NAME_MAX_CHARS:
+        return None, None, None, None, "invalid_lanlan_name"
+    return visit_id, choice, seq, lanlan_name, None
 
 
 @router.post("/debrief/choice")
@@ -1002,11 +1017,11 @@ async def debrief_choice(request: Request):
     denied = http_denied(request, payload)
     if denied is not None:
         return denied
-    visit_id, choice, seq, error = _parse_choice(payload)
+    visit_id, choice, seq, lanlan_name, error = _parse_choice(payload)
     if error is not None:
         return JSONResponse({"ok": False, "code": error}, status_code=400)
     try:
-        status, body = await _choose(visit_id, choice, seq)
+        status, body = await _choose(visit_id, choice, seq, lanlan_name)
     except Exception as exc:  # noqa: BLE001 - state.json 读写失败等：可重试
         logger.warning("visit %s: debrief choice %s failed: %r", visit_id[:6], choice, exc)
         return JSONResponse({"retry": True}, status_code=503)

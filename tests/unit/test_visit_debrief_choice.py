@@ -160,7 +160,7 @@ async def state_of(n=1, env=None):
 
 
 async def choose(choice, n=1, seq=None):
-    return await debrief._choose(vid(n), choice, seq)
+    return await debrief._choose(vid(n), choice, seq, "A")
 
 
 async def preview(env, n=1):
@@ -669,11 +669,16 @@ def test_classification_table():
 
 def test_payload_parsing():
     parse = debrief._parse_choice
-    assert parse({"visit_id": vid(1), "choice": "abandon", "seq": 2})[:3] == (vid(1), "abandon", 2)
-    assert parse({"visit_id": "x", "choice": "diary"})[3] == "visit_id_format"
-    assert parse({"visit_id": vid(1), "choice": "later"})[3] == "invalid_choice"
-    assert parse({"visit_id": vid(1), "choice": "confirm", "seq": True})[3] == "invalid_seq"
-    assert parse({"visit_id": vid(1), "choice": "confirm", "seq": 0})[3] == "invalid_seq"
+    ok = {"visit_id": vid(1), "lanlan_name": "A"}
+    assert parse({**ok, "choice": "abandon", "seq": 2}) == (vid(1), "abandon", 2, "A", None)
+    assert parse({**ok, "visit_id": "x", "choice": "diary"})[4] == "visit_id_format"
+    assert parse({**ok, "choice": "later"})[4] == "invalid_choice"
+    assert parse({**ok, "choice": "confirm", "seq": True})[4] == "invalid_seq"
+    assert parse({**ok, "choice": "confirm", "seq": 0})[4] == "invalid_seq"
+    # 发起页的角色名必填：不带 / 空 / 非字符串 / 过长都拒
+    for bad in (None, "", 7, "x" * 257):
+        assert parse({**ok, "choice": "diary", "lanlan_name": bad})[4] == "invalid_lanlan_name"
+    assert parse({"visit_id": vid(1), "choice": "diary"})[4] == "invalid_lanlan_name"
 
 
 async def test_the_endpoint_works_with_the_release_switch_off(env, monkeypatch):
@@ -690,11 +695,18 @@ async def test_the_endpoint_works_with_the_release_switch_off(env, monkeypatch):
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         resp = await client.post("/api/visit/debrief/choice", headers=headers,
-                                 json={"visit_id": vid(1), "choice": "diary"})
+                                 json={"visit_id": vid(1), "choice": "diary", "lanlan_name": "B"})
+        # 别的角色的页面发来的：当作不存在
+        assert resp.status_code == 404
+        resp = await client.post("/api/visit/debrief/choice", headers=headers,
+                                 json={"visit_id": vid(1), "choice": "diary", "lanlan_name": "A"})
         assert resp.status_code == 200 and resp.json()["applied"] == "preview"
         resp = await client.post("/api/visit/debrief/choice", headers=headers,
-                                 json={"visit_id": vid(1), "choice": "nope"})
+                                 json={"visit_id": vid(1), "choice": "nope", "lanlan_name": "A"})
         assert resp.status_code == 400
+        resp = await client.post("/api/visit/debrief/choice", headers=headers,
+                                 json={"visit_id": vid(1), "choice": "diary"})
+        assert resp.status_code == 400 and resp.json()["code"] == "invalid_lanlan_name"
         resp = await client.post("/api/visit/debrief/choice", headers={"Origin": "http://evil.test"},
                                  json={"visit_id": vid(1), "choice": "confirm"})
         assert resp.status_code in (401, 403)
@@ -1492,3 +1504,64 @@ async def test_an_account_change_that_stops_waiting_for_a_push_says_so(env, monk
         async with runtime.account_change(timeout=0.01):
             pass
     assert any("1 debrief pushes still in flight" in w for w in warnings)
+
+
+# ── Codex 第 21 轮 / CodeRabbit（9eafd6b） ───────────────────────────────
+
+
+@pytest.mark.parametrize("choice", ["diary", "forget", "confirm"])
+async def test_a_stale_page_of_the_old_name_cannot_act_on_the_visit(env, monkeypatch, choice):
+    from main_logic.visit import local_chars
+
+    await visit(env)
+    if choice == "confirm":
+        await preview(env)
+    before = await state_of(env=env)
+    names = {"now": "A2"}  # 改了名；"A" 这个名字可能已归另一只猫，那一页上还残留着这一场的块
+
+    async def resolve(uid):
+        return names["now"] if uid == CHAR_UID_A else None
+
+    monkeypatch.setattr(local_chars, "resolve_char_name", resolve)
+    frames = len(env.host.frames)
+    assert await debrief._choose(vid(1), choice, None, "A") == (404, {"error": "unknown_or_expired"})
+    assert await state_of(env=env) == before
+    assert env.memory.calls == [] and len(env.host.frames) == frames
+    # 它现在的页面照常能选
+    assert (await debrief._choose(vid(1), choice, None, "A2"))[0] == 200
+
+
+def test_an_account_bound_push_ends_before_the_account_change_stops_waiting():
+    assert runtime._ACCOUNT_BOUND_PUSH_MAX_S < runtime._ACCOUNT_CHANGE_SEAL_WAIT_S
+
+
+async def test_a_stuck_push_is_cut_off_at_the_account_hold_limit(env, monkeypatch):
+    from main_routers.visit_router import accounts
+
+    monkeypatch.setattr(runtime, "_ACCOUNT_BOUND_PUSH_MAX_S", 0.05)
+    await visit(env)
+    state = await state_of(env=env)
+
+    async def stuck():
+        await asyncio.Event().wait()  # 读登录态卡住
+
+    monkeypatch.setattr(accounts, "own_visit_uid", stuck)
+
+    class Socket:
+        def __init__(self):
+            setattr(self, VISIT_SOCKET_BOUND_ATTR, True)
+            self.sent = []
+
+        async def send_text(self, payload):
+            self.sent.append(payload)
+
+    socket = Socket()
+    results = await asyncio.wait_for(asyncio.gather(
+        debrief._render(state, debrief.chip_blocks(vid(1), "zh"), debrief.chips_request_id(vid(1))),
+        debrief._send(state, {"type": "visit_debrief"}),
+    ), 5)
+    assert results == [False, False]
+    assert await asyncio.wait_for(debrief.show_owed(env.host, vid(1), own_char="A", lang="zh"), 5) is False
+    assert await asyncio.wait_for(display_socket._replay_one(socket, "A", vid(1), OWN_A, set(), "zh"), 5) is False
+    assert env.host.blocks == [] and env.host.frames == [] and socket.sent == []
+    assert not runtime._account_bound_pushes
