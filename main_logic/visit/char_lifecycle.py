@@ -683,6 +683,10 @@ def record_renamed_characters_sync(config_dir: str | Path, renamed: Iterable[Map
         if not _has_visit_files_sync(config_dir, uid):
             continue
         marker = {"old": old, "new": new, "uid": uid, "source": CLOUDSAVE_SOURCE}
+        handed = _handed_over_names(entry)
+        if handed:
+            # 链式改名：旧名接着归了本机另一个角色（它的改名排在后面），对账时不算被复用
+            marker["handed_over"] = sorted(handed)
         ok, existing = set_roster_marker_sync(config_dir, PENDING_RENAME, marker)
         if ok:
             written += 1

@@ -485,10 +485,33 @@ def test_two_local_characters_trading_names_are_not_migrated(pair):
     kept = {"新名字": {"_reserved": {"character_uid": uid}}, "本地角色": {"_reserved": {"character_uid": other}}}
     removed, _kept_local, renamed = operations._removed_local_characters(target_cm, kept)
     assert removed == [] and renamed == []
-    # 本机另一个角色接过旧名、这个角色改到一个全新的名字：旧名下的条目照样分不开（变异：不看旧名归属必红）
-    kept = {"第三个名字": {"_reserved": {"character_uid": uid}}, "本地角色": {"_reserved": {"character_uid": other}}}
+
+
+async def test_an_acyclic_chain_of_local_renames_migrates_in_dependency_order(pair):
+    from tests.unit.visit_memory_test_helpers import PEER_X, PEER_Y, TAG_Y
+
+    _source_cm, target_cm = pair
+    uid, other = _local_uid(target_cm), "d" * 32
+    config_dir = Path(target_cm.config_dir)
+    characters = target_cm.load_characters()
+    characters["猫娘"]["新名字"] = {"_reserved": {"character_uid": other}}
+    target_cm.save_characters(characters, bypass_write_fence=True)
+    # 另一台设备上：先把「新名字」(other) 改成「第三个名字」，再把「本地角色」(uid) 改成「新名字」。
+    # 不成环：先迁 other 再迁 uid，两边的条目都分得开（变异：照旧当成交换跳过 / 不排顺序必红）
+    kept = {"新名字": {"_reserved": {"character_uid": uid}}, "第三个名字": {"_reserved": {"character_uid": other}}}
     removed, _kept_local, renamed = operations._removed_local_characters(target_cm, kept)
-    assert removed == [] and renamed == []
+    assert removed == []
+    assert renamed == [{"old": "新名字", "new": "第三个名字", "uid": other, "handed_over": ["新名字"]},
+                       {"old": "本地角色", "new": "新名字", "uid": uid}]
+    roster = await seed_roster(config_dir, own_char="本地角色")
+    await seed_roster(config_dir, peer_uid=PEER_Y, tag=TAG_Y, own_char="新名字")
+    lc.record_renamed_characters_sync(config_dir, renamed)
+    unsettled = await lc.reconcile_renames(config_dir, {"新名字", "第三个名字"}, {"新名字": uid, "第三个名字": other})
+    assert unsettled == frozenset()
+    assert await roster.get_char_entry(PEER_Y, "第三个名字") is not None      # other 的条目跟着它走
+    assert await roster.get_char_entry(PEER_X, "新名字") is not None          # uid 的条目跟着它走
+    assert await roster.get_char_entry(PEER_Y, "新名字") is None              # uid 没继承 other 的
+    assert await roster.get_char_entry(PEER_X, "本地角色") is None
 
 
 async def test_a_rename_whose_old_name_goes_to_a_new_character_still_migrates(tmp_path):

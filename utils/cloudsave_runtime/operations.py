@@ -259,8 +259,33 @@ def _removed_local_characters(
         if uid:
             kept_name_of_uid.setdefault(uid, kept_name)
     local_uids = {uid for uid in (uid_in(local_map, name) for name in local_map) if uid}
+    local_uid_of_name = {name: uid for name in local_map if (uid := uid_in(local_map, name))}
+    # 本机角色在快照里换了名字：uid -> (旧名, 新名)
+    moves: dict[str, tuple[str, str]] = {}
+    for name in local_map:
+        uid = uid_in(local_map, name)
+        moved_to = kept_name_of_uid.get(uid) if uid else None
+        if moved_to is not None and moved_to != name:
+            moves[uid] = (name, moved_to)
+
+    def next_in_chain(uid: str) -> str | None:
+        # 这个角色要搬进去的名字，导入前是哪个本机角色在用（它也得先搬走）
+        holder = local_uid_of_name.get(moves[uid][1])
+        return holder if holder in moves else None
+
+    def chain_depth(uid: str) -> int | None:
+        """Steps until the chain of name hand-offs ends; ``None`` for a cycle (characters trading names)."""
+        seen, current, depth = {uid}, next_in_chain(uid), 0
+        while current is not None:
+            if current in seen:
+                return None
+            seen.add(current)
+            current, depth = next_in_chain(current), depth + 1
+        return depth
+
     removed: list[dict[str, Any]] = []
-    renamed: list[dict[str, str]] = []
+    renamed: list[dict[str, Any]] = []
+    depth_of: dict[str, int] = {}
     for name, data in local_map.items():
         if not isinstance(name, str) or not name:
             continue
@@ -275,19 +300,32 @@ def _removed_local_characters(
         if new_name is None:
             removed.append({"name": name, "character_uid": uid})
             continue
-        if taken_by_local:
-            # 两个本机角色交换了名字：两边的串门数据分不开，不迁
+        depth = chain_depth(uid)
+        if depth is None:
+            # 几个本机角色轮换了名字（成环）：各名字下的串门数据分不开，不迁
+            logger.warning("cloudsave import: %r renamed to %r in a cycle of local characters trading names; "
+                           "visit data not moved", name, new_name)
+            continue
+        if taken_by_local and moves.get(holder, (None, None))[1] != name:
             logger.warning("cloudsave import: %r renamed to %r while its old name goes to another local character; "
                            "visit data not moved", name, new_name)
             continue
         new_holder = uid_in(local_map, new_name) if new_name in local_map else None
-        if new_name in local_map and (new_holder is None or new_holder in kept_name_of_uid):
-            # 新名字在导入前属于本机另一个仍保留的角色：迁过去会和它的串门数据混在一起。
-            # 那个角色被删了则不同：启动对账先退役它、再迁移
+        if new_name in local_map and (new_holder is None or (new_holder in kept_name_of_uid and new_holder not in moves)):
+            # 新名字在导入前属于本机另一个仍保留、且没搬走的角色：迁过去会和它的串门数据混在一起。
+            # 那个角色被删了、或自己也改了名（链式改名，先迁它）则不同
             logger.warning("cloudsave import: %r renamed to %r, a name held by another local character; "
                            "visit data not moved", name, new_name)
             continue
-        renamed.append({"old": name, "new": new_name, "uid": uid})
+        entry: dict[str, Any] = {"old": name, "new": new_name, "uid": uid}
+        if taken_by_local:
+            # 链式改名：旧名接着归了本机另一个角色，它的改名排在这一笔之后；对账到这一笔时
+            # 旧名下的条目都还是这个角色的
+            entry["handed_over"] = [name]
+        depth_of[uid] = depth
+        renamed.append(entry)
+    # 链尾先迁：要搬进的名字先由原主人搬走（B -> C 先于 A -> B）
+    renamed.sort(key=lambda entry: depth_of[entry["uid"]])
     kept_local = frozenset(name for name in kept_character_map if name in local_map)
     return removed, kept_local, renamed
 
