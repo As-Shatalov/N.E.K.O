@@ -1646,7 +1646,13 @@ class VisitSpool:
                     except SpoolBusy:
                         # 正在写的场次：只有它属于被改名的角色才算 busy。改名在运行期执行时，
                         # 别的角色可能正在串门，不能因为它们把这次迁移卡住
-                        header = _read_header_strict(jsonl, validate=False)
+                        try:
+                            header = _read_header_strict(jsonl, validate=False)
+                        except (OSError, ValueError):
+                            # 刚登记、头行还没写完（_open_sync 出锁后才写）：归属未知，可能正是被改名
+                            # 角色自己的新场次，跳过会让它留在旧名下。按仍在写处理（busy，标记留着稍后重试），
+                            # 不算读不出；这个窗口只有一次写入那么长
+                            raise SpoolBusy(f"spool {jsonl.name} is being opened") from None
                         if header is not None and header.get("own_char") == old:
                             raise
                 with path_lock(state_path):
@@ -1677,8 +1683,9 @@ class VisitSpool:
         reconciliation (and to run as ``new -> old`` for a rollback). Returns
         the visit ids that changed. Visits of other characters still being
         written are left alone; one of the renamed character still being
-        written raises :class:`SpoolBusy` after every other visit is handled.
-        Raises :class:`SpoolStateUnreadable` (after rewriting every readable
+        written raises :class:`SpoolBusy` after every other visit is handled,
+        as does one still being opened (its header not written yet, so its
+        owner is unknown). Raises :class:`SpoolStateUnreadable` (after rewriting every readable
         visit) when some header or ``state.json`` cannot be read.
         """
         if not old or not new or old == new:

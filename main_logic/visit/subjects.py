@@ -59,7 +59,7 @@ import json
 import math
 import threading
 import weakref
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -651,6 +651,58 @@ async def promote_roster_marker(config_dir: str | Path, slot_key: str, queue_key
     """
     path = Path(config_dir) / VISIT_PEERS_FILENAME
     return await asyncio.to_thread(_promote_marker_sync, path, slot_key, queue_key)
+
+
+def _rotate_marker_sync(path: Path, slot_key: str, queue_key: str, expected: Any) -> Any:
+    with path_lock(path):
+        data = _read_top_level_sync_unlocked(path)
+        queue = data.get(queue_key)
+        if data.get(slot_key) != expected or not isinstance(queue, list) or not queue:
+            return None
+        item, *rest = queue
+        data[slot_key] = copy.deepcopy(item)
+        data[queue_key] = [*rest, copy.deepcopy(expected)]
+        atomic_write_json(path, data)
+        return copy.deepcopy(item)
+
+
+async def rotate_roster_marker(config_dir: str | Path, slot_key: str, queue_key: str, expected: Any) -> Any:
+    """Swap the slot ``slot_key`` (while it equals ``expected``) to the end of ``queue_key``; return the new slot.
+
+    The first queued item takes the slot, in one write. ``None`` when the
+    slot changed or the queue is empty (nothing is written). An unreadable
+    roster raises :class:`RosterCorruptError`.
+    """
+    path = Path(config_dir) / VISIT_PEERS_FILENAME
+    return await asyncio.to_thread(_rotate_marker_sync, path, slot_key, queue_key, expected)
+
+
+def _prune_marker_items_sync(path: Path, key: str, keep: Callable[[Any], bool]) -> list[Any]:
+    with path_lock(path):
+        data = _read_top_level_sync_unlocked(path)
+        value = data.get(key)
+        if value is None:
+            return []
+        kept = [item for item in value if keep(item)] if isinstance(value, list) else []
+        dropped = [item for item in value if not keep(item)] if isinstance(value, list) else [value]
+        if not dropped:
+            return []
+        if kept:
+            data[key] = kept
+        else:
+            del data[key]
+        atomic_write_json(path, data)
+        return dropped
+
+
+async def prune_roster_marker_items(config_dir: str | Path, key: str, keep: Callable[[Any], bool]) -> list[Any]:
+    """Drop the items of the list marker ``key`` that ``keep`` rejects (the whole value if not a list).
+
+    Returns the dropped items. An unreadable roster raises
+    :class:`RosterCorruptError`.
+    """
+    path = Path(config_dir) / VISIT_PEERS_FILENAME
+    return await asyncio.to_thread(_prune_marker_items_sync, path, key, keep)
 
 
 class PeerRoster:

@@ -60,7 +60,7 @@ from main_logic.visit.char_lifecycle import (
     MARKER_CHANGED as _MARKER_CHANGED,
     RetirePersona,
     drop_deleted_queued_renames,
-    promote_queued_rename,
+    reconcile_renames,
     reconcile_rename as _reconcile_rename,
     replay_retires,
 )
@@ -1425,10 +1425,11 @@ async def visit_spool_recovery(
             else:
                 names, uid_of = await load_names()
                 await drop_deleted_queued_renames(config_dir, uid_of)
-            unsettled = await _reconcile_rename_guarded(config_dir, names, uid_of, lifecycle_guard, load_names)
-            # 云快照一次改了几个角色的名字：其余的排在队列里，位置清掉后依次轮到
-            while unsettled == frozenset() and await promote_queued_rename(config_dir):
-                unsettled = await _reconcile_rename_guarded(config_dir, names, uid_of, lifecycle_guard, load_names)
+            # 云快照一次改了几个角色的名字：其余的排在队列里依次轮到（同一套规则，每笔在各自角色的守卫下对账）
+            unsettled = await reconcile_renames(
+                config_dir, names, uid_of,
+                reconcile=lambda: _reconcile_rename_guarded(config_dir, names, uid_of, lifecycle_guard, load_names),
+            )
         except Exception as exc:  # noqa: BLE001 - 补录各段互不连累
             logger.error("visit recovery: rename reconciliation failed: %r", exc)
             unsettled = _ALL_NAMES

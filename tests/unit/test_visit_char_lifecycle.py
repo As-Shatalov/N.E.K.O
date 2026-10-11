@@ -825,13 +825,13 @@ async def test_startup_recovery_skips_the_names_of_renames_still_queued(tmp_path
 
     monkeypatch.setattr(recovery, "_recover_visit", recover_visit)
     await make_visit(tmp_path, vid(1), [ln(1)])
-    # 位置上的改名永久歧义，后面排着另一个角色的 P -> Q：Q 下还没有条目（都在 P 下）
+    # 位置上的改名永久歧义，后面排着另一个角色的 X -> Q（共用 X，得等它）：Q 下还没有条目（都在 X 下）
     await set_roster_marker(tmp_path, "pending_rename", {"old": "A", "new": "X", "uid": CHAR_UID_A})
-    await add_roster_marker_item(tmp_path, "pending_rename_queue", {"old": "P", "new": "Q", "uid": "e" * 32})
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", {"old": "X", "new": "Q", "uid": "e" * 32})
     report = await _recover(tmp_path, ["A2", "X", "Q"], {}, list_char_names=None)
     # 变异：只跳过位置上的两个名字必红（Q 的逐场补录会按新名找不到条目、记成已完成）
     assert report.renamed is False
-    assert skipped and {"A", "X", "P", "Q"} <= set(skipped[0])
+    assert skipped and {"A", "X", "Q"} <= set(skipped[0])
 
 
 # ── 云快照改名的回滚、链式中间名、已清完名册的退役 ─────────────────────
@@ -965,11 +965,137 @@ async def test_startup_recovery_rereads_the_characters_after_replaying_retiremen
 
     monkeypatch.setattr(local_chars, "load_local_characters", configured)
     await seed_roster(tmp_path, own_char="A")
+    roster = await seed_roster(tmp_path, peer_uid=PEER_Y, tag=TAG_Y, own_char="P")
     stuck = {"old": "A", "new": "X", "uid": CHAR_UID_A}
     await set_roster_marker(tmp_path, "pending_rename", stuck)
     queued = {"old": "P", "new": "Q", "uid": "e" * 32}
     await add_roster_marker_item(tmp_path, "pending_rename_queue", queued)
     await _recover(tmp_path, ["A2", "X"], {}, list_char_names=None, config_lock=config_lock if with_lock else None)
-    # 恢复回来的角色的排队改名不能按重放之前的旧名单当成「已删」撤掉（变异：不重读必红）
-    assert _peers(tmp_path)["pending_rename_queue"] == [queued]
+    # 恢复回来的角色的排队改名不能按重放之前的旧名单当成「已删」撤掉：照常对账，P 下的条目迁到
+    # 它现在的名字 R（变异：不重读必红，条目留在 P 下给以后叫 P 的角色继承）
+    assert await roster.get_char_entry(PEER_Y, "R") is not None
+    assert await roster.get_char_entry(PEER_Y, "P") is None
     assert bool(held) is with_lock
+
+
+# ── 队列：坏掉的排队项、位置卡住时其它改名照常对账 ─────────────────────
+
+
+async def test_malformed_queued_renames_are_dropped_and_stop_blocking(tmp_path, _readable, monkeypatch):
+    from main_logic.visit import local_chars
+    from main_logic.visit.forget_runner import _refuse_pending_rename
+
+    async def configured():
+        return {"A": CHAR_UID_A}
+
+    monkeypatch.setattr(local_chars, "load_local_characters", configured)
+    await seed_roster(tmp_path, own_char="A")
+    good = {"old": "G", "new": "A", "uid": CHAR_UID_A}
+    data = _peers(tmp_path)
+    data["pending_rename_queue"] = [{"old": "A"}, good, "junk"]
+    (tmp_path / "visit_peers.json").write_text(json.dumps(data), encoding="utf-8")
+    report = await _recover(tmp_path, ["A"], {CHAR_UID_A: "A"}, list_char_names=None)
+    # 缺 old / new 的排队项没什么可对账的：记诊断后清掉，其余照常对账（变异：不清必红，
+    # 每次启动都跳过清除重放与补录、清除永远被拒）
+    assert report.renamed is True
+    assert "pending_rename_queue" not in _peers(tmp_path)
+    await _refuse_pending_rename(tmp_path, ["A"])
+
+
+async def test_a_queue_that_is_not_a_list_is_dropped(tmp_path):
+    await seed_roster(tmp_path, own_char="A")
+    data = _peers(tmp_path)
+    data["pending_rename_queue"] = {"old": "A", "new": "B"}
+    (tmp_path / "visit_peers.json").write_text(json.dumps(data), encoding="utf-8")
+    # 变异：不清非列表的队列必红（挪进位置时抛 RosterCorruptError，永远解不开）
+    assert await lc.reconcile_renames(tmp_path, {"A"}, {"A": CHAR_UID_A}) == frozenset()
+    assert "pending_rename_queue" not in _peers(tmp_path)
+
+
+async def test_an_unrelated_queued_rename_settles_behind_an_ambiguous_slot(tmp_path):
+    roster = await seed_roster(tmp_path, own_char="A")
+    await seed_roster(tmp_path, peer_uid=PEER_Y, tag=TAG_Y, own_char="P")
+    stuck = {"old": "A", "new": "X", "uid": CHAR_UID_A}
+    await set_roster_marker(tmp_path, "pending_rename", stuck)
+    queued = {"old": "P", "new": "Q", "uid": "e" * 32}
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", queued)
+    uid_of = {"A2": CHAR_UID_A, "X": CHAR_UID_B, "Q": "e" * 32}
+    # 位置那笔永久歧义（X 被别的角色占着）：挪到队尾，P -> Q 照常迁完（变异：位置卡住就停必红）
+    assert await lc.reconcile_renames(tmp_path, set(uid_of), uid_of) == frozenset({"A", "X"})
+    assert await roster.get_char_entry(PEER_Y, "Q") is not None and await roster.get_char_entry(PEER_Y, "P") is None
+    assert await roster.get_char_entry(PEER_X, "A") is not None
+    data = _peers(tmp_path)
+    assert data["pending_rename"] == stuck and "pending_rename_queue" not in data
+
+
+async def test_a_queued_rename_sharing_a_name_with_a_pending_one_waits_behind_it(tmp_path):
+    roster = await seed_roster(tmp_path, own_char="B")
+    # 链式：uid A 从 B 改到 C 卡住（C 被别的角色占着、永久歧义），之后 uid E 从 D 改到 B。
+    # B 下的条目还是 uid A 的：E 的改名先迁会把两个角色的条目混到一起（变异：不看共用名字必红）
+    stuck = {"old": "B", "new": "C", "uid": CHAR_UID_A}
+    await set_roster_marker(tmp_path, "pending_rename", stuck)
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", {"old": "D", "new": "B", "uid": "e" * 32})
+    uid_of = {"A2": CHAR_UID_A, "C": CHAR_UID_B, "B": "e" * 32}
+    assert await lc.reconcile_renames(tmp_path, set(uid_of), uid_of) == frozenset({"B", "C"})
+    data = _peers(tmp_path)
+    # 两笔都留着、原来的顺序不变
+    assert data["pending_rename"] == stuck
+    assert data["pending_rename_queue"] == [{"old": "D", "new": "B", "uid": "e" * 32}]
+    assert await roster.get_char_entry(PEER_X, "B") is not None
+
+
+async def test_dropping_malformed_queued_renames_keeps_the_well_formed_ones(tmp_path):
+    await seed_roster(tmp_path, own_char="A")
+    good = {"old": "G", "new": "A", "uid": CHAR_UID_A}
+    data = _peers(tmp_path)
+    data["pending_rename_queue"] = [{"old": "A"}, good, "junk"]
+    (tmp_path / "visit_peers.json").write_text(json.dumps(data), encoding="utf-8")
+    # 变异：不清必红（位置一直被占着时它们永远轮不到，名字读不出、清除与补录一直推迟）
+    await lc.drop_malformed_queued_renames(tmp_path)
+    assert _peers(tmp_path)["pending_rename_queue"] == [good]
+
+
+async def test_a_partially_migrated_chained_rename_moves_every_name_back(tmp_path, monkeypatch):
+    roster = await seed_roster(tmp_path, own_char="A")
+    await make_visit(tmp_path, vid(1), [ln(1)], own_char="A", own_char_uid=CHAR_UID_A)
+    marker = {"old": "A", "new": "B", "uid": CHAR_UID_A, "chained": ["C"]}
+    await set_roster_marker(tmp_path, "pending_rename", marker)
+    original = VisitSpool.rename_own_char
+
+    async def busy(*_a, **_k):
+        raise OSError("spool locked")
+
+    # 角色现在叫 C：名册已从 A 挪进 C，改写场次时失败，标记留着并记下已开始迁
+    monkeypatch.setattr(VisitSpool, "rename_own_char", busy)
+    with pytest.raises(OSError):
+        await lc.reconcile_rename(tmp_path, {"C"}, {"C": CHAR_UID_A})
+    monkeypatch.setattr(VisitSpool, "rename_own_char", original)
+    assert await roster.get_char_entry(PEER_X, "C") is not None
+    assert _peers(tmp_path)["pending_rename"] == {**marker, "migrated": True}
+    # 之后它又回到旧名 A：chained 的 C 不能当成回滚留下的名字忽略，挪进去的条目要一起迁回
+    # （变异：照样忽略 chained 必红 / 只把新名迁回必红）
+    assert await lc.reconcile_rename(tmp_path, {"A"}, {"A": CHAR_UID_A}) == frozenset()
+    assert await roster.get_char_entry(PEER_X, "A") is not None
+    assert await roster.get_char_entry(PEER_X, "C") is None
+    assert await _state_char(tmp_path, vid(1)) == "A"
+    assert "pending_rename" not in _peers(tmp_path)
+
+
+async def test_replay_goes_on_after_one_item_fails_to_write(tmp_path, monkeypatch):
+    await _retire_fixture(tmp_path)
+    first = lc.retire_item("A", CHAR_UID_A)
+    second = lc.retire_item("Z", "f" * 32)
+    await add_roster_marker_item(tmp_path, "pending_retire", first)
+    await add_roster_marker_item(tmp_path, "pending_retire", second)
+    settled = []
+
+    async def settle(_config_dir, item, **_kw):
+        if item == first:
+            raise OSError("disk full")
+        settled.append(item)
+        return True
+
+    monkeypatch.setattr(lc, "settle_retire", settle)
+    # 一项写不进去不能中断整轮重放：后面的照常补（变异：不逐项接住必红）
+    assert await lc.replay_retires(tmp_path, _loader({"B"}, {"B": CHAR_UID_B}), retire_persona=None) is False
+    assert settled == [second]

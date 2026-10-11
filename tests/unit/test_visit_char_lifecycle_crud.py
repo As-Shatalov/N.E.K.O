@@ -615,12 +615,31 @@ async def test_a_queued_rename_is_reconciled_before_its_name_is_reused(env, monk
 async def test_a_name_queued_behind_an_ambiguous_rename_is_busy_not_ambiguous(env, monkeypatch):
     cm, _path, config_dir = env
     _roster, _uid_old, _persona, unlock = await _failed_rename(cm, config_dir, monkeypatch)
-    # 位置上是一笔永久歧义的改名（Other 被别的角色占着），Old -> New 排在它后面
+    # 位置上是一笔永久歧义的改名（Other、New 都被别的角色占着），Old -> New 排在它后面、共用 New：
+    # 得等那笔（先迁会把两个角色的条目混到一起）
+    ambiguous = {"old": "Other", "new": "New", "uid": _uid(cm, "Current")}
+    await _queue_behind(config_dir, ambiguous)
+    unlock()
+    # 挡住 Old 的不是它自己的歧义：答「稍后再试」，不能让用户去删 Other / New（变异：不看名字必红）
+    assert await character_hooks.name_block_reason(cm, "Old") == (character_hooks.NAME_BUSY, frozenset())
+    assert await character_hooks.name_block_reason(cm, "Other") == (
+        character_hooks.NAME_AMBIGUOUS, frozenset({"Other", "New"}))
+
+
+async def test_a_rename_queued_behind_an_unrelated_ambiguous_rename_still_settles(env, monkeypatch):
+    cm, _path, config_dir = env
+    roster, _uid_old, _persona, unlock = await _failed_rename(cm, config_dir, monkeypatch)
+    # 位置上是另一个角色永久歧义的改名（Other 被别的角色占着），跟 Old -> New 不共用名字
     ambiguous = {"old": "Other", "new": "Current", "uid": _uid(cm, "Current")}
     await _queue_behind(config_dir, ambiguous)
     unlock()
-    # 挡住 Old 的不是它自己的歧义：答「稍后再试」，不能让用户去删 Other / Current（变异：不看名字必红）
-    assert await character_hooks.name_block_reason(cm, "Old") == (character_hooks.NAME_BUSY, frozenset())
+    # 歧义那笔挪到队尾，Old -> New 照常迁完（变异：位置卡住就停必红）
+    assert await character_hooks.name_block_reason(cm, "Old") is None
+    assert await roster.get_char_entry(PEER_X, "New") is not None
+    assert await roster.get_char_entry(PEER_X, "Old") is None
+    assert (await VisitSpool(config_dir, vid(1)).read_state())["own_char"] == "New"
+    data = _peers(config_dir)
+    assert data["pending_rename"] == ambiguous and "pending_rename_queue" not in data
     assert await character_hooks.name_block_reason(cm, "Other") == (
         character_hooks.NAME_AMBIGUOUS, frozenset({"Other", "Current"}))
 
@@ -628,9 +647,9 @@ async def test_a_name_queued_behind_an_ambiguous_rename_is_busy_not_ambiguous(en
 async def test_deleting_a_character_whose_rename_is_stuck_in_the_queue_retires_its_other_name(env, monkeypatch):
     cm, _path, config_dir = env
     roster, uid, _persona, unlock = await _failed_rename(cm, config_dir, monkeypatch)
-    await _queue_behind(config_dir, {"old": "Other", "new": "Current", "uid": _uid(cm, "Current")})
+    await _queue_behind(config_dir, {"old": "Other", "new": "New", "uid": _uid(cm, "Current")})
     unlock()
-    # 排队的改名轮不到（位置被歧义占着）：删 New 不能被永远挡住，旧名 Old 随它一起退役（变异：不退役 Old 必红）
+    # 排队的改名轮不到（位置上的歧义改名同样占着 New）：删 New 不能被永远挡住，旧名 Old 随它一起退役（变异：不退役 Old 必红）
     status, body = await _delete(cm, "New")
     assert status == 200 and body["success"] is True
     assert "New" not in cm.load_characters()["猫娘"]
