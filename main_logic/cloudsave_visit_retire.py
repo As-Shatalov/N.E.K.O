@@ -34,7 +34,8 @@ def removed_characters_recorder(
     """The ``on_characters_removed`` callback recording the visit markers under its ``config_dir``.
 
     ``pending_retire`` items for the removed characters, then a
-    ``pending_rename`` for a character the snapshot renamed.
+    ``pending_rename`` for a character the snapshot renamed, then the names
+    handed to new characters on the pending renames still holding them.
 
     ``None`` for a config object without a real ``config_dir`` (``str`` /
     ``Path``; the application's ``ConfigManager`` always has one): it has no
@@ -47,8 +48,16 @@ def removed_characters_recorder(
 
     def record(
         removed: list[dict[str, Any]], kept_local_names: frozenset[str], renamed: list[dict[str, str]],
+        fresh_names: frozenset[str] = frozenset(),
     ) -> int:
-        from main_logic.visit.char_lifecycle import record_removed_characters_sync, record_renamed_characters_sync
+        if not removed and not renamed and not (config_dir / "visit_peers.json").exists():
+            # 只带来了新角色、这台机器又没有串门名册：没有要标的改名，不加载串门模块
+            return 0
+        from main_logic.visit.char_lifecycle import (
+            record_handed_over_names_sync,
+            record_removed_characters_sync,
+            record_renamed_characters_sync,
+        )
 
         # 先记删除：它要读当前的改名标记，判断被删角色的另一个名字。两步互不连累：
         # 一步写盘失败（文件被短暂占住）不能让另一步也不记，失败最后再交给导入方记日志
@@ -60,6 +69,12 @@ def removed_characters_recorder(
             failure = exc
         try:
             recorded += record_renamed_characters_sync(config_dir, renamed)
+        except Exception as exc:  # noqa: BLE001
+            failure = failure or exc
+        try:
+            # 最后标交出去的名字：刚写下的改名标记与之前没对完账的都要看
+            removed_uids = [entry.get("character_uid") for entry in removed]
+            recorded += record_handed_over_names_sync(config_dir, fresh_names, removed_uids)
         except Exception as exc:  # noqa: BLE001
             failure = failure or exc
         if failure is not None:

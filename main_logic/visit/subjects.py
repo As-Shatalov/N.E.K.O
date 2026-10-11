@@ -546,6 +546,32 @@ async def remove_roster_marker_item(config_dir: str | Path, key: str, item: Any)
     return await asyncio.to_thread(_edit_marker_list_sync, path, key, item, False)
 
 
+def _replace_marker_sync(path: Path, key: str, expected: Any, value: Any) -> bool:
+    with path_lock(path):
+        data = _read_top_level_sync_unlocked(path)
+        current = data.get(key)
+        if isinstance(current, list):
+            if expected not in current:
+                return False
+            data[key] = [copy.deepcopy(value) if entry == expected else entry for entry in current]
+        elif current == expected and current is not None:
+            data[key] = copy.deepcopy(value)
+        else:
+            return False
+        atomic_write_json(path, data)
+        return True
+
+
+def replace_roster_marker_sync(config_dir: str | Path, key: str, expected: Any, value: Any) -> bool:
+    """Replace the marker ``key`` (or, for a list, its item equal to ``expected``) with ``value``.
+
+    False, writing nothing, when the marker no longer is ``expected``. Blocking,
+    for a startup import thread; an unreadable roster raises
+    :class:`RosterCorruptError`.
+    """
+    return _replace_marker_sync(Path(config_dir) / VISIT_PEERS_FILENAME, key, expected, value)
+
+
 def _promote_marker_sync(path: Path, slot_key: str, queue_key: str) -> Any:
     with path_lock(path):
         data = _read_top_level_sync_unlocked(path)

@@ -52,11 +52,12 @@ def names_loader(config_manager: Any) -> char_lifecycle.LoadNames:
     """``LoadNames`` reading the character config through ``config_manager``."""
 
     async def load() -> tuple[set[str], dict[str, str] | None]:
-        config_path = getattr(config_manager, "get_config_path", None)
+        config_path = getattr(config_manager, "get_runtime_config_path", None)
         if callable(config_path):
-            # 普通读取在文件坏了时静默退回缓存 / 默认角色：拿它对账会把还在的角色当成已删除，
-            # 清掉标记却不迁移。读不出就抛出，调用方按「对不完账」处理（与启动对账一致）
-            await local_chars.ensure_characters_file_readable(config_path("characters.json"))
+            # 普通读取在文件坏了 / 不在时静默退回缓存 / 默认角色：拿它对账会把还在的角色当成已删除，
+            # 清掉标记却不迁移。读不出就抛出，调用方按「对不完账」处理。有标记要对账说明这台机器
+            # 有过角色，运行时文件不在不能当成全新安装
+            await local_chars.ensure_characters_file_readable(config_path("characters.json"), missing_ok=False)
         return char_lifecycle.names_of(await config_manager.aload_characters())
 
     return load

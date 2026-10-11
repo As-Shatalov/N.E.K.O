@@ -660,6 +660,23 @@ async def test_reconciling_on_demand_refuses_a_fallback_character_config(env, mo
         Path(path).write_text(original, encoding="utf-8")
 
 
+async def test_reconciling_on_demand_refuses_a_missing_runtime_character_config(env, monkeypatch):
+    cm, _path, config_dir = env
+    _roster, _uid_old, _persona, unlock = await _failed_rename(cm, config_dir, monkeypatch)
+    unlock()
+    marker = _peers(config_dir)["pending_rename"]
+    runtime_path = Path(cm.get_runtime_config_path("characters.json"))
+    original = runtime_path.read_text(encoding="utf-8")
+    runtime_path.unlink()
+    try:
+        # 有标记就说明这台机器有过角色：运行时文件不在不是全新安装，退回的种子角色不能拿来对账
+        # （变异：不在也放过必红）
+        assert await character_hooks.name_block_reason(cm, "Old") == (character_hooks.NAME_BUSY, frozenset())
+        assert _peers(config_dir)["pending_rename"] == marker
+    finally:
+        runtime_path.write_text(original, encoding="utf-8")
+
+
 async def test_a_rename_waiting_for_a_retirement_is_busy_not_ambiguous(env, monkeypatch):
     cm, _path, config_dir = env
     uid = _uid(cm, "Old")

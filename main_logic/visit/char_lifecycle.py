@@ -71,6 +71,7 @@ from main_logic.visit.subjects import (
     promote_roster_marker,
     read_roster_marker,
     read_roster_marker_sync,
+    replace_roster_marker_sync,
     set_roster_marker_sync,
     remove_roster_marker_item,
     set_roster_marker,
@@ -188,7 +189,10 @@ async def reconcile_rename(
         current = {name for name, value in uid_of.items() if value == uid}
         # 另一个名字被别的角色占着（旧名被新建角色复用）：名册条目只按名字存，迁移会把
         # 两个角色的记录混到一起。分不开就不迁，留着标记、只挡这两个名字
-        reused = (old in uid_of and uid_of[old] != uid) or (new in uid_of and uid_of[new] != uid)
+        # 云快照导入把名字交给了本机原来没有的角色（handed_over）：导入那一刻这个名字下的条目
+        # 都还是这个角色的，新角色不能继承，照常迁走
+        handed = _handed_over_names(marker)
+        reused = any(name in uid_of and uid_of[name] != uid and name not in handed for name in (old, new))
         forward = new in current and not reused
         backward = old in current and not forward and not reused
         deleted = not current
@@ -276,6 +280,13 @@ async def reconcile_renames(config_dir: Path, names: set[str], uid_of: dict[str,
 
 def _queued_renames(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
+
+
+def _handed_over_names(marker: Any) -> frozenset[str]:
+    names = marker.get("handed_over") if isinstance(marker, dict) else None
+    if not isinstance(names, list):
+        return frozenset()
+    return frozenset(name for name in names if isinstance(name, str) and name)
 
 
 async def begin_rename(
@@ -623,6 +634,8 @@ def record_renamed_characters_sync(config_dir: str | Path, renamed: Iterable[Map
     taken by the same character's unfinished rename is left to that one
     (recovery sees the character under a third name and moves both). Machines
     without visit data get nothing; returns the number of renames recorded.
+    An old name the snapshot gives to a new character is marked afterwards
+    by :func:`record_handed_over_names_sync`.
     """
     config_dir = Path(config_dir)
     written = 0
@@ -632,7 +645,8 @@ def record_renamed_characters_sync(config_dir: str | Path, renamed: Iterable[Map
             continue
         if not _has_visit_files_sync(config_dir, uid):
             continue
-        ok, existing = set_roster_marker_sync(config_dir, PENDING_RENAME, {"old": old, "new": new, "uid": uid})
+        marker = {"old": old, "new": new, "uid": uid}
+        ok, existing = set_roster_marker_sync(config_dir, PENDING_RENAME, marker)
         if ok:
             written += 1
         elif isinstance(existing, dict) and existing.get("uid") == uid:
@@ -641,10 +655,43 @@ def record_renamed_characters_sync(config_dir: str | Path, renamed: Iterable[Map
                         old, new, existing)
         else:
             # 标记只有一个位置：排进队列，启动对账在这一笔清掉之后依次处理（同一次导入改了几个角色）
-            written += bool(add_roster_marker_item_sync(
-                config_dir, PENDING_RENAME_QUEUE, {"old": old, "new": new, "uid": uid}))
+            written += bool(add_roster_marker_item_sync(config_dir, PENDING_RENAME_QUEUE, marker))
             logger.info("visit rename: cloudsave renamed %r to %r queued behind pending %r", old, new, existing)
     return written
+
+
+def record_handed_over_names_sync(
+    config_dir: str | Path, fresh_names: Iterable[str], removed_uids: Iterable[str] = (),
+) -> int:
+    """Mark the names a cloudsave import gives to new characters on the pending renames still holding them.
+
+    A pending rename (the slot or a queued one) of a character the import
+    keeps still has entries under its two names; when the snapshot hands one
+    of them to a character new to this machine, those entries remain the
+    renamed character's and the marker records the name as ``handed_over``
+    (otherwise the reconciliation would see the name reused and keep the
+    entries there, for the new character to inherit). Renames of removed
+    characters are left to their retirement. Returns the markers updated.
+    """
+    config_dir = Path(config_dir)
+    fresh = frozenset(fresh_names)
+    gone = set(removed_uids)
+    if not fresh or not _may_exist(config_dir / VISIT_PEERS_FILENAME):
+        return 0
+    updated = 0
+    slot = read_roster_marker_sync(config_dir, PENDING_RENAME)
+    queued = _queued_renames(read_roster_marker_sync(config_dir, PENDING_RENAME_QUEUE))
+    for key, marker in [(PENDING_RENAME, slot)] + [(PENDING_RENAME_QUEUE, item) for item in queued]:
+        if not isinstance(marker, dict) or marker.get("uid") in gone:
+            continue
+        handed = _handed_over_names(marker)
+        adding = [name for name in (marker.get("old"), marker.get("new"))
+                  if isinstance(name, str) and name in fresh and name not in handed]
+        if not adding:
+            continue
+        value = {**marker, "handed_over": sorted(handed | set(adding))}
+        updated += bool(replace_roster_marker_sync(config_dir, key, marker, value))
+    return updated
 
 
 def names_of(characters: Any) -> tuple[set[str], dict[str, str]]:
