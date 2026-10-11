@@ -138,29 +138,23 @@ async def render_chips(visit_id: str, *, own_char: str, status: Optional[str] = 
     if owner is None or owner != await own_visit_uid():
         # 启动补录逐场回调、不分账号：不是当前登录账号的场次不发（换回那个账号后由 visit_bind 重放）
         return False
-    if status == "interrupted" and await _owes_chips(visit_id):
-        # 与芯片同一出口：校验 bind 与写入用同一个连接对象（send_status 会重读 mgr.websocket）。
-        # 预览块 / 写入中 / 失败块不带这条提示（与 bind 重放同一口径）
-        if not await host.send_frame({"type": "status", "message": json.dumps(
-                {"code": "VISIT_INTERRUPTED_LAST_TIME", "details": {"visit_id": visit_id}}, ensure_ascii=False)}):
-            # 提示没送出（连接刚被换掉等）：芯片也不单独发，下次 visit_bind 连同提示一起重放
-            return False
-        if await own_visit_uid() != owner:
-            return False  # 写提示的这段 await 里登出 / 换了账号：芯片不再发
-    return await show_owed(host, visit_id, own_char=own_char, lang=prompt_lang())
+    return await show_owed(host, visit_id, own_char=own_char, lang=prompt_lang(),
+                           interrupted=status == "interrupted")
 
 
-async def show_owed(host: Any, visit_id: str, *, own_char: str, lang: Optional[str]) -> bool:
+async def show_owed(host: Any, visit_id: str, *, own_char: str, lang: Optional[str],
+                    interrupted: bool = False) -> bool:
     """Render the block ``visit_id`` currently owes (chips, preview or failure block) and its state frame.
 
     Under the per-visit lock, from the current ``state.json``: a choice made
     meanwhile on another page is never overtaken by an older block.
     """
     async with _visit_lock(visit_id):
-        return await _show_owed_locked(host, visit_id, own_char=own_char, lang=lang)
+        return await _show_owed_locked(host, visit_id, own_char=own_char, lang=lang, interrupted=interrupted)
 
 
-async def _show_owed_locked(host: Any, visit_id: str, *, own_char: str, lang: Optional[str]) -> bool:
+async def _show_owed_locked(host: Any, visit_id: str, *, own_char: str, lang: Optional[str],
+                            interrupted: bool = False) -> bool:
     try:
         state = await _spool(visit_id).read_state()
     except Exception as exc:  # noqa: BLE001 - 读不出：等 bind 重放
@@ -178,6 +172,15 @@ async def _show_owed_locked(host: Any, visit_id: str, *, own_char: str, lang: Op
     if await own_visit_uid() != state.get("own_uid"):
         # 账号放在最后核（解析名字有 await）：换了账号就不把这一场的预览正文推给现在登录的账号
         return False
+    if interrupted and state["debrief_choice"] in _CHIP_CHOICES:
+        # 「意外中断」与它所跟的块按同一份锁内状态决定：只跟芯片一起出（与 bind 重放同一口径）。
+        # 与芯片同一出口：校验 bind 与写入用同一个连接对象（send_status 会重读 mgr.websocket）
+        if not await host.send_frame({"type": "status", "message": json.dumps(
+                {"code": "VISIT_INTERRUPTED_LAST_TIME", "details": {"visit_id": visit_id}}, ensure_ascii=False)}):
+            # 提示没送出（连接刚被换掉等）：芯片也不单独发，下次 visit_bind 连同提示一起重放
+            return False
+        if await own_visit_uid() != state.get("own_uid"):
+            return False  # 写提示的这段 await 里登出 / 换了账号：芯片不再发
     try:
         shown = bool(await host.render_chat_blocks(blocks, request_id=request_id, source_name=own_char))
     except Exception as exc:  # noqa: BLE001 - 页面不在：标记留在 state.json，等下次 bind 重放
@@ -186,14 +189,6 @@ async def _show_owed_locked(host: Any, visit_id: str, *, own_char: str, lang: Op
     if shown and frame is not None:
         await host.send_frame(frame)
     return shown
-
-
-async def _owes_chips(visit_id: str) -> bool:
-    try:
-        state = await _spool(visit_id).read_state()
-    except Exception:  # noqa: BLE001 - 读不出：不发提示，块本身也发不出，等 bind 重放
-        return False
-    return state is not None and state.get("debrief_choice") in _CHIP_CHOICES
 
 
 async def _visit_owner(visit_id: str) -> Optional[str]:
@@ -861,7 +856,9 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     if current not in _CHIP_CHOICES:
         return _already_chosen(state)
     # 条件转移：「清除这个人」的作废步骤不拿这把锁、会把未定的 debrief 直接改成 forget，不能盖掉它
-    applied, found = await spool.update_state_if(current, debrief_choice="generating:diary")
+    # 期望值是整组芯片状态：芯片状态之间的变化（收尾时 mark_debrief_pending 的 None → ask_later 可能晚于芯片
+    # 落盘、生成失败后再点是 generating → generating）不算被别人抢先；作废步骤写的 forget 仍拦得住
+    applied, found = await spool.update_state_if(_CHIP_CHOICES, debrief_choice="generating:diary")
     if not applied:
         return _already_chosen(found)
     try:

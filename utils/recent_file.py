@@ -612,6 +612,14 @@ def read_retired_keys_unlocked(path: Any) -> dict[str, float]:
         return {}
     if not isinstance(data, dict):
         raise ValueError(f"{RETIRED_KEYS_FILENAME} is not an object")
+    for key, stamp in data.items():
+        # 条目畸形（键不是串门日记键、时间不是有限数）同样按「坏了」处理：不把它当成「写过」的证据
+        if (
+            not isinstance(key, str) or VISIT_DIARY_KEY_RE.fullmatch(key) is None
+            or isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or stamp != stamp
+            or stamp in (float("inf"), float("-inf"))
+        ):
+            raise ValueError(f"{RETIRED_KEYS_FILENAME} has a malformed entry")
     return data
 
 

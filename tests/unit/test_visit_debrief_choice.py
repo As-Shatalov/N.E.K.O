@@ -1198,3 +1198,48 @@ async def test_bind_replay_rechecks_the_character_after_waiting_for_the_lock(env
     lock.release()
     await replay
     assert socket.sent == []
+
+
+# ── 自动评审第 9 轮 / Codex 第 16 轮 ─────────────────────────────────────
+
+
+async def test_a_late_ask_later_does_not_reject_the_first_click(env, monkeypatch):
+    # 收尾的 mark_debrief_pending（None → ask_later）晚于芯片落盘：用户已经点了「记成日记」也照常生成
+    await visit(env, debrief_choice=None)
+    real = VisitSpool.update_state_if
+
+    async def ask_later_lands_first(self, expected, **changes):
+        if changes.get("debrief_choice") == "generating:diary":
+            await self.mark_debrief_pending()
+        return await real(self, expected, **changes)
+
+    monkeypatch.setattr(VisitSpool, "update_state_if", ask_later_lands_first)
+    status, body = await choose("diary")
+    assert status == 200 and body["applied"] == "preview"
+
+
+async def test_startup_notice_follows_the_locked_state(env, monkeypatch):
+    from main_routers.visit_router import host_port
+
+    class BoundHost(Host):
+        def display_bound(self):
+            return True
+
+    host = BoundHost()
+    monkeypatch.setattr(host_port.ManagerHost, "for_character", classmethod(lambda cls, name: host))
+    await visit(env, finalized="crash")
+    lock = debrief._visit_lock(vid(1))
+    await lock.acquire()
+    task = asyncio.ensure_future(debrief.render_chips(vid(1), own_char="A", status="interrupted"))
+    for _ in range(500):
+        if lock._waiters:
+            break
+        await asyncio.sleep(0.01)
+    assert lock._waiters
+    # 另一页在这期间点了「记成日记」、预览已落盘：投递的是预览块，「意外中断」不能跟着出
+    await VisitSpool(env.tmp, vid(1)).update_state(
+        debrief_choice="preview:diary", debrief_pending={"diary": "d", "facts": []})
+    lock.release()
+    assert await task is True
+    statuses = [f for f in host.frames if f.get("type") == "status"]
+    assert statuses == [] and [rid for rid, _ in host.blocks] == [debrief.preview_request_id(vid(1))]

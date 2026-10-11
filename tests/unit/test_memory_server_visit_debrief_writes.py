@@ -875,3 +875,29 @@ async def test_existing_evidence_is_reported_even_when_bookkeeping_writes_are_bl
     monkeypatch.setattr("app.memory_server.idempotency.assert_cloudsave_writable", blocked)
     status, body = await _cache(env, _diary_request())
     assert (status, body["duplicate"]) == (200, True) and len(_keyed(env)) == 1
+
+
+# ── CodeRabbit / Codex 第 16 轮 ──────────────────────────────────────────
+
+
+async def test_a_failed_done_mark_after_a_write_still_reports_success(env, monkeypatch):
+    calls = {"n": 0}
+
+    def maintenance_after_pending(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] > 1:  # pending 记上之后，标 done 时遇到云存档维护
+            raise RuntimeError("cloudsave maintenance")
+
+    monkeypatch.setattr("app.memory_server.idempotency.assert_cloudsave_writable", maintenance_after_pending)
+    status, body = await _cache(env, _diary_request())
+    assert (status, body) == (200, {"status": "cached", "count": 1})
+    assert len(_keyed(env)) == 1
+
+
+@pytest.mark.parametrize("payload", [{KEY: None}, {KEY: True}, {"k1": 1.0}, {KEY: "x"}])
+def test_malformed_retired_entries_fail_closed(tmp_path, payload):
+    path = str(tmp_path / "recent.json")
+    Path(recent_file.recent_sidecar_path(path, recent_file.RETIRED_KEYS_FILENAME)).write_text(
+        json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError):
+        recent_file.read_retired_keys(path)

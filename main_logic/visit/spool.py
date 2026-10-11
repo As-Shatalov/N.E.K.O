@@ -1403,7 +1403,7 @@ class VisitSpool:
         return changed
 
     async def update_state_if(self, expected_choice: Any, **changes: Any) -> tuple[bool, dict]:
-        """Apply ``changes`` only while ``debrief_choice`` is still ``expected_choice``.
+        """Apply ``changes`` only while ``debrief_choice`` is still ``expected_choice`` (a value or a tuple of values).
 
         Returns ``(True, new state)``, or ``(False, the state found)`` without
         writing when the choice moved on.
@@ -1413,8 +1413,10 @@ class VisitSpool:
         ``forget``): an unconditional write after a long await would overwrite
         that newer terminal choice.
         """
+        expected = expected_choice if isinstance(expected_choice, tuple) else (expected_choice,)
+
         def mutate(state: dict) -> None:
-            if state["debrief_choice"] != expected_choice:
+            if state["debrief_choice"] not in expected:
                 raise _NotApplied(copy.deepcopy(state))
             state.update(copy.deepcopy(changes))
 
