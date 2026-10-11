@@ -617,7 +617,9 @@ def read_retired_keys_unlocked(path: Any) -> dict[str, float]:
         # 条目畸形（键不是串门日记键、时间不是有限数）同样按「坏了」处理：不把它当成「写过」的证据
         if (
             not isinstance(key, str) or VISIT_DIARY_KEY_RE.fullmatch(key) is None
-            or isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not math.isfinite(stamp)
+            or isinstance(stamp, bool) or not isinstance(stamp, (int, float))
+            # int 一律有限（超大整数交给 math.isfinite 会抛 OverflowError、挡住 recent.json 写入）；只查 float
+            or (isinstance(stamp, float) and not math.isfinite(stamp))
         ):
             raise ValueError(f"{RETIRED_KEYS_FILENAME} has a malformed entry")
     return data

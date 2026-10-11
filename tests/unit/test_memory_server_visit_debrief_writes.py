@@ -910,3 +910,15 @@ def test_non_finite_retired_stamps_fail_closed(tmp_path, stamp):
         '{"%s": %s}' % (KEY, stamp), encoding="utf-8")
     with pytest.raises(ValueError):
         recent_file.read_retired_keys(path)
+
+
+def test_a_huge_integer_stamp_does_not_block_recent_writes(tmp_path):
+    # JSON 能解析出超大整数：读旁路不能抛 OverflowError，recent.json 照常可写
+    path = str(tmp_path / "recent.json")
+    recent_file.write_recent_payload(path, messages_to_dict([_keyed_entry("d", KEY)]))
+    sidecar = recent_file.recent_sidecar_path(path, recent_file.RETIRED_KEYS_FILENAME)
+    Path(sidecar).write_text('{"%s": %s}' % (K1, "1" + "0" * 400), encoding="utf-8")
+    assert K1 in recent_file.read_retired_keys(path)
+    recent_file.write_recent_payload(path, [])
+    assert json.loads(Path(path).read_text(encoding="utf-8")) == []
+    assert KEY in recent_file.read_retired_keys(path)
