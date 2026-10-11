@@ -199,6 +199,10 @@ async def reconcile_rename(
         # 都还是这个角色的，新角色不能继承，照常迁走
         handed = _handed_over_names(marker)
         held = rename_marker_names(marker) or (old, new)
+        if {name for name, value in uid_of.items() if value == uid} & {old, new}:
+            # 角色还停在这笔改名本身的两个名字上：chained 里的名字是一次回滚了的云快照导入记下的
+            # （或它又改回来了），不再算它的，也不拿来判断复用
+            held = (old, new)
         reused = any(name in uid_of and uid_of[name] != uid and name not in handed for name in held)
         forward = new in current and not reused
         backward = old in current and not forward and not reused
@@ -234,7 +238,7 @@ async def reconcile_rename(
             # 目标名字下还有已删除角色的残留没退役完：先迁进去，之后按名字退役会连这个角色的条目一起删。
             # 留着标记等退役补完（启动恢复先补退役、再对账）
             logger.warning("visit recovery: pending_rename %r -> %r waits for the retirement of %r", old, new, target)
-            return frozenset({old, new})
+            return frozenset(held)
     if forward or moved:
         # 标记涉及的每个名字（含 chained 记下的中间名字）下的条目都迁到它现在的名字
         for name in held:
@@ -255,7 +259,8 @@ async def reconcile_rename(
         logger.warning("visit recovery: pending_rename %r -> %r names a deleted character, dropped", old, new)
     else:
         logger.warning("visit recovery: pending_rename %r -> %r is ambiguous, kept", old, new)
-        return frozenset({old, new})
+        # 标记涉及的每个名字（含 chained）都还挂着：覆盖下载其中任一个都要答「请先删除其中一个」
+        return frozenset(held)
     return frozenset() if await clear_roster_marker(config_dir, PENDING_RENAME, marker) else ALL_NAMES
 
 
@@ -695,9 +700,15 @@ def record_renamed_characters_sync(config_dir: str | Path, renamed: Iterable[Map
             # 新名字记进标记（chained），对账前同样算占用：否则覆盖下载这个名字会换掉角色的 uid，
             # 对账就按「已删除」清掉标记，两个旧名下的条目没人认领
             chained = list(existing.get("chained")) if isinstance(existing.get("chained"), list) else []
+            value = dict(existing)
             if new not in chained and new not in (existing.get("old"), existing.get("new")):
-                written += bool(replace_roster_marker_sync(
-                    config_dir, PENDING_RENAME, existing, {**existing, "chained": [*chained, new]}))
+                value["chained"] = [*chained, new]
+            # 这一笔若记了 handed_over（链式改名里旧名接着归了下一个本机角色），一并带进已有标记
+            handed = _handed_over_names(existing) | _handed_over_names(marker)
+            if handed:
+                value["handed_over"] = sorted(handed)
+            if value != existing:
+                written += bool(replace_roster_marker_sync(config_dir, PENDING_RENAME, existing, value))
             logger.info("visit rename: cloudsave renamed %r to %r on top of pending %r; recovery chains it",
                         old, new, existing)
         else:

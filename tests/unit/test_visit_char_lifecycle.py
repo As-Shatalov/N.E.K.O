@@ -872,3 +872,25 @@ async def test_a_rename_does_not_wait_for_a_retirement_whose_roster_step_is_done
     await add_roster_marker_item(tmp_path, "pending_retire", {**lc.retire_item("A2", CHAR_UID_B), "roster_done": True})
     assert await lc.reconcile_rename(tmp_path, {"A2"}, {"A2": CHAR_UID_A}) == frozenset()
     assert await roster.get_char_entry(PEER_X, "A2") is not None
+
+
+async def test_an_ambiguous_chained_rename_reports_every_name_it_holds(tmp_path):
+    await seed_roster(tmp_path, own_char="A")
+    marker = {"old": "A", "new": "B", "uid": CHAR_UID_A, "chained": ["C"]}
+    await set_roster_marker(tmp_path, "pending_rename", marker)
+    # 角色现在叫 C，A 被别的角色复用：永久歧义。覆盖下载 C 也得答「请先删除其中一个」
+    # （变异：只返回 old / new 必红）
+    unsettled = await lc.reconcile_rename(tmp_path, {"A", "C"}, {"A": CHAR_UID_B, "C": CHAR_UID_A})
+    assert unsettled == frozenset({"A", "B", "C"})
+    assert _peers(tmp_path)["pending_rename"] == marker
+
+
+async def test_chained_names_of_a_rolled_back_import_are_ignored(tmp_path):
+    roster = await _visit_data(tmp_path)
+    # X -> A 没对完账；一次云快照导入想把它改成 C（记进 chained）、把 C 原来的主人删掉，但回滚了：
+    # 它还叫 A、C 仍归另一个角色。chained 的 C 不再算它的（变异：照算必红，永久歧义）
+    await set_roster_marker(tmp_path, "pending_rename",
+                            {"old": "X", "new": "A", "uid": CHAR_UID_A, "chained": ["C"]})
+    assert await lc.reconcile_rename(tmp_path, {"A", "C"}, {"A": CHAR_UID_A, "C": CHAR_UID_B}) == frozenset()
+    assert await roster.get_char_entry(PEER_X, "A") is not None
+    assert "pending_rename" not in _peers(tmp_path)

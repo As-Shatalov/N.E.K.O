@@ -392,6 +392,20 @@ async def test_a_snapshot_rename_of_the_same_character_chains_onto_its_pending_r
     assert await roster.get_char_entry(PEER_X, "C") is not None
 
 
+async def test_a_chain_extending_a_pending_rename_keeps_its_handed_over_name(tmp_path):
+    from main_logic.visit.subjects import set_roster_marker
+
+    uid = "c" * 32
+    await seed_roster(tmp_path, own_char="A")
+    earlier = {"old": "X", "new": "A", "uid": uid}
+    await set_roster_marker(tmp_path, "pending_rename", earlier)
+    # 链式改名 A -> C（旧名 A 接着归了下一个本机角色，handed_over）落在这个角色自己没对完账的
+    # 标记上：chained 与 handed_over 一起补进去（变异：丢掉 handed_over 必红）
+    lc.record_renamed_characters_sync(tmp_path, [{"old": "A", "new": "C", "uid": uid, "handed_over": ["A"]}])
+    peers = json.loads((tmp_path / "visit_peers.json").read_text(encoding="utf-8"))
+    assert peers["pending_rename"] == {**earlier, "chained": ["C"], "handed_over": ["A"]}
+
+
 def test_a_failing_retire_record_still_records_the_renames(tmp_path, monkeypatch):
     record = removed_characters_recorder(SimpleNamespace(config_dir=str(tmp_path)))
     renamed = [{"old": "A", "new": "C", "uid": "c" * 32}]
