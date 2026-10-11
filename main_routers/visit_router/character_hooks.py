@@ -156,10 +156,15 @@ async def name_block_reason(config_manager: Any, name: str) -> tuple[str, frozen
             # 退役还没补完、名字又挂在一笔改名上：照样挡住，但先按改名对账一次，永久歧义时
             # 要答「请先删除其中一个」（已清完名册的退役不会让它解开，一直答「稍后再试」解不开）
             state = char_lifecycle.NAME_RENAMING
+        retried = True
+    else:
+        retried = False
     if state == char_lifecycle.NAME_RENAMING:
         try:
-            # 改名迁移会等目标名下的退役补完：先补一次，能补完就不用等下次启动
-            await char_lifecycle.replay_retires(config_dir, names_loader(config_manager), retire_persona=retire_persona)
+            # 改名迁移会等目标名下的退役补完：先补一次，能补完就不用等下次启动（上面刚补过就不再补）
+            if not retried:
+                await char_lifecycle.replay_retires(
+                    config_dir, names_loader(config_manager), retire_persona=retire_persona)
         except Exception as exc:  # noqa: BLE001 - 补不完照样对账，改名会继续等着
             logger.warning("visit retire: retry before reconciling the rename holding %r failed: %r", name, exc)
         try:

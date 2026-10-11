@@ -1195,3 +1195,79 @@ async def test_renaming_the_fresh_holder_of_a_handed_over_name_settles_the_renam
     assert marker == {"old": "A", "new": "C", "uid": CHAR_UID_B}
     assert await roster.get_char_entry(PEER_X, "B") is not None and await roster.get_char_entry(PEER_X, "A") is None
     assert "pending_rename_queue" not in _peers(tmp_path)
+
+
+async def test_deleting_the_fresh_holder_goes_ahead_when_the_handing_rename_is_ambiguous_for_good(tmp_path):
+    roster = await seed_roster(tmp_path, own_char="A")
+    # uid A 的 A -> B 交出了 A（给 uid B）、现在叫 C；B 又被别的角色（uid e）占着：永久歧义
+    handed = {"old": "A", "new": "B", "uid": CHAR_UID_A, "source": lc.CLOUDSAVE_SOURCE,
+              "handed_over": ["A"], "chained": ["C"]}
+    await set_roster_marker(tmp_path, "pending_rename", handed)
+    uid_of = {"A": CHAR_UID_B, "B": "e" * 32, "C": CHAR_UID_A}
+    # 删 uid B 不能被永远挡住（提示里可能正让用户删它）；但不按名字清 A，uid A 的条目留着
+    # （变异：照样拒绝必红 / 不记 roster_done 必红）
+    item = await lc.begin_retire(tmp_path, "A", CHAR_UID_B, load_names=_loader(set(uid_of), uid_of))
+    assert item == {**lc.retire_item("A", CHAR_UID_B), "roster_done": True}
+    remaining = {name: uid for name, uid in uid_of.items() if name != "A"}
+    assert await lc.settle_retire(tmp_path, item, names=set(remaining), uid_of=remaining, retire_persona=None)
+    assert await roster.get_char_entry(PEER_X, "A") is not None
+    assert _peers(tmp_path)["pending_rename"] == handed
+
+
+async def test_renaming_the_fresh_holder_stays_refused_when_the_handing_rename_is_ambiguous(tmp_path):
+    await seed_roster(tmp_path, own_char="A")
+    handed = {"old": "A", "new": "B", "uid": CHAR_UID_A, "source": lc.CLOUDSAVE_SOURCE,
+              "handed_over": ["A"], "chained": ["C"]}
+    await set_roster_marker(tmp_path, "pending_rename", handed)
+    uid_of = {"A": CHAR_UID_B, "B": "e" * 32, "C": CHAR_UID_A}
+    # 改名会把 uid A 留在 A 下的条目一起迁走：仍然拒绝（删除可以照常进行）
+    with pytest.raises(lc.RenamePendingElsewhere):
+        await lc.begin_rename(tmp_path, "A", "D", CHAR_UID_B, names=set(uid_of), uid_of=uid_of)
+    assert _peers(tmp_path)["pending_rename"] == handed
+
+
+async def test_reconcile_renames_can_leave_deleted_characters_queued_renames_alone(tmp_path, monkeypatch):
+    await seed_roster(tmp_path, own_char="A")
+    dropped = []
+
+    async def drop(*_a, **_k):
+        dropped.append(True)
+
+    monkeypatch.setattr(lc, "drop_deleted_queued_renames", drop)
+    # 启动恢复已在锁内按新名单撤过：这里不再按（可能过时的）名单撤一次（变异：照样撤必红）
+    await lc.reconcile_renames(tmp_path, {"A"}, {"A": CHAR_UID_A}, drop_deleted=False)
+    assert dropped == []
+    await lc.reconcile_renames(tmp_path, {"A"}, {"A": CHAR_UID_A})
+    assert dropped == [True]
+
+
+async def test_startup_recovery_drops_deleted_queued_renames_only_under_the_lock(tmp_path, _readable, monkeypatch):
+    from main_logic.visit import local_chars, recovery
+
+    async def configured():
+        return {"A2": CHAR_UID_A}
+
+    seen = []
+
+    async def reconcile(*_a, **kw):
+        seen.append(kw.get("drop_deleted", True))
+        return frozenset()
+
+    monkeypatch.setattr(local_chars, "load_local_characters", configured)
+    monkeypatch.setattr(recovery, "reconcile_renames", reconcile)
+    await seed_roster(tmp_path, own_char="A")
+    await _recover(tmp_path, ["A2"], {}, list_char_names=None)
+    # 锁外不再用同一份名单撤第二次（变异：照样撤必红）
+    assert seen == [False]
+
+
+async def test_deleting_the_fresh_holder_waits_while_the_handing_rename_waits_for_a_retirement(tmp_path):
+    await seed_roster(tmp_path, own_char="A")
+    handed = {"old": "A", "new": "B", "uid": CHAR_UID_A, "source": lc.CLOUDSAVE_SOURCE, "handed_over": ["A"]}
+    await set_roster_marker(tmp_path, "pending_rename", handed)
+    # 交出 A 的那笔改名在等 B 下旧角色的退役：迟早对得完，不是永久歧义，删除仍要等（409）
+    # （变异：在等退役也当成歧义放行必红）
+    await add_roster_marker_item(tmp_path, "pending_retire", lc.retire_item("B", "e" * 32))
+    uid_of = {"A": CHAR_UID_B, "B": CHAR_UID_A}
+    with pytest.raises(lc.RenamePendingElsewhere):
+        await lc.begin_retire(tmp_path, "A", CHAR_UID_B, load_names=_loader(set(uid_of), uid_of))

@@ -1429,6 +1429,8 @@ async def visit_spool_recovery(
             unsettled = await reconcile_renames(
                 config_dir, names, uid_of,
                 reconcile=lambda: _reconcile_rename_guarded(config_dir, names, uid_of, lifecycle_guard, load_names),
+                # 上面已在锁内按重读的名单撤过；锁外再按同一份名单撤一次，会把锁释放后新记下的排队改名当成已删除
+                drop_deleted=False,
             )
         except Exception as exc:  # noqa: BLE001 - 补录各段互不连累
             logger.error("visit recovery: rename reconciliation failed: %r", exc)
