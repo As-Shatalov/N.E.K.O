@@ -548,3 +548,62 @@ async def test_concurrent_same_visit_writes_once(env):
     results = await asyncio.gather(_facts(env, ["在邻居家看了星星"]), _facts(env, ["在邻居家看了星星"]))
     assert sorted(r.get("duplicate", False) for r in results) == [False, True]
     assert len([r for r in _pool(env) if r.get("visit_id") == VISIT]) == 1
+
+
+# ── 评审第 1 轮 ──────────────────────────────────────────────────────────
+
+
+async def test_a_retired_key_writes_neither_store(env):
+    # 云存档连 time_indexed.db 一起回滚、退役旁路记着本键：不把恢复掉的日记补回时间索引
+    await _set_pending(env)
+    recent_file.write_recent_payload(env.recent_path, messages_to_dict([_keyed_entry("d", KEY)]))
+    recent_file.write_recent_payload(env.recent_path, [])
+    env.recent.user_histories.clear()
+    status, body = await _cache(env, _diary_request())
+    assert body["duplicate"] is True and env.tsdb.stores == 0 and _keyed(env) == []
+    assert (await _key_record())["state"] == "done"
+
+
+async def test_a_done_key_with_other_content_is_refused(env):
+    await _cache(env, _diary_request())
+    status, body = await _cache(env, _diary_request("改过的日记"))
+    assert status == 422 and len(_keyed(env)) == 1
+
+
+def test_periodic_extraction_skips_keyed_diaries():
+    from app.memory_server.rows import _extract_role_tagged_messages_from_rows
+
+    diary = messages_to_dict([_keyed_entry("今天去了邻居家，她说她住在三号楼", KEY)])[0]
+    rows = [
+        (1, "s", json.dumps({"type": "human", "data": {"content": "回来啦"}})),
+        (2, "s", json.dumps(diary, ensure_ascii=False)),
+        (3, "s", json.dumps({"type": "ai", "data": {"content": "嗯"}})),
+    ]
+    out = _extract_role_tagged_messages_from_rows(rows)
+    assert [m["data"]["content"] for m in out] == ["回来啦", "嗯"]
+
+
+async def test_strict_load_counts_an_interrupted_archive_row_once(env):
+    from app.memory_server import idempotency
+
+    await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
+    active = Path(env.fs._facts_path(NAME))
+    Path(env.fs._facts_archive_path(NAME)).write_text(active.read_text(encoding="utf-8"), encoding="utf-8")
+    assert len([r for r in _pool(env) if r.get("visit_id") == VISIT]) == 2
+    data = json.loads(Path(idempotency.keys_path(NAME)).read_text(encoding="utf-8"))
+    data[f"visit-facts:{VISIT}"] = {"state": "pending", "written_at": 1.0}
+    Path(idempotency.keys_path(NAME)).write_text(json.dumps(data), encoding="utf-8")
+    assert (await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"]))["written"] == 2
+
+
+async def test_visit_facts_skip_semantic_arbitration(env, monkeypatch):
+    seen = {}
+    real = env.fs._apersist_new_facts
+
+    async def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(env.fs, "_apersist_new_facts", spy)
+    await _facts(env, ["在邻居家看了星星"])
+    assert seen["semantic_dedup"] is False

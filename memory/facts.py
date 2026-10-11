@@ -601,7 +601,9 @@ class FactStore:
         For keyed writes deciding "was this already written": the lenient
         :meth:`load_facts` caches an unreadable active pool as empty (a later
         save would erase it) and :meth:`load_facts_full` reads an unreadable
-        archive as absent. Nothing is cached. Absent files read as empty.
+        archive as absent. Nothing is cached. Absent files read as empty; a
+        row present in both files (an interrupted archive commit) counts once,
+        as in :meth:`load_facts_full`.
         """
         from utils.file_utils import read_json_tolerating_replace
 
@@ -609,7 +611,8 @@ class FactStore:
         paths = [self._facts_path(name)]
         if include_archive:
             paths.append(self._facts_archive_path(name))
-        for path in paths:
+        active_ids: set = set()
+        for index, path in enumerate(paths):
             if not os.path.exists(path):
                 continue
             try:
@@ -618,7 +621,17 @@ class FactStore:
                 raise RuntimeError(f"{os.path.basename(path)} of {name!r} unreadable: {e}") from e
             if not isinstance(data, list):
                 raise RuntimeError(f"{os.path.basename(path)} of {name!r} is not a list")
-            rows.extend(row for row in data if isinstance(row, dict))
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                fid = _readable_fact_id(row)
+                if index == 0:
+                    if fid is not None:
+                        active_ids.add(fid)
+                elif fid is not None and fid in active_ids:
+                    # 与 load_facts_full 同一规则：归档两文件提交被打断时同一行在两边，以活跃池那份为准
+                    continue
+                rows.append(row)
         return rows
 
     async def aload_facts_strict(self, name: str, *, include_archive: bool = False) -> list[dict]:

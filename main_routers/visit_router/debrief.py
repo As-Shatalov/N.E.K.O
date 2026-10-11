@@ -290,6 +290,8 @@ router = APIRouter()
 
 _locks: "weakref.WeakValueDictionary[tuple[int, str], asyncio.Lock]" = weakref.WeakValueDictionary()
 _timers: dict[str, asyncio.Task] = {}
+_running: set[asyncio.Task] = set()
+_timer_epoch = 0
 
 _now = time.time
 """Wall clock of the retry schedule (``debrief_retry.next_at`` survives restarts); tests replace it."""
@@ -470,16 +472,23 @@ def _host(own_char: str):
     return ManagerHost.for_character(own_char)
 
 
-async def _send(own_char: str, frame: dict) -> bool:
+async def _owner_signed_in(owner: str) -> bool:
+    from main_routers.visit_router.accounts import own_visit_uid
+
+    # 按社区账号分区：别的账号登录着时不把这一场的内容推给页面（等那个账号回来 bind 时重放）
+    return await own_visit_uid() == owner
+
+
+async def _send(own_char: str, owner: str, frame: dict) -> bool:
     host = _host(own_char)
-    if host is None:
+    if host is None or not await _owner_signed_in(owner):
         return False
     return await host.send_frame(frame)
 
 
-async def _render(own_char: str, blocks: list[dict], request_id: str) -> bool:
+async def _render(own_char: str, owner: str, blocks: list[dict], request_id: str) -> bool:
     host = _host(own_char)
-    if host is None:
+    if host is None or not await _owner_signed_in(owner):
         return False
     try:
         return bool(await host.render_chat_blocks(blocks, request_id=request_id, source_name=own_char))
@@ -523,8 +532,14 @@ def _cancel_timer(visit_id: str) -> None:
         task.cancel()
 
 
-def schedule_commit_retry(visit_id: str, next_at: float) -> None:
-    """(Re)arm the one in-process retry of a ``committing:diary`` visit at wall time ``next_at``."""
+def schedule_commit_retry(visit_id: str, next_at: float, *, epoch: Optional[int] = None) -> None:
+    """(Re)arm the one in-process retry of a ``committing:diary`` visit at wall time ``next_at``.
+
+    ``epoch`` (from a commit that started earlier): when :func:`cancel_commit_timers`
+    ran since, nothing is armed -- the background was stopped meanwhile.
+    """
+    if epoch is not None and epoch != _timer_epoch:
+        return
     _cancel_timer(visit_id)
     task = asyncio.ensure_future(_retry_at(visit_id, float(next_at)))
     _timers[visit_id] = task
@@ -535,20 +550,30 @@ async def _retry_at(visit_id: str, next_at: float) -> None:
         await _sleep(max(0.0, next_at - _now()))
     except asyncio.CancelledError:
         return
-    if _timers.get(visit_id) is asyncio.current_task():
+    me = asyncio.current_task()
+    if _timers.get(visit_id) is me:
         # 先摘掉自己：这次再暂时失败会登记下一次定时，不能把正在跑的自己取消掉
         del _timers[visit_id]
+    _running.add(me)
     try:
         await run_commit(visit_id, "timer")
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - state.json 读不出等：下次启动补录再排
         logger.warning("visit %s: diary retry failed: %r", visit_id[:6], exc)
+    finally:
+        _running.discard(me)
 
 
 def cancel_commit_timers() -> list[asyncio.Task]:
-    """Cancel every pending diary retry (shutdown / startup rollback); returns the tasks."""
-    tasks = list(_timers.values())
+    """Cancel every pending or running diary retry (shutdown / startup rollback); returns the tasks.
+
+    Bumps the timer epoch, so a commit already past its request does not arm
+    a new retry afterwards.
+    """
+    global _timer_epoch
+    _timer_epoch += 1
+    tasks = list(_timers.values()) + list(_running)
     _timers.clear()
     for task in tasks:
         if not task.done():
@@ -591,6 +616,7 @@ async def _run_commit_locked(visit_id: str, trigger: str) -> tuple[int, dict]:
     from config.visit_settings import VISIT_DEBRIEF_COMMIT_BACKOFF_S
     from main_logic.visit import debrief_writers
 
+    epoch = _timer_epoch
     spool = _spool(visit_id)
     state = await spool.read_state()
     if state is None:
@@ -616,10 +642,10 @@ async def _run_commit_locked(visit_id: str, trigger: str) -> tuple[int, dict]:
                                  debrief_chip_pending=False)
         _cancel_timer(visit_id)
         await spool.delete_if_settled()
-        await _send(own_char, _state_frame(visit_id, "chosen", preview_request_id(visit_id), choice="diary"))
+        await _send(own_char, state["own_uid"], _state_frame(visit_id, "chosen", preview_request_id(visit_id), choice="diary"))
         if trigger != "http":
             # 发起页自己追加状态；后台补完时没有发起页，单独发一条
-            await _render(own_char, [{"type": "status", "tone": "success", "text": t("savedDiary", lang)}],
+            await _render(own_char, state["own_uid"], [{"type": "status", "tone": "success", "text": t("savedDiary", lang)}],
                           f"visit-debrief-done:{visit_id}")
         return 200, {"ok": True, "applied": "diary"}
     if result.kind == "transient":
@@ -628,7 +654,7 @@ async def _run_commit_locked(visit_id: str, trigger: str) -> tuple[int, dict]:
         delay = VISIT_DEBRIEF_COMMIT_BACKOFF_S[min(attempts, len(VISIT_DEBRIEF_COMMIT_BACKOFF_S)) - 1]
         next_at = _now() + delay
         await spool.update_state(debrief_retry={"attempts": attempts, "next_at": next_at})
-        schedule_commit_retry(visit_id, next_at)
+        schedule_commit_retry(visit_id, next_at, epoch=epoch)
         logger.warning("visit %s: diary write step %s not done (status %s); retry %d in %ds",
                        visit_id[:6], result.step, result.status, attempts, delay)
         return 503, {"retry": True, "next_retry_at": next_at}
@@ -641,8 +667,8 @@ async def _run_commit_locked(visit_id: str, trigger: str) -> tuple[int, dict]:
     _cancel_timer(visit_id)
     logger.warning("visit %s: diary write step %s rejected (status %s); waiting for the user",
                    visit_id[:6], result.step, result.status)
-    await _send(own_char, commit_failed_frame(state))
-    await _render(own_char, failed_blocks(visit_id, state, lang), failed_request_id(visit_id, seq))
+    await _send(own_char, state["own_uid"], commit_failed_frame(state))
+    await _render(own_char, state["own_uid"], failed_blocks(visit_id, state, lang), failed_request_id(visit_id, seq))
     return 502, {"error": "commit_failed", "step": result.step, "status": int(result.status),
                  "written": written_of(state["debrief_writes"]),
                  "unconfirmed": unconfirmed_of(state["debrief_writes"])}
@@ -689,7 +715,7 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
                 from main_logic.visit.debrief_writers import write_forget
 
                 await write_forget(spool)
-                await _send(own_char, _state_frame(visit_id, "chosen", chips_request_id(visit_id), choice="forget"))
+                await _send(own_char, state["own_uid"], _state_frame(visit_id, "chosen", chips_request_id(visit_id), choice="forget"))
                 return 200, {"ok": True, "applied": "forget"}
             return _already_chosen(state)
         if choice == "abandon":
@@ -705,7 +731,7 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
             unconfirmed = unconfirmed_of(state["debrief_writes"])
             await write_forget(spool, final_choice="abandoned")
             _cancel_timer(visit_id)
-            await _send(own_char, _state_frame(visit_id, "chosen", failed_request_id(visit_id, seq),
+            await _send(own_char, state["own_uid"], _state_frame(visit_id, "chosen", failed_request_id(visit_id, seq),
                                                choice="abandoned", written=written, unconfirmed=unconfirmed))
             return 200, {"ok": True, "applied": "abandoned", "written": written, "unconfirmed": unconfirmed}
         # confirm
@@ -720,12 +746,13 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
         elif current != "committing:diary":
             return _not_committing(state)
         _cancel_timer(visit_id)
-        await _send(own_char, committing_frame(state))
+        await _send(own_char, state["own_uid"], committing_frame(state))
         return await _run_commit_locked(visit_id, "http")
 
 
 async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> tuple[int, dict]:
     from main_logic.visit import debrief_writers
+    from main_routers.visit_router.accounts import own_visit_uid
 
     visit_id = spool.visit_id
     current = state["debrief_choice"]
@@ -747,9 +774,12 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     pending = preview.to_pending()
     # 预览、状态与待投递标记一次原子写：之后 bind 重放的就是这一份
     await spool.update_state(debrief_pending=pending, debrief_choice="preview:diary", debrief_chip_pending=True)
+    if await own_visit_uid() != state["own_uid"]:
+        # 生成期间登出 / 换了账号：预览已落盘、等那个账号回来 bind 时重放，不推给现在这一页、也不回给它
+        return 404, {"error": "unknown_or_expired"}
     lang = _lang()
-    await _render(own_char, preview_blocks(visit_id, pending, lang), preview_request_id(visit_id))
-    await _send(own_char, _state_frame(visit_id, "preview", preview_request_id(visit_id)))
+    await _render(own_char, state["own_uid"], preview_blocks(visit_id, pending, lang), preview_request_id(visit_id))
+    await _send(own_char, state["own_uid"], _state_frame(visit_id, "preview", preview_request_id(visit_id)))
     return 200, {"ok": True, "applied": "preview", "preview": pending}
 
 

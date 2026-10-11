@@ -1275,10 +1275,11 @@ async def _cache_keyed(lanlan_name: str, raw_history: str, input_history: list, 
     anything is stored and ``done`` only after both stores confirmed: first
     ``time_indexed.db`` (rows under a session id derived from the key), then
     ``recent.json`` (entries carry the key in their metadata). A retry of a
-    key that is not ``done`` decides from the stores themselves: no time-index
-    row means neither was written (recent is written second); with the row,
-    the recent entry or its retired-key record proves the second step, else
-    only recent is written. Unconfirmed writes answer 503 and leave the key
+    key that is not ``done`` decides from the stores themselves: a recent
+    entry or retired-key record carrying the key proves it was written (then
+    nothing is written); otherwise the time-index row is written unless
+    present, then recent. A different payload under the same key is refused
+    (422), even once ``done``. Unconfirmed writes answer 503 and leave the key
     ``pending``. Post-turn signals are never registered for keyed writes.
     Errors are returned, never raised: the caller's ``except`` turns anything
     raised into a 200 ``status:'error'``.
@@ -1300,28 +1301,35 @@ async def _cache_keyed(lanlan_name: str, raw_history: str, input_history: list, 
             record = await idempotency.read_key(lanlan_name, key)
         except (idempotency.IdempotencyStateError, OSError):
             return _keyed_unconfirmed("idempotency state unreadable; retry later")
-        if record is not None and record.get("state") in idempotency.TERMINAL_KEY_STATES:
-            return {"status": "cached", "duplicate": True, "count": 0}
         stored_hash = record.get("content_hash") if record is not None else None
         if stored_hash is not None and stored_hash != content_hash:
-            # 同一场的日记只有一份（客户端重试用落盘的同一份正文）：内容变了是调用方的错，不是可重试的失败
+            # 同一场的日记只有一份（客户端重试用落盘的同一份正文）：内容变了是调用方的错，不是可重试的失败；
+            # 已 done 也一样，不能把没存进去的新内容报成已缓存
             return JSONResponse({"status": "error", "message": "idempotency_key reused with different content"},
                                 status_code=422)
+        if record is not None and record.get("state") in idempotency.TERMINAL_KEY_STATES:
+            return {"status": "cached", "duplicate": True, "count": 0}
         try:
             await idempotency.update_key(
                 lanlan_name, key,
                 idempotency.transition(idempotency.KEY_STATE_PENDING, content_hash=content_hash, kind="cache"),
             )
             async with runtime._get_settle_lock(lanlan_name):
-                had_row = await runtime.time_manager.ahas_conversation(session_id, lanlan_name)
-                if not had_row:
-                    await runtime.time_manager.astore_conversation_strict(session_id, input_history, lanlan_name)
-                outcome = await runtime.recent_history_manager.append_keyed(input_history, lanlan_name, key)
+                # recent 里已有本键条目、或它已被移出（退役旁路）：写过的正面证据，两处都不再写——
+                # 云存档恢复连 time_indexed.db 一起回滚时，也不把用户恢复掉的日记补回时间索引
+                outcome = await runtime.recent_history_manager.keyed_state(lanlan_name, key)
+                if outcome == "absent":
+                    had_row = await runtime.time_manager.ahas_conversation(session_id, lanlan_name)
+                    if not had_row:
+                        await runtime.time_manager.astore_conversation_strict(
+                            session_id, input_history, lanlan_name,
+                        )
+                    outcome = await runtime.recent_history_manager.append_keyed(input_history, lanlan_name, key)
             await idempotency.update_key(lanlan_name, key, idempotency.transition(idempotency.KEY_STATE_DONE))
         except Exception as exc:  # noqa: BLE001 - 任一处没确认落盘：键留 pending，503 让调用方重试
             logger.warning(f"[MemoryServer] keyed cache {lanlan_name}: not confirmed: {exc!r}")
             return _keyed_unconfirmed("keyed write not confirmed; retry later")
-    if had_row and outcome != "written":
+    if outcome != "written":
         return {"status": "cached", "duplicate": True, "count": 0}
     logger.info(f"[MemoryServer] cache: {lanlan_name} keyed +{len(input_history)} 条消息")
     return {"status": "cached", "count": len(input_history)}
@@ -1345,7 +1353,9 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
     every new fact ``source='ai_disclosure'``, ``importance=4``,
     ``absorbed=True``, ``origin='neko_visit'`` and ``visit_id`` (callers
     cannot override them), so reflection never synthesizes them while recall
-    still finds them; exact and semantic dedup apply as usual. A key left
+    still finds them; only exact dedup applies (a semantic near-duplicate
+    would go to arbitration, whose ``replace`` could archive the user's own
+    fact in favour of a visit fact). A key left
     ``pending`` (crash after the facts were saved) is settled by counting the
     visit's facts in the active and archived pools, read strictly: either
     file unreadable answers 503 and writes nothing. An empty list is a no-op
@@ -1410,6 +1420,9 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
                     lanlan_name,
                     extracted,
                     default_source="ai_disclosure",
+                    # 只做精确去重：语义近重复会进仲裁，仲裁的 replace 可能把用户自己的事实归档、
+                    # 换成邻居家的串门事实
+                    semantic_dedup=False,
                     effect_keys=[idempotency.effect_key_for(key, i) for i in range(len(extracted))],
                 )
             written = len(created)

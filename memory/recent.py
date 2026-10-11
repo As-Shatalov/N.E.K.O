@@ -1677,6 +1677,32 @@ class CompressedRecentHistoryManager:
             self._cache_history_view(file_path, lanlan_name, merged)
             return 'written'
 
+    def _keyed_state_locked(self, file_path, lanlan_name, key, expected_generation=None) -> str:
+        with recent_file.recent_file_access(
+            file_path, expected_generation=expected_generation,
+        ) as file_path:
+            status, history = self._load_history_unlocked(file_path, lanlan_name)
+            if status == RECENT_READ_UNREADABLE:
+                raise RuntimeError(f"recent history of {lanlan_name!r} unreadable")
+            pending = recent_file.get_recent_pending_unlocked(file_path)
+            if key in recent_file.keyed_entry_keys(messages_to_dict(list(history) + list(pending))):
+                return 'present'
+            if key in recent_file.read_retired_keys_unlocked(file_path):
+                return 'retired'
+            return 'absent'
+
+    async def keyed_state(self, lanlan_name, key: str) -> str:
+        """``'present'`` / ``'retired'`` / ``'absent'`` for ``key`` in this character's recent file; never writes.
+
+        Raises when the file or its retired-key sidecar cannot be read.
+        """
+        file_path, admission_generation = self._capture_recent_operation_admission(
+            lanlan_name,
+        )
+        return await asyncio.to_thread(
+            self._keyed_state_locked, file_path, lanlan_name, key, admission_generation,
+        )
+
     async def append_keyed(self, new_messages, lanlan_name, key: str) -> str:
         """Append a keyed batch unless ``key`` already is (or was) in this character's recent file.
 

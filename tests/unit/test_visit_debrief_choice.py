@@ -677,13 +677,12 @@ def test_payload_parsing():
 
 
 async def test_the_endpoint_works_with_the_release_switch_off(env, monkeypatch):
-    import config.visit_settings as visit_settings
     from fastapi import FastAPI
 
     from main_routers import visit_router
     from main_routers.system_router import AUTOSTART_CSRF_TOKEN
 
-    monkeypatch.setattr(visit_settings, "VISIT_ENABLED", False)
+    monkeypatch.setattr("config.visit_settings.VISIT_ENABLED", False)
     app = FastAPI()
     app.include_router(visit_router.router)
     await visit(env)
@@ -704,3 +703,71 @@ async def test_the_endpoint_works_with_the_release_switch_off(env, monkeypatch):
 
 async def test_the_retry_backoff_constant_is_the_owner_schedule():
     assert tuple(VISIT_DEBRIEF_COMMIT_BACKOFF_S) == (30, 120, 600, 3600)
+
+
+# ── 评审第 1 轮 ──────────────────────────────────────────────────────────
+
+
+async def test_an_account_switch_during_generation_hides_the_preview(env):
+    await visit(env)
+
+    async def switch(prompt):
+        env.account = OWN_B
+        return GOOD_REPLY
+
+    env.llm = switch
+    assert await choose("diary") == (404, {"error": "unknown_or_expired"})
+    assert env.host.blocks == [] and env.host.frames == []
+    # 预览已落盘：原账号回来 bind 时重放
+    assert (await state_of(env=env))["debrief_choice"] == "preview:diary"
+
+
+async def test_background_results_are_not_pushed_to_another_account(env):
+    await visit(env)
+    await preview(env)
+    env.memory.script["cache"] = [(503, {}), (422, {})]
+    await choose("confirm")
+    env.account = OWN_B
+    pushed = len(env.host.blocks), len(env.host.frames)
+    env.clock.now += 30
+    await fire(env)
+    assert (await state_of(env=env))["debrief_choice"] == "commit_failed:diary"
+    assert (len(env.host.blocks), len(env.host.frames)) == pushed
+
+
+async def test_stopping_cancels_a_retry_that_is_already_running(env):
+    await visit(env)
+    await preview(env)
+    env.memory.script["cache"] = [(503, {}), (503, {})]
+    await choose("confirm")
+    gate = asyncio.Event()
+    reached = asyncio.Event()
+    real = env.memory.handler
+
+    def slow(request):
+        reached.set()
+        return real(request)
+
+    async def handler(request):
+        response = slow(request)
+        await gate.wait()
+        return response
+
+    import httpx as _httpx
+
+    client = _httpx.AsyncClient(transport=_httpx.MockTransport(handler))
+    import utils.http.internal_client as internal
+
+    original = internal.get_internal_http_client
+    internal.get_internal_http_client = lambda: client
+    try:
+        await armed(env)
+        env.sleeps[-1][1].set()
+        await asyncio.wait_for(reached.wait(), 5)
+        stopped = debrief.cancel_commit_timers()
+        assert stopped, "the running retry must be handed to the caller"
+        gate.set()
+        await asyncio.gather(*stopped, return_exceptions=True)
+    finally:
+        internal.get_internal_http_client = original
+    assert debrief.pending_commit_retries() == {}
