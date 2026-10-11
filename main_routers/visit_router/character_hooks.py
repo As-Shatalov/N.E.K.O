@@ -118,8 +118,11 @@ async def name_blocked(config_manager: Any, name: str) -> bool:
     return await name_block_reason(config_manager, name) is not None
 
 
-async def name_block_reason(config_manager: Any, name: str) -> str | None:
-    """Why ``name`` may not be taken yet (``NAME_BUSY`` / ``NAME_AMBIGUOUS``), ``None`` when it may.
+async def name_block_reason(config_manager: Any, name: str) -> tuple[str, frozenset[str]] | None:
+    """Why ``name`` may not be taken yet, ``None`` when it may.
+
+    ``(NAME_BUSY, frozenset())`` or ``(NAME_AMBIGUOUS, {old, new})`` with the
+    two names of the rename that can never be reconciled.
 
     Taken while a deleted character of that name is still being retired, or
     while it is the old or new name of an unreconciled rename (a new
@@ -129,8 +132,8 @@ async def name_block_reason(config_manager: Any, name: str) -> str | None:
     clears without a restart). An unreadable roster blocks nothing. A rename
     that is ambiguous for good keeps blocking (an overwrite would replace the
     character's identity, and recovery could then never retire its data) and
-    answers ``NAME_AMBIGUOUS``, so the user can be told to delete one of the
-    two characters instead of retrying.
+    answers ``NAME_AMBIGUOUS``, so the user can be told which two characters
+    to choose between instead of retrying.
     """
     config_dir = _config_dir(config_manager)
     if config_dir is None:
@@ -141,7 +144,7 @@ async def name_block_reason(config_manager: Any, name: str) -> str | None:
             await char_lifecycle.replay_retires(config_dir, names_loader(config_manager), retire_persona=retire_persona)
         except Exception as exc:  # noqa: BLE001 - 重试失败按「仍在退役」处理：409 / 跳过这张卡，不能变成 500
             logger.warning("visit retire: retry before reusing name %r failed: %r", name, exc)
-            return NAME_BUSY
+            return NAME_BUSY, frozenset()
         state = await char_lifecycle.name_marker_state(config_dir, name)
     if state == char_lifecycle.NAME_RENAMING:
         try:
@@ -150,9 +153,12 @@ async def name_block_reason(config_manager: Any, name: str) -> str | None:
         except Exception as exc:  # noqa: BLE001 - 对不完账就挡住这个名字，标记留给启动对账
             logger.warning("visit rename: pending_rename not reconciled before reusing %r: %r", name, exc)
         else:
-            if unsettled:
+            # 显式判断：ALL_NAMES（读不出）是另一个哨兵，不能被当成「请删除角色」
+            if isinstance(unsettled, frozenset) and unsettled:
                 # 永久 ambiguous（另一个名字已被别的角色占着）：重试也解不开，只有删掉其中一个角色才行
                 logger.warning("visit rename: ambiguous pending_rename holds %r", name)
-                return NAME_AMBIGUOUS
+                return NAME_AMBIGUOUS, unsettled
         state = await char_lifecycle.name_marker_state(config_dir, name)
-    return NAME_BUSY if state in (char_lifecycle.NAME_RETIRING, char_lifecycle.NAME_RENAMING) else None
+    if state in (char_lifecycle.NAME_RETIRING, char_lifecycle.NAME_RENAMING):
+        return NAME_BUSY, frozenset()
+    return None

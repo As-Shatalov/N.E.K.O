@@ -483,6 +483,11 @@ def _set_marker_sync(path: Path, key: str, value: Any) -> tuple[bool, Any]:
         return True, None
 
 
+def set_roster_marker_sync(config_dir: str | Path, key: str, value: Any) -> tuple[bool, Any]:
+    """Blocking :func:`set_roster_marker`, for callers already off the event loop (a startup import thread)."""
+    return _set_marker_sync(Path(config_dir) / VISIT_PEERS_FILENAME, key, value)
+
+
 async def set_roster_marker(config_dir: str | Path, key: str, value: Any) -> tuple[bool, Any]:
     """Atomically store the top-level ``key`` unless it already holds a non-null value.
 

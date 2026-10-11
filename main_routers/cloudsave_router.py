@@ -342,16 +342,19 @@ async def _visit_name_refusal(config_manager, name: str):
     """
     from main_routers.visit_router import character_hooks
 
-    reason = await character_hooks.name_block_reason(config_manager, name)
-    if reason is None:
+    blocked = await character_hooks.name_block_reason(config_manager, name)
+    if blocked is None:
         return None
+    reason, names = blocked
     if reason == character_hooks.NAME_AMBIGUOUS:
+        other = next((n for n in sorted(names) if n != name), name)
         return _cloudsave_error_response(
             "VISIT_DATA_AMBIGUOUS",
-            "This character's visit data from an unfinished rename cannot be separated automatically, because "
-            "its old name is now used by another character. Delete one of the two characters, then download again.",
+            "An unfinished rename between this character and another one left their visit data impossible to "
+            "separate automatically. Delete one of the two characters, then download again.",
             status_code=409,
             character_name=name,
+            message_params={"first": name, "second": other},
         )
     return _cloudsave_error_response(
         "VISIT_DATA_BUSY",

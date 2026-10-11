@@ -153,7 +153,7 @@
         },
         VISIT_DATA_AMBIGUOUS: {
             key: 'cloudsave.error.visitDataAmbiguous',
-            fallback: "This character's visit data from an unfinished rename cannot be separated automatically, because its old name is now used by another character. Delete one of the two characters, then download again.",
+            fallback: 'An unfinished rename between "{{first}}" and "{{second}}" left their visit data impossible to separate automatically. Delete one of the two characters, then download again.',
         },
         CLOUD_CHARACTER_EXISTS: {
             key: 'cloudsave.error.cloudCharacterExists',

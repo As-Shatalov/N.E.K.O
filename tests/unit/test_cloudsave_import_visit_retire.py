@@ -77,14 +77,14 @@ def test_full_snapshot_reports_the_removed_character_before_committing(pair):
     _stage_full_snapshot(source_cm, target_cm)
     seen = []
 
-    def record(removed, kept_local_names):
+    def record(removed, kept_local_names, renamed):
         # 先于删除落盘：这时 characters.json 里还是本地角色
-        seen.append((removed, kept_local_names, _names_on_disk(target_cm)))
+        seen.append((removed, kept_local_names, renamed, _names_on_disk(target_cm)))
 
     result = CloudSaveManager(target_cm).import_if_needed(reason="unit", force=True, on_characters_removed=record)
     assert result["action"] == "imported"
     # 云端角色是快照新带来的，不算「保留下来的本地角色」
-    assert seen == [([{"name": "本地角色", "character_uid": uid}], frozenset(), {"本地角色"})]
+    assert seen == [([{"name": "本地角色", "character_uid": uid}], frozenset(), [], {"本地角色"})]
     assert _names_on_disk(target_cm) == {"云端角色"}
 
 
@@ -94,7 +94,7 @@ def test_import_without_removals_does_not_call_back(pair):
     export_cloudsave_character_unit(source_cm, "云端角色")
     shutil.copytree(source_cm.cloudsave_dir, target_cm.cloudsave_dir, dirs_exist_ok=True)
     seen = []
-    import_local_cloudsave_snapshot(target_cm, on_characters_removed=lambda removed, _kept: seen.append(removed))
+    import_local_cloudsave_snapshot(target_cm, on_characters_removed=lambda removed, _kept, _renamed: seen.append(removed))
     assert seen == []
     assert {"本地角色", "云端角色"} <= _names_on_disk(target_cm)
 
@@ -103,7 +103,7 @@ def test_a_failing_callback_does_not_stop_the_import(pair):
     source_cm, target_cm = pair
     _stage_full_snapshot(source_cm, target_cm)
 
-    def broken(_removed, _kept_local_names):
+    def broken(_removed, _kept_local_names, _renamed):
         raise OSError("visit_peers.json locked")
 
     import_local_cloudsave_snapshot(target_cm, on_characters_removed=broken)
@@ -146,14 +146,19 @@ def test_recorder_needs_a_real_config_dir():
 def test_removed_characters_come_from_the_runtime_file_only(pair, tmp_path):
     _source_cm, target_cm = pair
     uid = _local_uid(target_cm)
-    nothing = ([], frozenset())
+    nothing = ([], frozenset(), [])
     assert operations._removed_local_characters(target_cm, {}) == (
-        [{"name": "本地角色", "character_uid": uid}], frozenset(),
+        [{"name": "本地角色", "character_uid": uid}], frozenset(), [],
     )
-    # 同一个 uid 在快照里换了名字：是改名不是删除
+    # 同一个 uid 在快照里换了名字：是改名不是删除，报给回调去迁移串门数据
     renamed = {"新名字": {"_reserved": {"character_uid": uid}}}
-    assert operations._removed_local_characters(target_cm, renamed) == nothing
-    assert operations._removed_local_characters(target_cm, {"本地角色": {}}) == ([], frozenset({"本地角色"}))
+    assert operations._removed_local_characters(target_cm, renamed) == (
+        [], frozenset(), [{"old": "本地角色", "new": "新名字", "uid": uid}],
+    )
+    # 旧名又给了快照里另一个角色：两边数据分不开，不报改名（变异：照报必红）
+    reused = {"本地角色": {"_reserved": {"character_uid": "d" * 32}}, "新名字": {"_reserved": {"character_uid": uid}}}
+    assert operations._removed_local_characters(target_cm, reused) == ([], frozenset({"本地角色"}), [])
+    assert operations._removed_local_characters(target_cm, {"本地角色": {}}) == ([], frozenset({"本地角色"}), [])
     # 文件读不出：什么都不报（变异：退回 load_characters 的默认角色必红）
     path = Path(target_cm.get_runtime_config_path("characters.json"))
     path.write_text("{broken", encoding="utf-8")
@@ -228,3 +233,88 @@ def test_the_other_rename_name_is_not_retired_when_another_local_character_holds
     assert lc.record_removed_characters_sync(tmp_path, removed, frozenset({"Old"})) == 1
     peers = json.loads((tmp_path / "visit_peers.json").read_text(encoding="utf-8"))
     assert peers["pending_retire"] == [lc.retire_item("New", uid)]
+
+
+# ── 快照里同一个 uid 换了名字（另一台设备上改过名） ──────────────────
+
+
+def _stage_renamed_snapshot(tmp_path, target_name="本地角色", new_name="新名字"):
+    """``(target_cm, uid)``: the target holds ``target_name``; the staged full snapshot holds it as ``new_name``."""
+    source_cm = _make_config_manager(tmp_path / "source")
+    target_cm = _make_config_manager(tmp_path / "target")
+    bootstrap_local_cloudsave_environment(source_cm)
+    bootstrap_local_cloudsave_environment(target_cm)
+    _write_runtime_state(target_cm, character_name=target_name)
+    target_cm.backfill_character_uids()
+    uid = _local_uid(target_cm) if target_name == "本地角色" else get_character_uid(
+        target_cm.load_characters()["猫娘"][target_name])
+    _write_runtime_state(source_cm, character_name=new_name)
+    characters = source_cm.load_characters()
+    characters["猫娘"][new_name].setdefault("_reserved", {})["character_uid"] = uid
+    source_cm.save_characters(characters, bypass_write_fence=True)
+    _stage_full_snapshot(source_cm, target_cm)
+    return target_cm, uid
+
+
+async def test_a_snapshot_rename_moves_the_visit_data_to_the_new_name(tmp_path):
+    from main_logic.visit.spool import VisitSpool
+    from tests.unit.visit_memory_test_helpers import PEER_X, ln, make_visit, vid
+
+    target_cm, uid = _stage_renamed_snapshot(tmp_path)
+    config_dir = Path(target_cm.config_dir)
+    roster = await seed_roster(config_dir, own_char="本地角色")
+    await make_visit(config_dir, vid(1), [ln(1)], own_char="本地角色", own_char_uid=uid)
+    import_local_cloudsave_snapshot(target_cm, on_characters_removed=removed_characters_recorder(target_cm))
+    peers = json.loads((config_dir / "visit_peers.json").read_text(encoding="utf-8"))
+    # 变异：不记改名必红（旧名下的对端没人迁，以后同名新角色会继承）
+    assert peers["pending_rename"] == {"old": "本地角色", "new": "新名字", "uid": uid}
+    assert "pending_retire" not in peers
+    # 启动对账按 uid 正向迁移
+    assert await lc.reconcile_rename(config_dir, {"新名字"}, {"新名字": uid}) == frozenset()
+    assert await roster.get_char_entry(PEER_X, "本地角色") is None
+    assert await roster.get_char_entry(PEER_X, "新名字") is not None
+    assert (await VisitSpool(config_dir, vid(1)).read_state())["own_char"] == "新名字"
+
+
+async def test_a_snapshot_rename_that_rolled_back_leaves_the_data_under_the_old_name(tmp_path):
+    from tests.unit.visit_memory_test_helpers import PEER_X
+
+    target_cm, uid = _stage_renamed_snapshot(tmp_path)
+    config_dir = Path(target_cm.config_dir)
+    roster = await seed_roster(config_dir, own_char="本地角色")
+    lc.record_renamed_characters_sync(config_dir, [{"old": "本地角色", "new": "新名字", "uid": uid}])
+    # 导入回滚：这个 uid 仍叫本地角色
+    assert await lc.reconcile_rename(config_dir, {"本地角色"}, {"本地角色": uid}) == frozenset()
+    assert await roster.get_char_entry(PEER_X, "本地角色") is not None
+    assert await roster.get_char_entry(PEER_X, "新名字") is None
+    assert "pending_rename" not in json.loads((config_dir / "visit_peers.json").read_text(encoding="utf-8"))
+
+
+def test_a_snapshot_rename_without_visit_data_writes_nothing(tmp_path):
+    target_cm, _uid = _stage_renamed_snapshot(tmp_path)
+    import_local_cloudsave_snapshot(target_cm, on_characters_removed=removed_characters_recorder(target_cm))
+    assert not (Path(target_cm.config_dir) / "visit_peers.json").exists()
+
+
+async def test_a_snapshot_rename_keeps_an_earlier_pending_rename(tmp_path):
+    from main_logic.visit.subjects import set_roster_marker
+
+    config_dir = tmp_path
+    earlier = {"old": "X", "new": "Y", "uid": "e" * 32}
+    await set_roster_marker(config_dir, "pending_rename", earlier)
+    # 标记只有一个位置：已有一笔没对完账的改名时不覆盖（变异：覆盖必红）
+    assert lc.record_renamed_characters_sync(config_dir, [{"old": "A", "new": "C", "uid": "c" * 32}]) == 0
+    peers = json.loads((config_dir / "visit_peers.json").read_text(encoding="utf-8"))
+    assert peers["pending_rename"] == earlier
+
+
+def test_a_snapshot_rename_onto_a_name_another_local_character_held_is_not_migrated(pair):
+    _source_cm, target_cm = pair
+    uid = _local_uid(target_cm)
+    characters = target_cm.load_characters()
+    characters["猫娘"]["新名字"] = {"_reserved": {"character_uid": "d" * 32}}
+    target_cm.save_characters(characters, bypass_write_fence=True)
+    kept = {"新名字": {"_reserved": {"character_uid": uid}}}
+    # 新名字导入前属于本机另一个角色：迁过去会混进它的数据，不报改名（变异：照报必红）
+    removed, _kept_local, renamed = operations._removed_local_characters(target_cm, kept)
+    assert renamed == [] and removed == []

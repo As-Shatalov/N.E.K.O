@@ -70,6 +70,7 @@ from main_logic.visit.subjects import (
     clear_roster_marker,
     read_roster_marker,
     read_roster_marker_sync,
+    set_roster_marker_sync,
     remove_roster_marker_item,
     set_roster_marker,
 )
@@ -509,6 +510,35 @@ def record_removed_characters_sync(
         for retiring in names:
             added += bool(add_roster_marker_item_sync(config_dir, PENDING_RETIRE, retire_item(retiring, uid)))
     return added
+
+
+def record_renamed_characters_sync(config_dir: str | Path, renamed: Iterable[Mapping[str, Any]]) -> int:
+    """Write ``pending_rename`` for a character a cloudsave import keeps under another name.
+
+    Called from the import thread right before it commits, with the
+    ``{old, new, uid}`` of every local character the snapshot renamed (on
+    another device). Startup recovery then reconciles the marker by uid like
+    any rename: the roster entries and spools follow the character to its new
+    name (or stay, when the import rolled back). The marker has one slot, so
+    only the first rename is recorded when there are several, and none when
+    another rename is still pending. Machines without visit data get nothing;
+    returns the number of markers written.
+    """
+    config_dir = Path(config_dir)
+    written = 0
+    for entry in renamed:
+        old, new, uid = entry.get("old"), entry.get("new"), entry.get("uid")
+        if not all(isinstance(value, str) and value for value in (old, new, uid)) or old == new:
+            continue
+        if not _has_visit_files_sync(config_dir, uid):
+            continue
+        ok, existing = set_roster_marker_sync(config_dir, PENDING_RENAME, {"old": old, "new": new, "uid": uid})
+        if ok:
+            written += 1
+        else:
+            logger.warning("visit rename: cloudsave renamed %r to %r but pending_rename %r is still pending; "
+                           "visit data stays under the old name", old, new, existing)
+    return written
 
 
 def names_of(characters: Any) -> tuple[set[str], dict[str, str]]:

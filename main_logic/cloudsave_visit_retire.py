@@ -30,8 +30,11 @@ from typing import Any
 
 def removed_characters_recorder(
     config_manager: Any,
-) -> Callable[[list[dict[str, Any]], frozenset[str]], int] | None:
-    """The ``on_characters_removed`` callback recording ``pending_retire`` items under its ``config_dir``.
+) -> Callable[[list[dict[str, Any]], frozenset[str], list[dict[str, str]]], int] | None:
+    """The ``on_characters_removed`` callback recording the visit markers under its ``config_dir``.
+
+    ``pending_retire`` items for the removed characters, then a
+    ``pending_rename`` for a character the snapshot renamed.
 
     ``None`` for a config object without a real ``config_dir`` (``str`` /
     ``Path``; the application's ``ConfigManager`` always has one): it has no
@@ -42,9 +45,13 @@ def removed_characters_recorder(
         return None
     config_dir = Path(value)
 
-    def record(removed: list[dict[str, Any]], kept_local_names: frozenset[str]) -> int:
-        from main_logic.visit.char_lifecycle import record_removed_characters_sync
+    def record(
+        removed: list[dict[str, Any]], kept_local_names: frozenset[str], renamed: list[dict[str, str]],
+    ) -> int:
+        from main_logic.visit.char_lifecycle import record_removed_characters_sync, record_renamed_characters_sync
 
-        return record_removed_characters_sync(config_dir, removed, kept_local_names)
+        # 先记删除：它要读当前的改名标记，判断被删角色的另一个名字
+        recorded = record_removed_characters_sync(config_dir, removed, kept_local_names)
+        return recorded + record_renamed_characters_sync(config_dir, renamed)
 
     return record

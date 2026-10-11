@@ -215,16 +215,19 @@ def _runtime_characters_with_safe_master(config_manager) -> dict[str, Any]:
 
 def _removed_local_characters(
     config_manager, kept_character_map: dict[str, Any],
-) -> tuple[list[dict[str, Any]], frozenset[str]]:
+) -> tuple[list[dict[str, Any]], frozenset[str], list[dict[str, str]]]:
     """What an import does to the characters of the runtime ``characters.json``.
 
-    Returns the ``{name, character_uid}`` of every local character it drops
-    and the names of the local characters it keeps (a kept name that is new
-    from the snapshot is not among them). Read strictly from the file: a
-    missing or unreadable file (where ``load_characters`` falls back to the
-    default profiles) reports nothing, so a default name is never taken for
-    a removed character. A character whose uid is kept under another name
-    was renamed, not removed.
+    Returns the ``{name, character_uid}`` of every local character it drops,
+    the names of the local characters it keeps (a kept name that is new from
+    the snapshot is not among them) and the ``{old, new, uid}`` of every local
+    character the snapshot keeps under another name (renamed on another
+    device). Read strictly from the file: a missing or unreadable file (where
+    ``load_characters`` falls back to the default profiles) reports nothing,
+    so a default name is never taken for a removed character. A rename is not
+    reported when its new name belonged to another local character before the
+    import, or its old name is taken by another character of the snapshot:
+    the data under the two names could not be told apart.
     """
     from utils.config_manager import get_character_uid
 
@@ -232,20 +235,38 @@ def _removed_local_characters(
         with open(config_manager.get_runtime_config_path("characters.json"), "r", encoding="utf-8") as f:
             payload = json.load(f)
     except (OSError, ValueError, RecursionError):
-        return [], frozenset()
+        return [], frozenset(), []
     local_map = payload.get("猫娘") if isinstance(payload, dict) else None
     if not isinstance(local_map, dict):
-        return [], frozenset()
-    kept_uids = {get_character_uid(data) for data in kept_character_map.values() if isinstance(data, dict)}
+        return [], frozenset(), []
+    kept_name_of_uid: dict[str, str] = {}
+    for kept_name, data in kept_character_map.items():
+        uid = get_character_uid(data) if isinstance(data, dict) else None
+        if uid:
+            kept_name_of_uid.setdefault(uid, kept_name)
     removed: list[dict[str, Any]] = []
+    renamed: list[dict[str, str]] = []
     for name, data in local_map.items():
-        if not isinstance(name, str) or not name or name in kept_character_map:
+        if not isinstance(name, str) or not name:
             continue
         uid = get_character_uid(data) if isinstance(data, dict) else None
-        if uid and uid in kept_uids:
+        new_name = kept_name_of_uid.get(uid) if uid else None
+        if name in kept_character_map:
+            if new_name is not None and new_name != name:
+                # 快照里这个角色换了名字，旧名又给了另一个角色：两边的串门数据分不开，不迁
+                logger.warning("cloudsave import: %r renamed to %r but its old name is reused; visit data not moved",
+                               name, new_name)
             continue
-        removed.append({"name": name, "character_uid": uid})
-    return removed, frozenset(name for name in kept_character_map if name in local_map)
+        if new_name is None:
+            removed.append({"name": name, "character_uid": uid})
+        elif new_name in local_map:
+            # 新名字在导入前属于本机另一个角色：迁过去会和它的串门数据混在一起
+            logger.warning("cloudsave import: %r renamed to %r, a name held by another local character; "
+                           "visit data not moved", name, new_name)
+        else:
+            renamed.append({"old": name, "new": new_name, "uid": uid})
+    kept_local = frozenset(name for name in kept_character_map if name in local_map)
+    return removed, kept_local, renamed
 
 
 def _preserve_local_character_ids(character_map: dict[str, Any], local_character_map: Any) -> None:
@@ -1549,17 +1570,19 @@ def import_local_cloudsave_snapshot(
     *,
     deadline_monotonic: float | None = None,
     use_cloud_apply_fence: bool = True,
-    on_characters_removed: Callable[[list[dict[str, Any]], frozenset[str]], Any] | None = None,
+    on_characters_removed: Callable[[list[dict[str, Any]], frozenset[str], list[dict[str, str]]], Any] | None = None,
 ) -> dict[str, Any]:
     """Import the current local cloudsave snapshot back into runtime truth with rollback.
 
     ``on_characters_removed`` is called with the ``{name, character_uid}`` of
     every local character the import drops (tombstoned, or absent from a
-    full-runtime snapshot) and the names of the local characters it keeps,
-    right before the first runtime file is written.
+    full-runtime snapshot), the names of the local characters it keeps and
+    the ``{old, new, uid}`` of the local characters it keeps under another
+    name, right before the first runtime file is written.
     Data owned by other layers (the visit roster) can so record what to
-    retire before the removal commits. It is not called when nothing is
-    removed; whatever it raises is logged and the import goes on.
+    retire or migrate before the change commits. It is not called when no
+    character is removed or renamed; whatever it raises is logged and the
+    import goes on.
     """
     if is_cloudsave_disabled():
         _raise_cloudsave_disabled("local_cloudsave_import")
@@ -1723,10 +1746,10 @@ def import_local_cloudsave_snapshot(
                 characters_payload["当前猫娘"] = applied_character_names[0]
             else:
                 characters_payload["当前猫娘"] = ""
-        removed_characters, kept_local_names = (
+        removed_characters, kept_local_names, renamed_characters = (
             _removed_local_characters(config_manager, characters_payload["猫娘"])
             if on_characters_removed is not None
-            else ([], frozenset())
+            else ([], frozenset(), [])
         )
         apply_time = _utc_now_iso()
         backup_root = config_manager.cloudsave_backups_dir / f"import-{apply_time.replace(':', '').replace('.', '')}"
@@ -1949,10 +1972,10 @@ def import_local_cloudsave_snapshot(
                     operation="import",
                     stage="apply_runtime",
                 )
-                if removed_characters:
+                if removed_characters or renamed_characters:
                     try:
                         # 先于删除落盘：中途崩溃时记录已在，由记录方按落盘后的配置判定是否真删了
-                        on_characters_removed(removed_characters, kept_local_names)
+                        on_characters_removed(removed_characters, kept_local_names, renamed_characters)
                     except Exception as exc:
                         logger.warning("cloudsave import: removed characters not recorded: %r", exc)
                 for target_path, staged_path in runtime_targets.items():

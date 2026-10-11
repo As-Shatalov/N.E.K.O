@@ -2190,6 +2190,8 @@ async def test_cloudsave_overwrite_of_a_rename_ambiguous_for_good_asks_to_delete
         # 变异：ambiguous 放行 / 按「稍后再试」答复必红
         assert response.status_code == 409 and payload["code"] == "VISIT_DATA_AMBIGUOUS"
         _assert_localized_error_payload(payload, "cloudsave.error.visitDataAmbiguous")
+        # 提示要说出另一个角色是谁，用户才能自己解开（变异：不带名字必红）
+        assert payload["message_params"] == {"first": "云端角色", "second": "旧名"}
         assert get_character_uid(target_cm.load_characters()["猫娘"]["云端角色"]) == uid
         peers = json.loads((Path(target_cm.config_dir) / "visit_peers.json").read_text(encoding="utf-8"))
         assert peers["pending_rename"] == marker
