@@ -1,5 +1,7 @@
 pkgname=n.e.k.o-bin
 pkgver=0.9.0.1
+# 上游 release tag 和 pkgver 不一定相同（0.9.0.1 的文件挂在 v0.9.0 下），升级时两个一起改
+_tag=v0.9.0
 pkgrel=1
 provides=('n.e.k.o')
 conflicts=('n.e.k.o')
@@ -9,56 +11,51 @@ url="https://github.com/Project-N-E-K-O/N.E.K.O"
 license=('Apache-2.0')
 depends=('gtk3' 'nss' 'libxtst' 'libsecret' 'xdg-utils')
 makedepends=()
-# 注意：上游文件名写的是 x86，这里照抄；release tag 是 v0.9.0，升级时 tag 和 pkgver 要一起改
-source=("$pkgname-$pkgver.AppImage::https://github.com/Project-N-E-K-O/N.E.K.O/releases/download/v0.9.0/N.E.K.O_v${pkgver}_x86_linux.AppImage")
+# 注意：上游文件名写的是 x86，这里照抄
+source=("$pkgname-$pkgver.AppImage::https://github.com/Project-N-E-K-O/N.E.K.O/releases/download/${_tag}/N.E.K.O_v${pkgver}_x86_linux.AppImage")
 sha256sums=('8d8c9c3b79ac2b35db56ed0bbdf58b901b2ec980cb2d318b6511133c763fa618')
 
 package() {
   cd "$srcdir"
 
   # 1. 解包 AppImage
+  #    先清掉上次构建留下的 squashfs-root：--appimage-extract 只覆盖写入，
+  #    不清空的话旧版本里已经删掉的文件会被一起打进包
+  rm -rf squashfs-root
   chmod +x "$pkgname-$pkgver.AppImage"
-  ./"$pkgname-$pkgver.AppImage" --appimage-extract
+  ./"$pkgname-$pkgver.AppImage" --appimage-extract > /dev/null
   # 解包后生成 squashfs-root
 
-  # 2. 将解包内容全部复制到 /usr/lib/neko
-  mkdir -p "$pkgdir/usr/lib/neko"
-  cp -r -p squashfs-root/* "$pkgdir/usr/lib/neko/"
+  # 2. 把解包目录整个移到 /usr/lib/neko
+  #    解包后有近 4 GB，用 mv 而不是 cp，免得构建时再多占一份磁盘
+  mkdir -p "$pkgdir/usr/lib"
+  mv squashfs-root "$pkgdir/usr/lib/neko"
+  # --appimage-extract 解出来的目录全是 700（AppImage 里本来是 755），
+  # 装好后归 root 所有，不改的话普通用户进不去、程序起不来
+  find "$pkgdir/usr/lib/neko" -type d -exec chmod 755 {} +
 
-  # 3. 动态寻找主程序（防止它不叫 AppRun 或者 n.e.k.o）
-  # 大部分 AppImage 的入口是根目录的 AppRun
-  local _exec_bin="AppRun"
-  if [ ! -f "$pkgdir/usr/lib/neko/AppRun" ]; then
-      # 如果根目录没有 AppRun，尝试找 usr/bin 下的可执行文件
-      _exec_bin=$(find "$pkgdir/usr/lib/neko" -type f -executable -name "n.e.k.o" -o -executable -name "N.E.K.O" | head -n 1)
-      if [ -z "$_exec_bin" ]; then
-          # 最后兜底，取 usr/bin 目录下的第一个可执行文件
-          _exec_bin=$(find "$pkgdir/usr/lib/neko" -type f -executable -path "*/usr/bin/*" | head -n 1)
-      fi
-      _exec_bin="${_exec_bin#$pkgdir/usr/lib/neko/}" # 去除绝对路径，保留相对路径
-  fi
-  # 如果还是找不到，只能写死报错提醒
-  if [ -z "$_exec_bin" ] || [ "$_exec_bin" = "$pkgdir/usr/lib/neko/" ]; then
-      echo "错误：无法自动定位主程序。请手动检查 squashfs-root 目录！" >&2
+  # 3. 确认入口：AppImage 根目录的 AppRun 会自己判断要不要加 --no-sandbox
+  if [ ! -x "$pkgdir/usr/lib/neko/AppRun" ]; then
+      echo "错误：AppImage 根目录没有 AppRun，上游打包结构可能变了，请手动检查！" >&2
       return 1
   fi
 
   # 4. 创建启动脚本
   mkdir -p "$pkgdir/usr/bin"
-  cat > "$pkgdir/usr/bin/n.e.k.o" << EOF
+  cat > "$pkgdir/usr/bin/n.e.k.o" << 'EOF'
 #!/bin/sh
 cd /usr/lib/neko
-exec ./${_exec_bin} "\$@"
+exec ./AppRun "$@"
 EOF
   chmod +x "$pkgdir/usr/bin/n.e.k.o"
 
-  # 5. 动态寻找并安装 .desktop 文件
+  # 5. 安装 .desktop 文件：优先用 AppImage 自带的，改掉 Exec 和 Icon
   mkdir -p "$pkgdir/usr/share/applications"
-  local _desktop_file=$(find "$pkgdir/usr/lib/neko" -name "*.desktop" | head -n 1)
-  
-  if [ -n "$_desktop_file" ]; then
-      # 如果 AppImage 自带 desktop 文件，替换其 Exec 路径并复制
-      sed -i -e "s|Exec=.*|Exec=n.e.k.o|g" -e "s|^Icon=.*|Icon=neko-bin|" "$_desktop_file"
+  local _desktop_file="$pkgdir/usr/lib/neko/n.e.k.o.desktop"
+
+  if [ -f "$_desktop_file" ]; then
+      # 上游是 Exec=AppRun --no-sandbox %U；保留 %U，让拖到启动器上的文件/链接能传给程序
+      sed -i -e "s|^Exec=.*|Exec=n.e.k.o %U|" -e "s|^Icon=.*|Icon=neko-bin|" "$_desktop_file"
       install -Dm644 "$_desktop_file" "$pkgdir/usr/share/applications/$pkgname.desktop"
   else
       # 如果没找到，沿用你之前的写法
@@ -67,7 +64,7 @@ EOF
 Type=Application
 Name=Project N.E.K.O
 Comment=N.E.K.O., a digital life that yearns to understand, connect, and grow with us.
-Exec=n.e.k.o
+Exec=n.e.k.o %U
 Icon=neko-bin
 Categories=Utility;
 Terminal=false
@@ -79,8 +76,8 @@ EOF
   #    （resources 下有上百张界面素材的路径也带 icon，find 的顺序不固定，会装错图）
   local _icon_file=""
   for _candidate in \
-      squashfs-root/usr/share/icons/hicolor/512x512/apps/n.e.k.o.png \
-      squashfs-root/.DirIcon; do
+      "$pkgdir/usr/lib/neko/usr/share/icons/hicolor/512x512/apps/n.e.k.o.png" \
+      "$pkgdir/usr/lib/neko/.DirIcon"; do
     if [ -e "$_candidate" ]; then
       _icon_file="$_candidate"
       break
