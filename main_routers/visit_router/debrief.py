@@ -116,11 +116,14 @@ async def show_chips(host: Any, visit_id: str, *, own_char: str, lang: Optional[
 
 
 async def render_chips(visit_id: str, *, own_char: str, status: Optional[str] = None) -> bool:
-    """PR-08 recovery callback: show the chips of ``visit_id`` on ``own_char``'s display now.
+    """PR-08 recovery callback: show the block ``visit_id`` currently owes on ``own_char``'s display now.
 
     ``status='interrupted'`` (a crashed visit) also tells the page the last
-    visit was interrupted. The pending flag in ``state.json`` stays until
-    the user decides.
+    visit was interrupted, but only while the owed block is the chips
+    (``CHIP_CHOICES``, ``generating:diary`` included): the preview, the
+    committing preview and the failure block never carry it, the same rule
+    as the bind replay. The pending flag in ``state.json`` stays until the
+    user decides.
     """
     from main_routers.visit_router.host_port import ManagerHost
     from main_routers.visit_router.local_context import prompt_lang
@@ -754,6 +757,8 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
     spool = _spool(visit_id)
     lock = _visit_lock(visit_id)
     async with lock:
+        # 进锁先记代次：之后任何一个 await 期间关机 / 回滚都算数，确认失败时不再补排定时
+        epoch = _timer_epoch
         state = await spool.read_state()
         # 别的社区账号的场次（共用电脑）当作不存在；记忆关的场次本来就没有芯片
         if (state is None or state["own_uid"] != await own_visit_uid() or not is_digestable(state)
@@ -804,7 +809,6 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
             return _not_committing(state)
         _cancel_timer(visit_id)
         await _send(own_char, state["own_uid"], committing_frame(state))
-        epoch = _timer_epoch
         try:
             return await _run_commit_locked(visit_id, "http")
         except asyncio.CancelledError:
@@ -839,6 +843,9 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
         # 不再每次 bind 重放一个点了必然 404 的芯片
         await spool.update_state(debrief_choice="abandoned", debrief_pending=None, debrief_chip_pending=False)
         await spool.delete_if_settled()
+        # 已打开的页面上芯片还亮着：让它置灰（choice='abandoned'）
+        await _send(own_char, state["own_uid"],
+                    _state_frame(visit_id, "chosen", chips_request_id(visit_id), choice="abandoned"))
         return 404, {"error": "unknown_or_expired"}
     except debrief_writers.DiaryGenerationFailed:
         # 留在 generating:diary：再点「记成日记」重新生成

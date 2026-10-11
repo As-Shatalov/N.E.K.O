@@ -1003,3 +1003,37 @@ async def test_a_stopped_background_does_not_get_a_new_retry_from_a_failed_click
     with pytest.raises(OSError):
         await choose("confirm")
     assert debrief.pending_commit_retries() == {}
+
+
+# ── wehos 自动评审第 2 轮 ────────────────────────────────────────────────
+
+
+async def test_a_stop_while_entering_committing_is_honoured(env, monkeypatch):
+    await visit(env)
+    await preview(env)
+    env.memory.script["cache"] = [(503, {})]
+    await choose("confirm")
+    await armed(env)
+    real_send = debrief._send
+
+    async def send_and_stop(own_char, owner, frame):
+        if frame.get("phase") == "committing":
+            debrief.cancel_commit_timers()  # 关机恰好落在推「写入中」这一帧的 await 里
+        return await real_send(own_char, owner, frame)
+
+    async def fail(*_a, **_k):
+        raise OSError("state.json locked")
+
+    monkeypatch.setattr(debrief, "_send", send_and_stop)
+    monkeypatch.setattr(debrief, "_commit_held", fail)
+    with pytest.raises(OSError):
+        await choose("confirm")
+    assert debrief.pending_commit_retries() == {}
+
+
+async def test_a_lost_transcript_greys_the_open_chips(env):
+    await visit(env)
+    VisitSpool(env.tmp, vid(1)).jsonl_path.unlink()
+    await choose("diary")
+    chosen = [f for f in env.host.frames if f.get("phase") == "chosen"][-1]
+    assert chosen["request_id"] == debrief.chips_request_id(vid(1)) and chosen["choice"] == "abandoned"
