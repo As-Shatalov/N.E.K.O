@@ -677,6 +677,22 @@ async def test_reconciling_on_demand_refuses_a_missing_runtime_character_config(
         runtime_path.write_text(original, encoding="utf-8")
 
 
+async def test_deleting_a_character_whose_rename_waits_for_a_retirement_retires_its_other_name(env):
+    cm, _path, config_dir = env
+    uid = _uid(cm, "Old")
+    # Prev -> Old 已提交、迁移在等 Old 下一个已删除角色的退役补完；条目还在 Prev 下
+    roster = await seed_roster(config_dir, own_char="Prev")
+    await make_visit(config_dir, vid(1), [ln(1)], own_char="Prev", own_char_uid=uid)
+    await set_roster_marker(config_dir, "pending_rename", {"old": "Prev", "new": "Old", "uid": uid})
+    await add_roster_marker_item(config_dir, "pending_retire", lc.retire_item("Old", "f" * 32))
+    status, body = await _delete(cm, "Old")
+    assert status == 200 and body["success"] is True
+    # 不是永久歧义：Prev 没被别的角色占着，随角色一起退役（变异：只看队列必红，Prev 下的对端留给将来的 Prev）
+    assert lc.retire_item("Prev", uid) in _peers(config_dir)["pending_retire"]
+    status, body = await _add(cm, "Prev")
+    assert status == 200 and await roster.get_char_entry(PEER_X, "Prev") is None
+
+
 async def test_a_rename_waiting_for_a_retirement_is_busy_not_ambiguous(env, monkeypatch):
     cm, _path, config_dir = env
     uid = _uid(cm, "Old")

@@ -23,7 +23,7 @@ import) is loaded only when an import really removes a character.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path, PurePath
 from typing import Any
 
@@ -49,8 +49,10 @@ def removed_characters_recorder(
     def record(
         removed: list[dict[str, Any]], kept_local_names: frozenset[str], renamed: list[dict[str, str]],
         fresh_names: frozenset[str] = frozenset(),
+        replaced: Iterable[dict[str, Any]] = (),
     ) -> int:
-        if not removed and not renamed and not (config_dir / "visit_peers.json").exists():
+        replaced = list(replaced)
+        if not removed and not renamed and not replaced and not (config_dir / "visit_peers.json").exists():
             # 只带来了新角色、这台机器又没有串门名册：没有要标的改名，不加载串门模块
             return 0
         from main_logic.visit.char_lifecycle import (
@@ -64,7 +66,7 @@ def removed_characters_recorder(
         recorded = 0
         failure: Exception | None = None
         try:
-            recorded += record_removed_characters_sync(config_dir, removed, kept_local_names)
+            recorded += record_removed_characters_sync(config_dir, removed, kept_local_names, replaced)
         except Exception as exc:  # noqa: BLE001
             failure = exc
         try:
@@ -73,7 +75,7 @@ def removed_characters_recorder(
             failure = failure or exc
         try:
             # 最后标交出去的名字：刚写下的改名标记与之前没对完账的都要看
-            removed_uids = [entry.get("character_uid") for entry in removed]
+            removed_uids = [entry.get("character_uid") for entry in [*removed, *replaced]]
             recorded += record_handed_over_names_sync(config_dir, fresh_names, removed_uids)
         except Exception as exc:  # noqa: BLE001
             failure = failure or exc

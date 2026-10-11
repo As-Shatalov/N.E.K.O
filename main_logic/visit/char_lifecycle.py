@@ -364,9 +364,9 @@ async def _settle_own_rename(
     rename (unreadable spools) raises :class:`RenamePendingElsewhere`; an
     ambiguous one (the other name was taken by another character meanwhile)
     lets the delete go ahead, nothing being separable any more. Returns the
-    other names of a queued rename that still could not take the slot (an
-    ambiguous one holds it): they are retired with the character, no other
-    local character holding them.
+    other names of every rename of this character still pending afterwards
+    (one waiting for a retirement, or queued behind an ambiguous slot) that
+    no other local character holds: they are retired with the character.
     """
     marker, queued = await read_roster_markers(config_dir, PENDING_RENAME, PENDING_RENAME_QUEUE)
     queued = _queued_renames(queued)
@@ -384,12 +384,14 @@ async def _settle_own_rename(
         # 另一个名字已被别的角色占用：两边的条目分不开了，删掉这个角色不会让情况更糟；
         # 它的 uid 一消失，下次对账就按「已删除」清掉标记
         logger.warning("visit retire: ambiguous pending_rename of %r left as is, delete goes ahead", name)
-    # 还排在队里（位置被一笔永久歧义的改名占着）：它的另一个名字随角色一起退役，
-    # 之后轮到这一笔时按「已删除」清掉
+    # 对账后仍挂着的这个角色的改名（在等某个名字的退役、或排在一笔永久歧义的改名后面）：
+    # 另一个名字没被别的角色占着，就随角色一起退役，之后这笔改名按「已删除」清掉。
+    # 被别的角色占着的名字（真正的歧义）条目分不开，照旧不动
     held = set(names) - {name}
+    marker, queued = await read_roster_markers(config_dir, PENDING_RENAME, PENDING_RENAME_QUEUE)
     return tuple(dict.fromkeys(
         other
-        for item in _queued_renames(await read_roster_marker(config_dir, PENDING_RENAME_QUEUE))
+        for item in (marker, *_queued_renames(queued))
         for other in _rename_names_of(item, name, character_uid)
         if other != name and other not in held
     ))
@@ -586,6 +588,7 @@ def _rename_names_of(marker: Any, name: str, character_uid: str | None) -> tuple
 
 def record_removed_characters_sync(
     config_dir: str | Path, removed: Iterable[Mapping[str, Any]], kept_local_names: Iterable[str] = (),
+    replaced: Iterable[Mapping[str, Any]] = (),
 ) -> int:
     """Add a ``pending_retire`` item for each character a cloudsave import is about to remove.
 
@@ -600,7 +603,9 @@ def record_removed_characters_sync(
     it, and a character the snapshot brings under that name would inherit
     them. Only a name another local character already holds is left alone:
     its entries are mixed with that character's and cannot be told apart
-    (the same rule as an ordinary delete). Machines without visit data get
+    (the same rule as an ordinary delete). ``replaced`` characters (kept by
+    name under a new uid: their entries under that name stay with it) get
+    items for those other names only. Machines without visit data get
     nothing; returns the number of items added.
     """
     config_dir = Path(config_dir)
@@ -611,12 +616,15 @@ def record_removed_characters_sync(
     except RosterCorruptError:
         rename_markers = []  # 名册读不出：写标记那一步同样会失败，由回调方记日志
     added = 0
-    for entry in removed:
+    entries = [(entry, True) for entry in removed] + [(entry, False) for entry in replaced]
+    for entry, own_name in entries:
         fields = _item_fields(retire_item(entry.get("name"), entry.get("character_uid")))
         if fields is None or not _has_visit_files_sync(config_dir, fields[1]):
             continue
         name, uid = fields
-        names = list(dict.fromkeys([name] + [
+        if not own_name and uid is None:
+            continue  # 没有 uid 就认不出它的改名标记
+        names = list(dict.fromkeys(([name] if own_name else []) + [
             other for marker in rename_markers for other in _rename_names_of(marker, name, uid)
             if other != name and other not in kept
         ]))

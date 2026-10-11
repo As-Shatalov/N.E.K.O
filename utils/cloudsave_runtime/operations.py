@@ -292,6 +292,40 @@ def _removed_local_characters(
     return removed, kept_local, renamed
 
 
+def _replaced_local_characters(config_manager, kept_character_map: dict[str, Any]) -> list[dict[str, Any]]:
+    """The ``{name, character_uid}`` of local characters the snapshot keeps by name under a new uid.
+
+    The known same-name case: the entries under the name stay with the
+    character of that name, but the old uid is gone, so whatever a pending
+    rename of it still holds under its other name has no owner left.
+    A missing or unreadable runtime file reports nothing.
+    """
+    from utils.config_manager import get_character_uid
+
+    try:
+        with open(config_manager.get_runtime_config_path("characters.json"), "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return []
+    local_map = payload.get("猫娘") if isinstance(payload, dict) else None
+    if not isinstance(local_map, dict):
+        return []
+
+    def uid_in(mapping: dict[str, Any], name: str) -> str | None:
+        data = mapping.get(name)
+        return get_character_uid(data) if isinstance(data, dict) else None
+
+    local_uids = {uid for uid in (uid_in(local_map, name) for name in local_map) if uid}
+    kept_uids = {uid for uid in (uid_in(kept_character_map, name) for name in kept_character_map) if uid}
+    replaced = []
+    for name in local_map:
+        uid = uid_in(local_map, name)
+        holder = uid_in(kept_character_map, name) if name in kept_character_map else None
+        if uid and holder and holder != uid and holder not in local_uids and uid not in kept_uids:
+            replaced.append({"name": name, "character_uid": uid})
+    return replaced
+
+
 def _fresh_character_names(config_manager, kept_character_map: dict[str, Any]) -> frozenset[str]:
     """Names the snapshot gives to characters new to this machine (a uid, or else a name, none had).
 
@@ -1629,7 +1663,9 @@ def import_local_cloudsave_snapshot(
     full-runtime snapshot), the names of the local characters it keeps and
     the ``{old, new, uid}`` of the local characters it keeps under another
     name, plus ``fresh_names=`` the names it gives to characters new to this
-    machine, right before the first runtime file is written.
+    machine and ``replaced=`` the ``{name, character_uid}`` of local
+    characters it keeps by name under a new uid, right before the first
+    runtime file is written.
     Data owned by other layers (the visit roster) can so record what to
     retire or migrate before the change commits. It is not called when the
     import removes, renames and brings in no character; whatever it raises is
@@ -1806,6 +1842,11 @@ def import_local_cloudsave_snapshot(
             _fresh_character_names(config_manager, characters_payload["猫娘"])
             if on_characters_removed is not None
             else frozenset()
+        )
+        replaced_characters = (
+            _replaced_local_characters(config_manager, characters_payload["猫娘"])
+            if on_characters_removed is not None
+            else []
         )
         apply_time = _utc_now_iso()
         backup_root = config_manager.cloudsave_backups_dir / f"import-{apply_time.replace(':', '').replace('.', '')}"
@@ -2028,11 +2069,11 @@ def import_local_cloudsave_snapshot(
                     operation="import",
                     stage="apply_runtime",
                 )
-                if removed_characters or renamed_characters or fresh_character_names:
+                if removed_characters or renamed_characters or fresh_character_names or replaced_characters:
                     try:
                         # 先于删除落盘：中途崩溃时记录已在，由记录方按落盘后的配置判定是否真删了
                         on_characters_removed(removed_characters, kept_local_names, renamed_characters,
-                                              fresh_names=fresh_character_names)
+                                              fresh_names=fresh_character_names, replaced=replaced_characters)
                     except Exception as exc:
                         logger.warning("cloudsave import: removed characters not recorded: %r", exc)
                 for target_path, staged_path in runtime_targets.items():
