@@ -166,8 +166,8 @@ async def _show_owed_locked(host: Any, visit_id: str, *, own_char: str, lang: Op
         return False
     request_id, blocks, frame = owed
     async with contextlib.AsyncExitStack() as stack:
-        # 核名字、核账号到推送都按住这个角色的生命周期：中途改名（旧名字归了另一只猫）进不来
-        if not await _pin_lifecycle(stack, state):
+        # 核名字、核账号到推送都按住这只猫的生命周期与登录账号：中途改名（旧名字归了另一只猫）、切号都进不来
+        if not await _pin_push(stack, state):
             return False
         return await _push_owed(host, visit_id, state, request_id, blocks, frame,
                                 own_char=own_char, interrupted=interrupted)
@@ -515,29 +515,35 @@ async def _owner_signed_in(owner: str) -> bool:
     return await own_visit_uid() == owner
 
 
-async def _pin_lifecycle(stack: contextlib.AsyncExitStack, state: Mapping[str, Any]) -> bool:
-    """Hold the visit character's lifecycle on ``stack`` (rename / delete answer 400); False when it cannot be held.
+async def _pin_push(stack: contextlib.AsyncExitStack, state: Mapping[str, Any]) -> bool:
+    """Hold the visit character's lifecycle and the signed-in account on ``stack``; False when the push must wait.
 
     Pushes resolve the character's current name, check the account and send
-    while this is held, so no rename can slip in between and hand the freed
-    name (and its page) to another cat.
+    while both are held: no rename can slip in between and hand the freed
+    name (and its page) to another cat, and no logout / account switch can
+    land between the account check and the write. False (skip; the marker
+    stays in ``state.json`` for the bind replay) when the character config
+    is unreadable or an account change is in progress.
     """
+    from main_routers.visit_router import runtime
+
     try:
         await stack.enter_async_context(_hold_lifecycle([state["own_char_uid"]]))
     except Exception as exc:  # noqa: BLE001 - 角色配置读不出：这次不推，标记留在 state.json 等 bind 重放
         logger.info("visit debrief: lifecycle not held, push skipped: %s", type(exc).__name__)
         return False
-    return True
+    # 生命周期按住之后再按账号（同步登记、不 await）：切号要等这次推完才改会话，切号进行中就不推
+    return await stack.enter_async_context(runtime.hold_account_for_push())
 
 
 async def _target(state: Mapping[str, Any]) -> Optional[tuple[str, Any]]:
     """``(current name, host)`` of the visit's character, resolved now from ``own_char_uid``.
 
     None when another community account is signed in, the character is gone,
-    or it has no manager. Called with the character lifecycle held
-    (:func:`_pin_lifecycle`) through the push: a rename meanwhile (the freed
-    name maybe reused by another cat) must not send this visit's diary to
-    that cat's page.
+    or it has no manager. Called with the character lifecycle and the
+    account held (:func:`_pin_push`) through the push: a rename meanwhile
+    (the freed name maybe reused by another cat) must not send this visit's
+    diary to that cat's page, nor a switch hand it to another account.
     """
     name = await _own_char(state)
     # 账号放在最后核：解析名字会读角色配置（有 await），期间换了账号也拦得住
@@ -548,28 +554,39 @@ async def _target(state: Mapping[str, Any]) -> Optional[tuple[str, Any]]:
 
 
 async def _send(state: Mapping[str, Any], frame: dict) -> bool:
-    async with contextlib.AsyncExitStack() as stack:
-        if not await _pin_lifecycle(stack, state):
-            return False
-        target = await _target(state)
-        if target is None:
-            return False
-        return await target[1].send_frame(frame)
+    """Push ``frame`` to the visit character's page; best effort, never raises (False when not sent).
+
+    Pushes follow a ``state.json`` change that already happened: a failure
+    here (character config unreadable meanwhile, page gone) must not turn
+    that outcome into an error. The bind replay catches the page up.
+    """
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            if not await _pin_push(stack, state):
+                return False
+            target = await _target(state)
+            if target is None:
+                return False
+            return bool(await target[1].send_frame(frame))
+    except Exception as exc:  # noqa: BLE001 - 推送尽力而为：状态已落盘，页面靠 bind 重放校正
+        logger.info("visit debrief: frame not sent: %s", type(exc).__name__)
+        return False
 
 
 async def _render(state: Mapping[str, Any], blocks: list[dict], request_id: str) -> bool:
-    async with contextlib.AsyncExitStack() as stack:
-        if not await _pin_lifecycle(stack, state):
-            return False
-        target = await _target(state)
-        if target is None:
-            return False
-        name, host = target
-        try:
+    """Render ``blocks`` on the visit character's page; best effort like :func:`_send`."""
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            if not await _pin_push(stack, state):
+                return False
+            target = await _target(state)
+            if target is None:
+                return False
+            name, host = target
             return bool(await host.render_chat_blocks(blocks, request_id=request_id, source_name=name))
-        except Exception as exc:  # noqa: BLE001 - 页面不在：标记留在 state.json，等 bind 重放
-            logger.info("visit debrief: block %s not shown: %s", request_id, type(exc).__name__)
-            return False
+    except Exception as exc:  # noqa: BLE001 - 页面不在等：标记留在 state.json，等 bind 重放
+        logger.info("visit debrief: block %s not shown: %s", request_id, type(exc).__name__)
+        return False
 
 
 def _lang() -> str:
@@ -752,7 +769,10 @@ async def _commit_held(visit_id: str, trigger: str, spool: Any, state: Mapping[s
         await spool.update_state(debrief_choice="diary", debrief_pending=None, debrief_retry=None,
                                  debrief_chip_pending=False)
         _cancel_timer(visit_id)
-        await spool.delete_if_settled()
+        try:
+            await spool.delete_if_settled()
+        except Exception as exc:  # noqa: BLE001 - 日记已写成、状态已落盘：清理没做成留给之后的清扫，不改写结果
+            logger.info("visit %s: settled files not removed yet: %s", visit_id[:6], type(exc).__name__)
         await _send(state, _state_frame(visit_id, "chosen", preview_request_id(visit_id), choice="diary"))
         if trigger != "http":
             # 发起页自己追加状态；后台补完时没有发起页，单独发一条
@@ -860,7 +880,10 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
                 return 409, {"error": "stale_failure", "seq": state["debrief_commit_error"]["seq"]}
             # 「重试」：退避计数清零，只补未完成那步
             state = await spool.update_state(debrief_choice="committing:diary", debrief_retry=None)
-        elif current != "committing:diary":
+        elif current == "committing:diary":
+            # 写入中又手动点「写入」：同样是用户主动重试，退避计数清零（连点不把自动重试推到 1 小时后）
+            state = await spool.update_state(debrief_retry=None)
+        else:
             return _not_committing(state)
         _cancel_timer(visit_id)
         await _send(state, committing_frame(state))

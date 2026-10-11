@@ -1340,3 +1340,109 @@ async def test_a_push_is_skipped_when_the_lifecycle_cannot_be_held(env, monkeypa
     assert await debrief._send(state, {"type": "visit_debrief"}) is False
     assert await debrief.show_owed(env.host, vid(1), own_char="A", lang="zh") is False
     assert env.host.blocks == [] and env.host.frames == []
+
+
+# ── Codex 第 19 轮 ───────────────────────────────────────────────────────
+
+
+async def test_no_push_goes_out_while_an_account_change_is_in_progress(env, monkeypatch):
+    await visit(env)
+    state = await state_of(env=env)
+    monkeypatch.setattr(runtime, "_account_changes", 1)  # 登出 / 切号进行中
+
+    class Socket:
+        def __init__(self):
+            setattr(self, VISIT_SOCKET_BOUND_ATTR, True)
+            self.sent = []
+
+        async def send_text(self, payload):
+            self.sent.append(payload)
+
+    socket = Socket()
+    assert await debrief._render(state, debrief.chip_blocks(vid(1), "zh"), debrief.chips_request_id(vid(1))) is False
+    assert await debrief._send(state, {"type": "visit_debrief"}) is False
+    assert await debrief.show_owed(env.host, vid(1), own_char="A", lang="zh") is False
+    assert await display_socket._replay_one(socket, "A", vid(1), OWN_A, set(), "zh") is True
+    assert env.host.blocks == [] and env.host.frames == [] and socket.sent == []
+    assert not runtime._account_bound_pushes
+
+
+async def test_an_account_change_waits_for_a_push_that_already_checked_the_account(env):
+    await visit(env)
+    state = await state_of(env=env)
+    release = asyncio.Event()
+    writing = asyncio.Event()
+    render = env.host.render_chat_blocks
+
+    async def slow_render(blocks, **kw):
+        writing.set()  # 账号已核过，正在写
+        await release.wait()
+        return await render(blocks, **kw)
+
+    env.host.render_chat_blocks = slow_render
+    push = asyncio.ensure_future(
+        debrief._render(state, debrief.chip_blocks(vid(1), "zh"), debrief.chips_request_id(vid(1))))
+    await asyncio.wait_for(writing.wait(), 5)
+    switched = asyncio.Event()
+
+    async def switch():
+        async with runtime.account_change():
+            switched.set()
+
+    change = asyncio.ensure_future(switch())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    # 推送写完之前不改会话
+    assert not switched.is_set()
+    release.set()
+    assert await push is True
+    await asyncio.wait_for(change, 5)
+    assert switched.is_set() and not runtime._account_bound_pushes
+
+
+# ── 自动评审第 14 轮（可选建议） ─────────────────────────────────────────
+
+
+async def test_a_written_diary_is_reported_even_when_the_follow_up_steps_fail(env, monkeypatch):
+    from main_routers.visit_router import accounts
+
+    await visit(env)
+    await preview(env)
+    written = {"cache": False}
+
+    def on_request(step):
+        if step == "cache":
+            written["cache"] = True
+
+    async def own_uid():
+        if written["cache"]:
+            raise OSError("session file unreadable")  # 写成之后读不出登录态
+        return env.account
+
+    async def cleanup_fails(self):
+        raise OSError("spool dir locked")
+
+    env.memory.on_request = on_request
+    monkeypatch.setattr(accounts, "own_visit_uid", own_uid)
+    monkeypatch.setattr(VisitSpool, "delete_if_settled", cleanup_fails)
+    assert await choose("confirm") == (200, {"ok": True, "applied": "diary"})
+    state = await state_of(env=env)
+    assert state["debrief_choice"] == "diary"
+    assert debrief.pending_commit_retries() == {}
+    # 后台补完那条「已记下」块同样尽力而为
+    assert await debrief._render(state, [{"type": "status", "text": "x"}], "visit-debrief-done:x") is False
+
+
+async def test_a_manual_confirm_while_committing_resets_the_backoff(env):
+    await visit(env)
+    await preview(env)
+    await VisitSpool(env.tmp, vid(1)).update_state(
+        debrief_choice="committing:diary", debrief_retry={"attempts": 3, "next_at": 5000.0})
+    env.memory.script["facts"] = [(503, {})]
+    status, body = await choose("confirm")
+    assert status == 503 and body["retry"] is True
+    retry = (await state_of(env=env))["debrief_retry"]
+    from config.visit_settings import VISIT_DEBRIEF_COMMIT_BACKOFF_S
+
+    assert retry["attempts"] == 1
+    assert await armed(env) == VISIT_DEBRIEF_COMMIT_BACKOFF_S[0]

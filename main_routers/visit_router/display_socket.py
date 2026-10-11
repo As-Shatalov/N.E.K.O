@@ -242,8 +242,8 @@ async def _replay_one(websocket: Any, lanlan_name: str, visit_id: str, owner: st
         from main_logic.visit import local_chars
 
         async with contextlib.AsyncExitStack() as stack:
-            # 核名字、核账号到投递都按住这个角色的生命周期：中途改名（旧名字归了另一只猫）进不来
-            if not await debrief._pin_lifecycle(stack, state):
+            # 核名字、核账号到投递都按住这只猫的生命周期与登录账号：中途改名（旧名字归了另一只猫）、切号都进不来
+            if not await debrief._pin_push(stack, state):
                 return True
             if await local_chars.resolve_char_name(state["own_char_uid"]) != lanlan_name:
                 # 等锁期间这只猫改了名（旧名字可能已归另一只猫）：这条连接已不是它的页面，留给它新名字的 bind 重放

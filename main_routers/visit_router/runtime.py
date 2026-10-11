@@ -526,6 +526,7 @@ def _reset_for_tests() -> None:
     _account_gen = 0
     _account_change_lock = None
     _credential_requests.clear()
+    _account_bound_pushes.clear()
     _runtimes.clear()
     _pending_visits.clear()
     _resolving_names.clear()
@@ -2885,6 +2886,8 @@ async def account_change(
                     logger.warning("visit: ending live visits before the account change failed: %r", exc)
             # 还在途的领凭证请求（场次可能已注销、请求仍在后台）读会话时必须仍是旧账号：先等它们结束再改会话
             await _settle_credential_requests(timeout)
+            # 已核过账号、正往页面推复盘块的也先推完：核完账号到写出去之间不会换成另一个账号
+            await _settle_account_bound_pushes(timeout)
             yield
     finally:
         _account_changes -= 1
@@ -2892,6 +2895,39 @@ async def account_change(
 
 _credential_requests: set[asyncio.Future] = set()
 """Servers credential requests in flight: an account change waits for them before the session changes."""
+
+_account_bound_pushes: set[asyncio.Future] = set()
+"""Debrief pushes in flight (:func:`hold_account_for_push`): an account change waits for them before the session changes."""
+
+
+@asynccontextmanager
+async def hold_account_for_push():
+    """Yield whether a push bound to the signed-in account may go out; keep the account from changing until it ends.
+
+    Yields False while a logout / account switch is in progress (the caller
+    skips the push; bind replays it to the account that owns the visit).
+    Otherwise the push checks the account and writes inside the block, and
+    :func:`account_change` waits for it (bounded like credential requests)
+    before the session changes, so no switch lands between the check and
+    the write.
+    """
+    if _account_changes:
+        yield False
+        return
+    held = asyncio.get_running_loop().create_future()
+    _account_bound_pushes.add(held)
+    try:
+        yield True
+    finally:
+        if not held.done():
+            held.set_result(None)
+        _account_bound_pushes.discard(held)
+
+
+async def _settle_account_bound_pushes(timeout: float) -> None:
+    pending = [f for f in _account_bound_pushes if not f.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=max(0.0, timeout))
 
 
 async def _settle_credential_requests(timeout: float) -> None:
@@ -3052,5 +3088,6 @@ __all__ = [
     "visit_sweep_loop", "is_visit_live", "is_visit_route_active", "is_visit_route_locked",
     "has_visit_background_tasks", "spawn_visit_background", "register_visit_route_kind",
     "get_runtime", "get_runtime_by_visit", "recent_runtime", "live_runtimes", "on_page_signal",
-    "hold_character_lifecycle", "end_visits_for_account_change", "account_change", "cancel_background_writes",
+    "hold_character_lifecycle", "hold_account_for_push", "end_visits_for_account_change", "account_change",
+    "cancel_background_writes",
 ]
