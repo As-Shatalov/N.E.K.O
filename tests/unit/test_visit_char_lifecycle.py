@@ -330,10 +330,16 @@ async def test_failed_retirement_keeps_the_item_and_replay_finishes_it(tmp_path)
     personas.fail = True
     assert not await lc.settle_retire(tmp_path, item, names={"B"}, uid_of={"B": CHAR_UID_B},
                                       retire_persona=personas)
-    # 其余步骤照做（各步互不连累），标记保留（变异：失败也删标记必红）
+    # 其余步骤照做（各步互不连累），标记保留（变异：失败也删标记必红）；按名字清名册那一步
+    # 做完了，记 roster_done（变异：不记必红）
     assert not (spool_dir / f"{vid(1)}.state.json").exists()
-    assert _peers(tmp_path)["pending_retire"] == [item]
+    assert _peers(tmp_path)["pending_retire"] == [{**item, "roster_done": True}]
     assert await lc.is_name_retiring(tmp_path, "A") and not await lc.is_name_retiring(tmp_path, "B")
+    # 之后这个名字归了别的角色（云快照导入不经过名字占用判定），它写下的条目不能被重试再清掉
+    # （变异：重试照样按名字清名册必红）
+    newcomer = await seed_roster(tmp_path, own_uid=OWN_B, peer_uid=PEER_Y, tag=TAG_Y, own_char="A")
+    assert not await lc.replay_retires(tmp_path, _loader({"B"}, {"B": CHAR_UID_B}), retire_persona=personas)
+    assert await newcomer.get_char_entry(PEER_Y, "A") is not None
     personas.fail = False
     assert await lc.replay_retires(tmp_path, _loader({"B"}, {"B": CHAR_UID_B}), retire_persona=personas)
     assert "pending_retire" not in _peers(tmp_path)
@@ -481,7 +487,7 @@ async def test_startup_recovery_keeps_a_retirement_that_still_fails(tmp_path, _r
     await add_roster_marker_item(tmp_path, "pending_retire", item)
     report = await _recover(tmp_path, ["B"], {CHAR_UID_B: "B"}, retire_persona=Personas(tmp_path, fail=True))
     assert report.retired is False
-    assert await read_roster_marker(tmp_path, "pending_retire") == [item]
+    assert await read_roster_marker(tmp_path, "pending_retire") == [{**item, "roster_done": True}]
 
 
 async def test_startup_recovery_without_markers_reports_clean(tmp_path, _readable):
@@ -789,3 +795,39 @@ async def test_startup_recovery_drops_a_deleted_characters_queued_rename_behind_
     data = _peers(tmp_path)
     assert data["pending_rename"] == stuck and "pending_rename_queue" not in data
     assert await lc.name_marker_state(tmp_path, "G") == lc.NAME_FREE
+
+
+async def test_forget_refuses_names_held_by_a_queued_or_chained_rename(tmp_path):
+    from main_logic.visit.forget_runner import RenamePending, _refuse_pending_rename
+
+    await set_roster_marker(tmp_path, "pending_rename", {"old": "X", "new": "Y", "uid": CHAR_UID_B, "chained": ["Z"]})
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", {"old": "A", "new": "A2", "uid": CHAR_UID_A})
+    # 排在队里的改名同样没对完账：配置已是 A2、条目还在 A 下，清除 A2 会「成功」地什么都没删
+    # （变异：只看位置必红）；链式改名记下的名字也算（变异：不看 chained 必红）
+    for name in ("A2", "A", "Z", "Y"):
+        with pytest.raises(RenamePending):
+            await _refuse_pending_rename(tmp_path, [name])
+    await _refuse_pending_rename(tmp_path, ["B"])
+
+
+async def test_startup_recovery_skips_the_names_of_renames_still_queued(tmp_path, _readable, monkeypatch):
+    from main_logic.visit import local_chars, recovery
+
+    async def configured():
+        return {"A2": CHAR_UID_A, "X": CHAR_UID_B, "Q": "e" * 32}
+
+    monkeypatch.setattr(local_chars, "load_local_characters", configured)
+    skipped = []
+
+    async def recover_visit(_visit_id, *, skip_names, **_kw):
+        skipped.append(skip_names)
+
+    monkeypatch.setattr(recovery, "_recover_visit", recover_visit)
+    await make_visit(tmp_path, vid(1), [ln(1)])
+    # 位置上的改名永久歧义，后面排着另一个角色的 P -> Q：Q 下还没有条目（都在 P 下）
+    await set_roster_marker(tmp_path, "pending_rename", {"old": "A", "new": "X", "uid": CHAR_UID_A})
+    await add_roster_marker_item(tmp_path, "pending_rename_queue", {"old": "P", "new": "Q", "uid": "e" * 32})
+    report = await _recover(tmp_path, ["A2", "X", "Q"], {}, list_char_names=None)
+    # 变异：只跳过位置上的两个名字必红（Q 的逐场补录会按新名找不到条目、记成已完成）
+    assert report.renamed is False
+    assert skipped and {"A", "X", "P", "Q"} <= set(skipped[0])

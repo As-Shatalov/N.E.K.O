@@ -90,7 +90,9 @@ from main_logic.visit.spool import (
 from main_logic.visit.subjects import (
     RosterCorruptError,
     path_lock,
+    pending_rename_names,
     read_roster_marker,
+    read_roster_markers,
 )
 from memory.scoped_client import ScopedMemoryClient
 from utils.file_utils import atomic_write_json
@@ -1425,6 +1427,15 @@ async def visit_spool_recovery(
     else:
         report.retired = False
         unsettled = _ALL_NAMES
+    if unsettled is not _ALL_NAMES:
+        # 位置上那笔对不完账时，后面排队的改名也还没轮到：它们的名字同样没对完账，清除重放与
+        # 逐场补录都得跳过（按新名找不到还在旧名下的条目，会「成功」地什么都没做）
+        try:
+            held = pending_rename_names(*await read_roster_markers(
+                config_dir, "pending_rename", "pending_rename_queue"))
+        except RosterCorruptError:
+            held = None
+        unsettled = _ALL_NAMES if held is None else frozenset(unsettled | held)
     names_settled = unsettled is not _ALL_NAMES
     report.renamed = unsettled == frozenset()
     if names_settled:

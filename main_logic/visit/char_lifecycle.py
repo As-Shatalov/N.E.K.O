@@ -73,6 +73,8 @@ from main_logic.visit.subjects import (
     read_roster_marker_sync,
     read_roster_markers,
     read_roster_markers_sync,
+    rename_marker_names,
+    replace_roster_marker,
     replace_roster_marker_sync,
     set_roster_marker_sync,
     remove_roster_marker_item,
@@ -431,17 +433,22 @@ def _item_fields(item: Any) -> tuple[str, str | None] | None:
 
 
 async def _retire(config_dir: Path, name: str, uid: str | None, names: set[str],
-                  retire_persona: RetirePersona | None) -> None:
+                  retire_persona: RetirePersona | None, *, roster_done: bool = False,
+                  ) -> tuple[list[BaseException], bool]:
+    """Run every retirement step; return the failures and whether the roster step is done."""
     failures: list[BaseException] = []
     try:
         # 头行不带 own_char_uid 的旧场次按名字认：只在没有同名新角色时
         await VisitSpool.retire_char(config_dir, uid or "", legacy_name=None if name in names else name)
     except Exception as exc:  # noqa: BLE001 - 各步互不连累，最后统一报
         failures.append(exc)
-    try:
-        await PeerRoster(config_dir, own_uid="pending-retire").retire_char(name)
-    except Exception as exc:  # noqa: BLE001
-        failures.append(exc)
+    roster_ok = roster_done
+    if not roster_done:
+        try:
+            await PeerRoster(config_dir, own_uid="pending-retire").retire_char(name)
+            roster_ok = True
+        except Exception as exc:  # noqa: BLE001
+            failures.append(exc)
     if uid and retire_persona is not None:
         try:
             await retire_persona(uid)
@@ -450,8 +457,7 @@ async def _retire(config_dir: Path, name: str, uid: str | None, names: set[str],
             pass
         except Exception as exc:  # noqa: BLE001
             failures.append(exc)
-    if failures:
-        raise failures[0]
+    return failures, roster_ok
 
 
 async def settle_retire(
@@ -464,7 +470,10 @@ async def settle_retire(
     when ``uid_of`` is not known): the
     delete did not commit, the item is dropped and nothing is retired.
     Otherwise every retirement step runs (idempotent) and the item is
-    removed only when all of them succeeded.
+    removed only when all of them succeeded. The roster step goes by name
+    and runs once: when only other steps failed, the item is marked
+    ``roster_done`` so a retry never clears what a later character of that
+    name wrote meanwhile.
     """
     config_dir = Path(config_dir)
     fields = _item_fields(item)
@@ -476,10 +485,15 @@ async def settle_retire(
     name, uid = fields
     configured = uid in set(uid_of.values()) if uid and uid_of is not None else name in names
     if not configured:
-        try:
-            await _retire(config_dir, name, uid, names, retire_persona)
-        except Exception as exc:  # noqa: BLE001 - 角色不回滚：标记保留，启动对账补完
-            logger.warning("visit retire: visit data of a deleted character not fully retired: %r", exc)
+        roster_done = item.get("roster_done") is True
+        failures, roster_ok = await _retire(config_dir, name, uid, names, retire_persona, roster_done=roster_done)
+        if failures:
+            # 角色不回滚：标记保留，启动对账补完
+            logger.warning("visit retire: visit data of a deleted character not fully retired: %r", failures[0])
+            if roster_ok and not roster_done:
+                # 按名字清名册这一步已做完：记下来，之后重试不再按名字清——这个名字之后可能
+                # 归了新角色（云快照导入不经过名字占用判定），它写下的条目不能被反复清掉
+                await replace_roster_marker(config_dir, PENDING_RETIRE, dict(item), {**item, "roster_done": True})
             return False
     await remove_roster_marker_item(config_dir, PENDING_RETIRE, dict(item))
     return True
@@ -553,8 +567,7 @@ async def name_marker_state(config_dir: str | Path, name: str) -> str:
         return NAME_UNREADABLE
     if isinstance(retiring, list) and any((_item_fields(item) or ("", None))[0] == name for item in retiring):
         return NAME_RETIRING
-    if any(isinstance(marker, dict) and name in (marker.get("old"), marker.get("new"))
-           for marker in (renaming, *queued)):
+    if any(name in (rename_marker_names(marker) or ()) for marker in (renaming, *queued)):
         return NAME_RENAMING
     return NAME_FREE
 
@@ -575,15 +588,13 @@ async def is_name_retiring(config_dir: str | Path, name: str) -> bool:
 
 
 def _rename_names_of(marker: Any, name: str, character_uid: str | None) -> tuple[str, ...]:
-    """The ``old`` / ``new`` names of ``marker`` when it is a pending rename of this character, else ``()``."""
-    if not isinstance(marker, dict):
-        return ()
-    old, new = marker.get("old"), marker.get("new")
-    if not isinstance(old, str) or not old or not isinstance(new, str) or not new:
+    """The names ``marker`` holds when it is a pending rename of this character, else ``()``."""
+    held = rename_marker_names(marker)
+    if held is None:
         return ()
     marker_uid = marker.get("uid") if isinstance(marker.get("uid"), str) and marker.get("uid") else None
-    involved = marker_uid == character_uid if marker_uid and character_uid else name in (old, new)
-    return (old, new) if involved else ()
+    involved = marker_uid == character_uid if marker_uid and character_uid else name in held
+    return held if involved else ()
 
 
 def record_removed_characters_sync(
@@ -662,7 +673,13 @@ def record_renamed_characters_sync(config_dir: str | Path, renamed: Iterable[Map
         if ok:
             written += 1
         elif isinstance(existing, dict) and existing.get("uid") == uid:
-            # 这个角色自己的上一笔改名还没对完账：对账见它到了第三个名字，会把两个旧名下的条目一起迁过去
+            # 这个角色自己的上一笔改名还没对完账：对账见它到了第三个名字，会把两个旧名下的条目一起迁过去。
+            # 新名字记进标记（chained），对账前同样算占用：否则覆盖下载这个名字会换掉角色的 uid，
+            # 对账就按「已删除」清掉标记，两个旧名下的条目没人认领
+            chained = list(existing.get("chained")) if isinstance(existing.get("chained"), list) else []
+            if new not in chained and new not in (existing.get("old"), existing.get("new")):
+                written += bool(replace_roster_marker_sync(
+                    config_dir, PENDING_RENAME, existing, {**existing, "chained": [*chained, new]}))
             logger.info("visit rename: cloudsave renamed %r to %r on top of pending %r; recovery chains it",
                         old, new, existing)
         else:

@@ -463,6 +463,36 @@ async def read_roster_markers(config_dir: str | Path, *keys: str) -> tuple[Any, 
     return await asyncio.to_thread(read_roster_markers_sync, config_dir, *keys)
 
 
+def rename_marker_names(marker: Any) -> tuple[str, ...] | None:
+    """Every name a pending rename marker holds: ``old``, ``new`` and the ``chained`` ones.
+
+    ``chained``: names a cloudsave import moved the same character on to
+    while the marker was pending. ``None`` for a malformed marker.
+    """
+    if not isinstance(marker, dict):
+        return None
+    old, new = marker.get("old"), marker.get("new")
+    if not isinstance(old, str) or not old or not isinstance(new, str) or not new:
+        return None
+    chained = marker.get("chained")
+    extra = [name for name in chained if isinstance(name, str) and name] if isinstance(chained, list) else []
+    return tuple(dict.fromkeys([old, new, *extra]))
+
+
+def pending_rename_names(slot: Any, queued: Any) -> frozenset[str] | None:
+    """The names held by the ``pending_rename`` slot and every queued rename; ``None`` if one is malformed."""
+    markers = ([] if slot is None else [slot]) + (queued if isinstance(queued, list) else [])
+    if queued is not None and not isinstance(queued, list):
+        return None
+    names: set[str] = set()
+    for marker in markers:
+        held = rename_marker_names(marker)
+        if held is None:
+            return None
+        names.update(held)
+    return frozenset(names)
+
+
 def _clear_marker_sync(path: Path, key: str, expected: Any) -> bool:
     with path_lock(path):
         try:
@@ -586,6 +616,11 @@ def replace_roster_marker_sync(config_dir: str | Path, key: str, expected: Any, 
     :class:`RosterCorruptError`.
     """
     return _replace_marker_sync(Path(config_dir) / VISIT_PEERS_FILENAME, key, expected, value)
+
+
+async def replace_roster_marker(config_dir: str | Path, key: str, expected: Any, value: Any) -> bool:
+    """:func:`replace_roster_marker_sync` off the event loop."""
+    return await asyncio.to_thread(replace_roster_marker_sync, config_dir, key, expected, value)
 
 
 def _promote_marker_sync(path: Path, slot_key: str, queue_key: str) -> Any:

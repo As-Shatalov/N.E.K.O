@@ -280,7 +280,7 @@ async def test_failed_retirement_blocks_the_name_until_it_is_finished(env, monke
     # 删除已提交、不回滚；退役没做完：标记保留
     assert status == 200 and body["success"] is True and body["visit_data_retire_pending"] is True
     assert "Old" not in cm.load_characters()["猫娘"]
-    assert _peers(config_dir)["pending_retire"] == [{"name": "Old", "character_uid": uid}]
+    assert _peers(config_dir)["pending_retire"] == [{"name": "Old", "character_uid": uid, "roster_done": True}]
     # 标记在时同名新建一律 409（变异：去掉 add_catgirl 的检查必红）
     status, body = await _add(cm, "Old")
     assert status == 409 and body["error_code"] == "VISIT_DATA_BUSY"
