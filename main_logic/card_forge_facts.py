@@ -778,7 +778,7 @@ async def build_forge_facts_payload(
     )
     facts, stats = await asyncio.to_thread(
         _select_forge_facts_with_stats,
-        _shareable_facts(raw),
+        shareable_raw,
         min_importance=min_importance,
         include_absorbed=include_absorbed,
         limit=limit,

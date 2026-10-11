@@ -135,8 +135,9 @@ async def render_chips(visit_id: str, *, own_char: str, status: Optional[str] = 
     if owner is None or owner != await own_visit_uid():
         # 启动补录逐场回调、不分账号：不是当前登录账号的场次不发（换回那个账号后由 visit_bind 重放）
         return False
-    if status == "interrupted":
-        # 与芯片同一出口：校验 bind 与写入用同一个连接对象（send_status 会重读 mgr.websocket）
+    if status == "interrupted" and await _owes_chips(visit_id):
+        # 与芯片同一出口：校验 bind 与写入用同一个连接对象（send_status 会重读 mgr.websocket）。
+        # 预览块 / 写入中 / 失败块不带这条提示（与 bind 重放同一口径）
         if not await host.send_frame({"type": "status", "message": json.dumps(
                 {"code": "VISIT_INTERRUPTED_LAST_TIME", "details": {"visit_id": visit_id}}, ensure_ascii=False)}):
             # 提示没送出（连接刚被换掉等）：芯片也不单独发，下次 visit_bind 连同提示一起重放
@@ -179,6 +180,14 @@ async def _show_owed_locked(host: Any, visit_id: str, *, own_char: str, lang: Op
     if shown and frame is not None:
         await host.send_frame(frame)
     return shown
+
+
+async def _owes_chips(visit_id: str) -> bool:
+    try:
+        state = await _spool(visit_id).read_state()
+    except Exception:  # noqa: BLE001 - 读不出：不发提示，块本身也发不出，等 bind 重放
+        return False
+    return state is not None and state.get("debrief_choice") in _CHIP_CHOICES
 
 
 async def _visit_owner(visit_id: str) -> Optional[str]:
@@ -295,6 +304,8 @@ async def _offer_chips(rt: Any, *, has_lines: bool) -> None:
 
 CHOICES = ("diary", "confirm", "forget", "abandon")
 _CHIP_CHOICES = (None, "ask_later", "generating:diary")
+CHIP_CHOICES = _CHIP_CHOICES
+"""Choices whose owed block is the chips (the "interrupted" notice only ever accompanies them)."""
 _FINAL_CHOICES = ("diary", "forget", "abandoned")
 _PENDING_COMMIT = ("committing:diary", "commit_failed:diary")
 _DIARY_LLM_MAX_TOKENS = 900
@@ -460,17 +471,16 @@ def owed_block(state: Mapping[str, Any], lang: Optional[str]) -> Optional[tuple[
     """
     visit_id = state["visit_id"]
     choice = state["debrief_choice"]
+    request_id = owed_request_id(state)
+    if request_id is None:
+        return None
     if choice in _CHIP_CHOICES:
-        return chips_request_id(visit_id), chip_blocks(visit_id, lang), None
+        return request_id, chip_blocks(visit_id, lang), None
     if choice == "preview:diary":
-        return preview_request_id(visit_id), preview_blocks(visit_id, state["debrief_pending"], lang), None
+        return request_id, preview_blocks(visit_id, state["debrief_pending"], lang), None
     if choice == "committing:diary":
-        return (preview_request_id(visit_id), preview_blocks(visit_id, state["debrief_pending"], lang, committing=True),
-                committing_frame(state))
-    if choice == "commit_failed:diary":
-        seq = int(state["debrief_commit_error"]["seq"])
-        return failed_request_id(visit_id, seq), failed_blocks(visit_id, state, lang), commit_failed_frame(state)
-    return None
+        return request_id, preview_blocks(visit_id, state["debrief_pending"], lang, committing=True), committing_frame(state)
+    return request_id, failed_blocks(visit_id, state, lang), commit_failed_frame(state)
 
 
 def _spool(visit_id: str):
@@ -794,6 +804,7 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
             return _not_committing(state)
         _cancel_timer(visit_id)
         await _send(own_char, state["own_uid"], committing_frame(state))
+        epoch = _timer_epoch
         try:
             return await _run_commit_locked(visit_id, "http")
         except asyncio.CancelledError:
@@ -801,7 +812,7 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
         except Exception:
             # 本地失败（state.json 一时写不了等）：上面已撤掉定时，补排一次，不让它停在 committing
             if visit_id not in _timers:
-                schedule_commit_retry(visit_id, _now() + _LOCAL_FAILURE_RETRY_S)
+                schedule_commit_retry(visit_id, _now() + _LOCAL_FAILURE_RETRY_S, epoch=epoch)
             raise
 
 
@@ -824,6 +835,10 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
             spool, llm=_diary_llm(), own_char=own_char, family_names=await _family_names(),
         )
     except debrief_writers.NothingToRecord:
+        # 芯片只在 spool 有句子时出：走到这里是 spool 事后丢了。与「记忆开却无转录」同一终态（已放弃），
+        # 不再每次 bind 重放一个点了必然 404 的芯片
+        await spool.update_state(debrief_choice="abandoned", debrief_pending=None, debrief_chip_pending=False)
+        await spool.delete_if_settled()
         return 404, {"error": "unknown_or_expired"}
     except debrief_writers.DiaryGenerationFailed:
         # 留在 generating:diary：再点「记成日记」重新生成

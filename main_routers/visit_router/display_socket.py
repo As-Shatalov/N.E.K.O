@@ -247,7 +247,7 @@ async def _replay_one(websocket: Any, lanlan_name: str, visit_id: str, owner: st
 async def _send_owed(websocket: Any, lanlan_name: str, state: dict, delivered: set, lang: Optional[str],
                      own_visit_uid: Any) -> bool:
     """Send the block ``state`` owes (unless delivered on this connection) and its state frame."""
-    from main_routers.visit_router.debrief import owed_block
+    from main_routers.visit_router.debrief import CHIP_CHOICES, owed_block
 
     visit_id = state["visit_id"]
     # 按当前状态投递：芯片 / 预览块 / 写入中的预览块 / 写入失败块（内容全取自 state.json，零 LLM）
@@ -256,7 +256,8 @@ async def _send_owed(websocket: Any, lanlan_name: str, state: dict, delivered: s
         return True
     request_id, blocks, frame = owed
     if request_id not in delivered:
-        if state["finalized"] == "crash" and state["debrief_choice"] in (None, "ask_later"):
+        # 「意外中断」只跟芯片一起出（含 generating:diary，它投递的也是芯片），与启动补录同一口径
+        if state["finalized"] == "crash" and state["debrief_choice"] in CHIP_CHOICES:
             if not await _send_status(websocket, "VISIT_INTERRUPTED_LAST_TIME", {"visit_id": visit_id}):
                 # 提示没送出（连接卡住 / 断开）：芯片不单独发，后面的也不再试；下次 visit_bind 连同提示一起重放
                 return False

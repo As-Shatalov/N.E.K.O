@@ -825,3 +825,14 @@ async def test_recovery_account_change_during_the_notice_sends_no_chip(monkeypat
     assert await debrief.render_chips(vid(24), own_char="Host", status="interrupted") is False
     assert fake.blocks == []
 
+
+
+async def test_crashed_generation_replays_chips_with_the_interrupted_notice(monkeypatch, tmp_path):
+    # generating:diary 投递的也是芯片：崩溃场次照样先发「意外中断」，与启动补录同一口径
+    await _pending(tmp_path, 21, finalized="crash", debrief_choice="generating:diary")
+    manager = _ProtocolManager()
+    install(monkeypatch, manager)
+    socket = VisitSocket([bind()])
+    await run(socket, manager)
+    assert socket.statuses() == ["VISIT_INTERRUPTED_LAST_TIME"]
+    assert _chip_ids(socket) == [chips_request_id(vid(21))]

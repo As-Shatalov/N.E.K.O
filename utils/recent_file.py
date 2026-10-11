@@ -54,6 +54,7 @@ __all__ = [
     "fence_recent_deletions_and_clear_redirects",
     "keyed_entry_keys",
     "prune_retired_keys",
+    "read_keyed_payload",
     "read_retired_keys",
     "read_retired_keys_unlocked",
     "retire_removed_keyed_entries",
@@ -566,6 +567,14 @@ def _read_current_payload_unlocked(path: Any) -> Any:
     except (ValueError, RecursionError):
         # 旧文件已坏：比对不出移出了哪些键，照常写（坏文件本来就读不出任何条目）
         return []
+
+
+def read_keyed_payload(path: Any) -> Any:
+    """A recent payload read only for its keyed entries (``[]`` when absent, unreadable or without any).
+
+    No lock: for files outside the live recent path (e.g. a staged cloud copy).
+    """
+    return _read_current_payload_unlocked(path)
 
 
 def read_retired_keys_unlocked(path: Any) -> dict[str, float]:

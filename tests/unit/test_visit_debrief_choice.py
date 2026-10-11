@@ -952,3 +952,54 @@ async def test_a_cached_preview_is_not_returned_to_another_account(env, monkeypa
 
     monkeypatch.setattr(local_chars, "resolve_char_name", resolve_then_switch)
     assert await choose("diary") == (404, {"error": "unknown_or_expired"})
+
+
+# ── wehos 自动评审第 1 轮 ────────────────────────────────────────────────
+
+
+async def test_startup_replay_adds_the_interrupted_notice_to_chips_only(env, monkeypatch):
+    from main_routers.visit_router import host_port
+
+    class BoundHost(Host):
+        def display_bound(self):
+            return True
+
+        statuses = property(lambda self: [json.loads(f["message"])["code"] for f in self.frames
+                                          if f.get("type") == "status"])
+
+    host = BoundHost()
+    monkeypatch.setattr(host_port.ManagerHost, "for_character", classmethod(lambda cls, name: host))
+    await visit(env, 1, finalized="crash", debrief_choice="generating:diary")
+    await visit(env, 2, finalized="crash", debrief_choice="preview:diary",
+                debrief_pending={"diary": "d", "facts": []})
+    assert await debrief.render_chips(vid(1), own_char="A", status="interrupted") is True
+    assert host.statuses == ["VISIT_INTERRUPTED_LAST_TIME"]
+    assert await debrief.render_chips(vid(2), own_char="A", status="interrupted") is True
+    # 预览块不带「意外中断」
+    assert host.statuses == ["VISIT_INTERRUPTED_LAST_TIME"]
+
+
+async def test_a_lost_transcript_settles_as_abandoned(env):
+    await visit(env)
+    VisitSpool(env.tmp, vid(1)).jsonl_path.unlink()
+    assert await choose("diary") == (404, {"error": "unknown_or_expired"})
+    state = await state_of(env=env)
+    assert state["debrief_choice"] == "abandoned" and state["debrief_chip_pending"] is False
+    assert debrief.owed_block(state, "zh") is None
+
+
+async def test_a_stopped_background_does_not_get_a_new_retry_from_a_failed_click(env, monkeypatch):
+    await visit(env)
+    await preview(env)
+    env.memory.script["cache"] = [(503, {})]
+    await choose("confirm")
+    await armed(env)
+
+    async def stop_then_fail(*_a, **_k):
+        debrief.cancel_commit_timers()  # 关机 / 启动回滚恰好在这次提交途中
+        raise OSError("state.json locked")
+
+    monkeypatch.setattr(debrief, "_commit_held", stop_then_fail)
+    with pytest.raises(OSError):
+        await choose("confirm")
+    assert debrief.pending_commit_retries() == {}
