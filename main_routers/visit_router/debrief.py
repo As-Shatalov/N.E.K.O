@@ -524,6 +524,13 @@ async def _own_char(state: Mapping[str, Any]) -> Optional[str]:
     return await local_chars.resolve_char_name(state["own_char_uid"])
 
 
+def _hold_lifecycle(character_uids):
+    """Rename / delete of these characters answer 400 while held (``runtime.hold_character_lifecycle``)."""
+    from main_routers.visit_router import runtime
+
+    return runtime.hold_character_lifecycle(character_uids)
+
+
 def _diary_llm():
     from config.visit_settings import VISIT_LLM_TIMEOUT_S
     from main_routers.visit_router.llm import one_shot_llm
@@ -644,9 +651,6 @@ async def run_commit(visit_id: str, trigger: str) -> tuple[int, dict]:
 
 
 async def _run_commit_locked(visit_id: str, trigger: str) -> tuple[int, dict]:
-    from config.visit_settings import VISIT_DEBRIEF_COMMIT_BACKOFF_S
-    from main_logic.visit import debrief_writers
-
     epoch = _timer_epoch
     spool = _spool(visit_id)
     state = await spool.read_state()
@@ -654,6 +658,16 @@ async def _run_commit_locked(visit_id: str, trigger: str) -> tuple[int, dict]:
         return 404, {"error": "unknown_or_expired"}
     if state["debrief_choice"] != "committing:diary":
         return _not_committing(state)
+    # 两步写入期间按住这个角色的生命周期：改名 / 删除 400，不会一步写在旧名字下、一步写在新名字下
+    async with _hold_lifecycle([state["own_char_uid"]]):
+        return await _commit_held(visit_id, trigger, spool, state, epoch)
+
+
+async def _commit_held(visit_id: str, trigger: str, spool: Any, state: Mapping[str, Any],
+                       epoch: int) -> tuple[int, dict]:
+    from config.visit_settings import VISIT_DEBRIEF_COMMIT_BACKOFF_S
+    from main_logic.visit import debrief_writers
+
     own_char = await _own_char(state)
     if not own_char:
         # 角色已删：退役流程负责这场的文件，不再写
@@ -746,7 +760,9 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
                 from main_logic.visit.debrief_writers import write_forget
 
                 await write_forget(spool)
-                await _send(own_char, state["own_uid"], _state_frame(visit_id, "chosen", chips_request_id(visit_id), choice="forget"))
+                # 帧指向页上被点的那一块：从预览块选的「不记」置灰预览块，不是早先的芯片
+                target = preview_request_id(visit_id) if current == "preview:diary" else chips_request_id(visit_id)
+                await _send(own_char, state["own_uid"], _state_frame(visit_id, "chosen", target, choice="forget"))
                 return 200, {"ok": True, "applied": "forget"}
             return _already_chosen(state)
         if choice == "abandon":
@@ -778,7 +794,15 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
             return _not_committing(state)
         _cancel_timer(visit_id)
         await _send(own_char, state["own_uid"], committing_frame(state))
-        return await _run_commit_locked(visit_id, "http")
+        try:
+            return await _run_commit_locked(visit_id, "http")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 本地失败（state.json 一时写不了等）：上面已撤掉定时，补排一次，不让它停在 committing
+            if visit_id not in _timers:
+                schedule_commit_retry(visit_id, _now() + _LOCAL_FAILURE_RETRY_S)
+            raise
 
 
 async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> tuple[int, dict]:

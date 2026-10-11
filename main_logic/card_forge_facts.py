@@ -767,6 +767,12 @@ async def build_forge_facts_payload(
     total_memory_count, active_ids, active_hashes = await asyncio.to_thread(
         _memory_identity_stats, raw, raw_archive,
     )
+    shareable_raw = _shareable_facts(raw)
+    if shareable_raw is not raw:
+        # 归档的遮蔽只算可分享的活跃行：被排除的串门事实不能把同文的普通归档事实也挡掉（总数照旧按全池）
+        _, active_ids, active_hashes = await asyncio.to_thread(
+            _memory_identity_stats, shareable_raw, [],
+        )
     legacy_excluded_keys = await asyncio.to_thread(
         _legacy_excluded_fact_keys, raw, raw_archive, excluded_ids,
     )

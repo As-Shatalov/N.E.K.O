@@ -878,3 +878,61 @@ async def test_startup_replay_shows_the_current_choice(env):
     lock.release()
     assert await task is False
     assert env.host.blocks == []
+
+
+# ── 评审第 6 轮 ──────────────────────────────────────────────────────────
+
+
+async def test_a_manual_retry_that_fails_locally_keeps_a_retry_armed(env, monkeypatch):
+    await visit(env)
+    await preview(env)
+    env.memory.script["cache"] = [(503, {})]
+    await choose("confirm")
+    assert await armed(env) == 30
+
+    async def broken(*_a, **_k):
+        raise OSError("state.json locked")
+
+    monkeypatch.setattr(debrief, "_commit_held", broken)
+    before = len(env.sleeps)
+    with pytest.raises(OSError):
+        await choose("confirm")
+    for _ in range(100):
+        if len(env.sleeps) > before:
+            break
+        await asyncio.sleep(0)
+    # 原来的 30 s 定时已被这次手动「写入」撤掉；本地失败后补排的是新的一个
+    assert len(env.sleeps) == before + 1 and env.sleeps[-1][0] == debrief._LOCAL_FAILURE_RETRY_S
+    assert list(debrief.pending_commit_retries()) == [vid(1)]
+
+
+async def test_forgetting_from_the_preview_targets_the_preview_block(env):
+    await visit(env)
+    await preview(env)
+    await choose("forget")
+    chosen = [f for f in env.host.frames if f.get("phase") == "chosen"][-1]
+    assert chosen["request_id"] == debrief.preview_request_id(vid(1)) and chosen["choice"] == "forget"
+
+
+async def test_both_writes_run_with_the_character_lifecycle_held(env, monkeypatch):
+    import contextlib
+
+    held = {"uids": None, "inside": False}
+    seen = []
+
+    @contextlib.asynccontextmanager
+    async def hold(uids):
+        held["uids"] = list(uids)
+        held["inside"] = True
+        try:
+            yield
+        finally:
+            held["inside"] = False
+
+    monkeypatch.setattr(debrief, "_hold_lifecycle", hold)
+    env.memory.on_request = lambda step: seen.append((step, held["inside"]))
+    await visit(env)
+    await preview(env)
+    assert (await choose("confirm"))[0] == 200
+    assert held["uids"] == [CHAR_UID_A]
+    assert seen == [("facts", True), ("cache", True)]

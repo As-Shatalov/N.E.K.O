@@ -777,3 +777,12 @@ async def test_visit_facts_never_enter_a_card(query_pool):
 def test_pool_without_visit_facts_is_passed_through_unchanged():
     items = [memory("a"), memory("b")]
     assert F._shareable_facts(items) is items
+
+
+@pytest.mark.asyncio
+async def test_an_unshareable_visit_fact_does_not_shadow_an_archived_memory(query_pool):
+    # 同文的串门事实在活跃池、普通事实在归档：串门那条被排除，归档那条照样可抽
+    archived = memory("old-1", hash="same-hash")
+    visit = memory("visit-1", hash="same-hash", origin="neko_visit", visit_id="v" * 22)
+    payload = await query_pool([visit], [archived])
+    assert [f["id"] for f in payload["facts"]] == ["old-1"]
