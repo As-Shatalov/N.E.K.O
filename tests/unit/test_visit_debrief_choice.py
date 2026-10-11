@@ -1016,10 +1016,10 @@ async def test_a_stop_while_entering_committing_is_honoured(env, monkeypatch):
     await armed(env)
     real_send = debrief._send
 
-    async def send_and_stop(own_char, owner, frame):
+    async def send_and_stop(state, frame):
         if frame.get("phase") == "committing":
             debrief.cancel_commit_timers()  # 关机恰好落在推「写入中」这一帧的 await 里
-        return await real_send(own_char, owner, frame)
+        return await real_send(state, frame)
 
     async def fail(*_a, **_k):
         raise OSError("state.json locked")
@@ -1054,3 +1054,32 @@ async def test_startup_replay_follows_a_rename_made_meanwhile(env):
         mp.setattr(local_chars, "resolve_char_name", renamed)
         assert await debrief.show_owed(env.host, vid(1), own_char="A", lang="zh") is False
     assert env.host.blocks == []
+
+
+
+# ── Codex 第 13 轮 ───────────────────────────────────────────────────────
+
+
+async def test_a_rename_during_generation_sends_the_preview_to_the_renamed_character(env, monkeypatch):
+    # 生成期间角色改名、旧名字被另一只猫占用：预览按 uid 推给改名后的角色，不推给占了旧名字的那只
+    from main_logic.visit import local_chars
+    from main_routers.visit_router import host_port
+
+    hosts = {"A": Host(), "A2": Host()}
+    monkeypatch.setattr(host_port.ManagerHost, "for_character", classmethod(lambda cls, name: hosts.get(name)))
+    names = {"uid": "A"}
+
+    async def resolve(uid):
+        return names["uid"] if uid == CHAR_UID_A else None
+
+    monkeypatch.setattr(local_chars, "resolve_char_name", resolve)
+
+    async def generate_then_rename(prompt):
+        names["uid"] = "A2"
+        return GOOD_REPLY
+
+    env.llm = generate_then_rename
+    await visit(env)
+    assert (await choose("diary"))[0] == 200
+    assert hosts["A"].blocks == [] and hosts["A"].frames == []
+    assert hosts["A2"].block(debrief.preview_request_id(vid(1)))

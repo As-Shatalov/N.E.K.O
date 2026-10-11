@@ -509,19 +509,37 @@ async def _owner_signed_in(owner: str) -> bool:
     return await own_visit_uid() == owner
 
 
-async def _send(own_char: str, owner: str, frame: dict) -> bool:
-    host = _host(own_char)
-    if host is None or not await _owner_signed_in(owner):
-        return False
-    return await host.send_frame(frame)
+async def _target(state: Mapping[str, Any]) -> Optional[tuple[str, Any]]:
+    """``(current name, host)`` of the visit's character, resolved now from ``own_char_uid``.
+
+    None when another community account is signed in, the character is gone,
+    or it has no manager. Resolved at push time, never from a name looked up
+    before an await: a rename meanwhile (the freed name maybe reused by
+    another cat) must not send this visit's diary to that cat's page.
+    """
+    if not await _owner_signed_in(state["own_uid"]):
+        return None
+    name = await _own_char(state)
+    if not name:
+        return None
+    host = _host(name)
+    return (name, host) if host is not None else None
 
 
-async def _render(own_char: str, owner: str, blocks: list[dict], request_id: str) -> bool:
-    host = _host(own_char)
-    if host is None or not await _owner_signed_in(owner):
+async def _send(state: Mapping[str, Any], frame: dict) -> bool:
+    target = await _target(state)
+    if target is None:
         return False
+    return await target[1].send_frame(frame)
+
+
+async def _render(state: Mapping[str, Any], blocks: list[dict], request_id: str) -> bool:
+    target = await _target(state)
+    if target is None:
+        return False
+    name, host = target
     try:
-        return bool(await host.render_chat_blocks(blocks, request_id=request_id, source_name=own_char))
+        return bool(await host.render_chat_blocks(blocks, request_id=request_id, source_name=name))
     except Exception as exc:  # noqa: BLE001 - 页面不在：标记留在 state.json，等 bind 重放
         logger.info("visit debrief: block %s not shown: %s", request_id, type(exc).__name__)
         return False
@@ -703,10 +721,10 @@ async def _commit_held(visit_id: str, trigger: str, spool: Any, state: Mapping[s
                                  debrief_chip_pending=False)
         _cancel_timer(visit_id)
         await spool.delete_if_settled()
-        await _send(own_char, state["own_uid"], _state_frame(visit_id, "chosen", preview_request_id(visit_id), choice="diary"))
+        await _send(state, _state_frame(visit_id, "chosen", preview_request_id(visit_id), choice="diary"))
         if trigger != "http":
             # 发起页自己追加状态；后台补完时没有发起页，单独发一条
-            await _render(own_char, state["own_uid"], [{"type": "status", "tone": "success", "text": t("savedDiary", lang)}],
+            await _render(state, [{"type": "status", "tone": "success", "text": t("savedDiary", lang)}],
                           f"visit-debrief-done:{visit_id}")
         return 200, {"ok": True, "applied": "diary"}
     if result.kind == "transient":
@@ -728,8 +746,8 @@ async def _commit_held(visit_id: str, trigger: str, spool: Any, state: Mapping[s
     _cancel_timer(visit_id)
     logger.warning("visit %s: diary write step %s rejected (status %s); waiting for the user",
                    visit_id[:6], result.step, result.status)
-    await _send(own_char, state["own_uid"], commit_failed_frame(state))
-    await _render(own_char, state["own_uid"], failed_blocks(visit_id, state, lang), failed_request_id(visit_id, seq))
+    await _send(state, commit_failed_frame(state))
+    await _render(state, failed_blocks(visit_id, state, lang), failed_request_id(visit_id, seq))
     return 502, {"error": "commit_failed", "step": result.step, "status": int(result.status),
                  "written": written_of(state["debrief_writes"]),
                  "unconfirmed": unconfirmed_of(state["debrief_writes"])}
@@ -780,7 +798,7 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
                 await write_forget(spool)
                 # 帧指向页上被点的那一块：从预览块选的「不记」置灰预览块，不是早先的芯片
                 target = preview_request_id(visit_id) if current == "preview:diary" else chips_request_id(visit_id)
-                await _send(own_char, state["own_uid"], _state_frame(visit_id, "chosen", target, choice="forget"))
+                await _send(state, _state_frame(visit_id, "chosen", target, choice="forget"))
                 return 200, {"ok": True, "applied": "forget"}
             return _already_chosen(state)
         if choice == "abandon":
@@ -796,7 +814,7 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
             unconfirmed = unconfirmed_of(state["debrief_writes"])
             await write_forget(spool, final_choice="abandoned")
             _cancel_timer(visit_id)
-            await _send(own_char, state["own_uid"], _state_frame(visit_id, "chosen", failed_request_id(visit_id, seq),
+            await _send(state, _state_frame(visit_id, "chosen", failed_request_id(visit_id, seq),
                                                choice="abandoned", written=written, unconfirmed=unconfirmed))
             return 200, {"ok": True, "applied": "abandoned", "written": written, "unconfirmed": unconfirmed}
         # confirm
@@ -811,7 +829,7 @@ async def _choose(visit_id: str, choice: str, seq: Optional[int]) -> tuple[int, 
         elif current != "committing:diary":
             return _not_committing(state)
         _cancel_timer(visit_id)
-        await _send(own_char, state["own_uid"], committing_frame(state))
+        await _send(state, committing_frame(state))
         try:
             return await _run_commit_locked(visit_id, "http")
         except asyncio.CancelledError:
@@ -847,8 +865,7 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
         await spool.update_state(debrief_choice="abandoned", debrief_pending=None, debrief_chip_pending=False)
         await spool.delete_if_settled()
         # 已打开的页面上芯片还亮着：让它置灰（choice='abandoned'）
-        await _send(own_char, state["own_uid"],
-                    _state_frame(visit_id, "chosen", chips_request_id(visit_id), choice="abandoned"))
+        await _send(state, _state_frame(visit_id, "chosen", chips_request_id(visit_id), choice="abandoned"))
         return 404, {"error": "unknown_or_expired"}
     except debrief_writers.DiaryGenerationFailed:
         # 留在 generating:diary：再点「记成日记」重新生成
@@ -860,8 +877,8 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
         # 生成期间登出 / 换了账号：预览已落盘、等那个账号回来 bind 时重放，不推给现在这一页、也不回给它
         return 404, {"error": "unknown_or_expired"}
     lang = _lang()
-    await _render(own_char, state["own_uid"], preview_blocks(visit_id, pending, lang), preview_request_id(visit_id))
-    await _send(own_char, state["own_uid"], _state_frame(visit_id, "preview", preview_request_id(visit_id)))
+    await _render(state, preview_blocks(visit_id, pending, lang), preview_request_id(visit_id))
+    await _send(state, _state_frame(visit_id, "preview", preview_request_id(visit_id)))
     return 200, {"ok": True, "applied": "preview", "preview": pending}
 
 
