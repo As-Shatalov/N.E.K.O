@@ -620,3 +620,49 @@ def test_publish_finishing_after_stop_is_withdrawn():
         """
     )
     assert out == ["startLocalVideo-pending", "stopLocalVideo"]
+
+
+def test_quick_republish_after_stop_keeps_the_new_publication():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        const orig = h.trtc.startLocalVideo;
+        let finishFirst;
+        let first = true;
+        h.trtc.startLocalVideo = (c) => {
+          if (first) { first = false; h.log.push(['start-1-pending']); return new Promise((r) => { finishFirst = r; }); }
+          return orig(c);
+        };
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        h.ws.serverSend({ type: 'media', publish: false });
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        finishFirst();
+        await settle();
+        await settle();
+        return kinds(h.log).filter((k) => k.indexOf('LocalVideo') !== -1 || k.startsWith('start-'));
+        """
+    )
+    # 顺序执行：第一次发布完成 → 停止 → 第二次发布；最后停在「已发布」
+    assert out == ["start-1-pending", "stopLocalVideo", "startLocalVideo"]
+
+
+def test_superseded_while_publish_in_flight_still_stops_before_destroy():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        let finish;
+        h.trtc.startLocalVideo = (c) => { h.log.push(['start-pending']); return new Promise((r) => { finish = r; }); };
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        h.ws.serverClose(4409);
+        await settle();
+        finish();
+        await settle();
+        await settle();
+        return kinds(h.log).filter((k) => ['start-pending', 'stopLocalVideo', 'exitRoom', 'destroy'].includes(k));
+        """
+    )
+    # 被顶掉（4409）不离房，但在途的发布完成后必须停掉，然后才销毁实例
+    assert out == ["start-pending", "stopLocalVideo", "destroy"]

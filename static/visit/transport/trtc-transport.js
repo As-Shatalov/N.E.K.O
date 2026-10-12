@@ -21,8 +21,21 @@
     var leaving = false;
     var publishing = false;
     var publishedTrack = null;
-    // 发布代数：每次发布 / 撤销 / 离房都加一；发布完成时代数已变说明期间被停过，立即撤销
-    var publishGen = 0;
+    // 发布 / 撤销按顺序执行：有发布在途时，停止排在它之后、新的发布再排在停止之后，
+    // 不会出现「旧发布迟到完成后把新发布撤掉」；没有发布在途时停止同步执行（传输 WS 断开时
+    // 要在离房之前就停掉）。roomGen 只在离房时递增：离房后迟到完成的发布不记状态
+    var roomGen = 0;
+    var opChain = Promise.resolve();
+    var publishesInFlight = 0;
+    function serial(fn) {
+      var p = opChain.then(fn);
+      opChain = p.then(null, function () {});
+      return p;
+    }
+    function afterChain(p) {
+      opChain = opChain.then(function () { return p; }).then(null, function () {});
+      return p;
+    }
     var subscribeWanted = false;
     var peerVid = opts.peerVid || null;
     var remoteVideoUser = null;
@@ -162,37 +175,44 @@
         trtc.sendCustomMessage({ cmdId: cmd, data: buf });
       },
       publish: function (track, profile) {
-        if (!trtc || !joined) return Promise.resolve(false);
-        // 同一条轨已在发布：重复的 media 快照不再触发 SDK 调用（尺寸变化走 updateProfile）
-        if (publishing && publishedTrack === track) return Promise.resolve(true);
-        var config = { publish: true, option: { videoTrack: track, profile: profile } };
-        var gen = ++publishGen;
-        var p = publishing ? trtc.updateLocalVideo(config) : trtc.startLocalVideo(config);
-        // 发布成功才记状态：失败（暂时性）时下一次 media{publish:true} 还要真的再发一次
-        return p.then(function () {
-          if (gen !== publishGen) {
-            // 发布进行中收到了停止（media{publish:false} / 4409 / 离房）：不能在停止之后又发出去
-            if (trtc && joined) trtc.stopLocalVideo().catch(function () {});
-            return false;
-          }
-          publishing = true;
-          publishedTrack = track;
-          return true;
-        }, function (err) {
-          if (publishedTrack !== track) publishedTrack = null;
-          throw err;
-        });
+        publishesInFlight += 1;
+        var done = function (v) { publishesInFlight -= 1; return v; };
+        return serial(function () {
+          if (!trtc || !joined) return false;
+          // 同一条轨已在发布：重复的 media 快照不再触发 SDK 调用（尺寸变化走 updateProfile）
+          if (publishing && publishedTrack === track) return true;
+          var config = { publish: true, option: { videoTrack: track, profile: profile } };
+          var gen = roomGen;
+          var p = publishing ? trtc.updateLocalVideo(config) : trtc.startLocalVideo(config);
+          // 发布成功才记状态：失败（暂时性）时下一次 media{publish:true} 还要真的再发一次
+          return p.then(function () {
+            if (gen !== roomGen) return false;
+            publishing = true;
+            publishedTrack = track;
+            return true;
+          }, function (err) {
+            if (publishedTrack !== track) publishedTrack = null;
+            throw err;
+          });
+        }).then(done, function (err) { done(); throw err; });
       },
       updateProfile: function (profile) {
         if (!trtc || !publishing) return Promise.resolve(false);
         return trtc.updateLocalVideo({ option: { profile: profile } }).then(function () { return true; });
       },
       unpublish: function () {
-        publishGen += 1;
-        if (!trtc || !publishing) return Promise.resolve();
-        publishing = false;
-        publishedTrack = null;
-        return trtc.stopLocalVideo().catch(function () {});
+        var stop = function () {
+          if (!trtc || !publishing) return undefined;
+          publishing = false;
+          publishedTrack = null;
+          return trtc.stopLocalVideo().catch(function () {});
+        };
+        if (publishesInFlight > 0) return serial(stop);
+        return afterChain(Promise.resolve(stop()));
+      },
+      /** 队列里的发布 / 撤销都执行完（销毁前等它，免得排队的停止落在已销毁的实例上）。 */
+      idle: function () {
+        return opChain;
       },
       setPeerVid: function (vid) {
         peerVid = vid || peerVid;
@@ -213,7 +233,7 @@
         leaving = true;
         joined = false;
         remoteStarted = false;
-        publishGen += 1;
+        roomGen += 1;
         publishing = false;
         publishedTrack = null;
         if (!trtc) return Promise.resolve();

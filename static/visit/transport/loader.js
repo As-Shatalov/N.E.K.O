@@ -487,7 +487,11 @@
         // 已结束
       }
     }
-    if (this.adapter) this.adapter.destroy();
+    var adapter = this.adapter;
+    if (adapter) {
+      var idle = typeof adapter.idle === 'function' ? adapter.idle() : null;
+      Promise.resolve(idle).then(function () { adapter.destroy(); }, function () { adapter.destroy(); });
+    }
   };
 
   // ── 父页消息 ──────────────────────────────────────────────────────────

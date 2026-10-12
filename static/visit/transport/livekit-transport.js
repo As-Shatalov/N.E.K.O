@@ -46,8 +46,21 @@
     var leaving = false;
     var publication = null;
     var publishedTrack = null;
-    // 发布代数：同 TRTC 适配器，停止之后才完成的发布立即撤销
-    var publishGen = 0;
+    // 发布 / 撤销按顺序执行：有发布在途时，停止排在它之后、新的发布再排在停止之后，
+    // 不会出现「旧发布迟到完成后把新发布撤掉」；没有发布在途时停止同步执行（传输 WS 断开时
+    // 要在离房之前就停掉）。roomGen 只在离房时递增：离房后迟到完成的发布不记状态
+    var roomGen = 0;
+    var opChain = Promise.resolve();
+    var publishesInFlight = 0;
+    function serial(fn) {
+      var p = opChain.then(fn);
+      opChain = p.then(null, function () {});
+      return p;
+    }
+    function afterChain(p) {
+      opChain = opChain.then(function () { return p; }).then(null, function () {});
+      return p;
+    }
     var subscribeWanted = false;
     var peerVid = opts.peerVid || null;
     var remotePublication = null;
@@ -213,27 +226,29 @@
         if (sending && typeof sending.catch === 'function') sending.catch(function () {});
       },
       publish: function (track) {
-        if (!room || !joined) return Promise.resolve(false);
-        if (publication && publishedTrack === track) return Promise.resolve(true);
-        var gen = ++publishGen;
-        var before = publication ? room.localParticipant.unpublishTrack(publishedTrack, false) : Promise.resolve();
-        return Promise.resolve(before).then(function () {
-          return room.localParticipant.publishTrack(track, {
-            source: LK.Track.Source.Camera,
-            simulcast: false,
-            videoCodec: codecPref(creds),
-            scalabilityMode: 'L1T1',
-            degradationPreference: 'maintain-framerate',
+        publishesInFlight += 1;
+        var done = function (v) { publishesInFlight -= 1; return v; };
+        return serial(function () {
+          if (!room || !joined) return false;
+          if (publication && publishedTrack === track) return true;
+          var gen = roomGen;
+          var current = room;
+          var before = publication ? current.localParticipant.unpublishTrack(publishedTrack, false) : Promise.resolve();
+          return Promise.resolve(before).then(function () {
+            return current.localParticipant.publishTrack(track, {
+              source: LK.Track.Source.Camera,
+              simulcast: false,
+              videoCodec: codecPref(creds),
+              scalabilityMode: 'L1T1',
+              degradationPreference: 'maintain-framerate',
+            });
+          }).then(function (pub) {
+            if (gen !== roomGen) return false;
+            publication = pub;
+            publishedTrack = track;
+            return true;
           });
-        }).then(function (pub) {
-          if (gen !== publishGen) {
-            if (room) room.localParticipant.unpublishTrack(track, false).catch(function () {});
-            return false;
-          }
-          publication = pub;
-          publishedTrack = track;
-          return true;
-        });
+        }).then(done, function (err) { done(); throw err; });
       },
       /**
        * 构图 / 阶梯 / 取帧帧率变化：同一条轨就地改尺寸后 LiveKit 照常编码新尺寸
@@ -249,13 +264,19 @@
         return sender.setParameters(params).then(function () { return true; });
       },
       unpublish: function () {
-        publishGen += 1;
-        if (!room || !publication) return Promise.resolve();
-        var track = publishedTrack;
-        publication = null;
-        publishedTrack = null;
-        // stopOnUnpublish=false：画布轨留着复用
-        return room.localParticipant.unpublishTrack(track, false).catch(function () {});
+        var stop = function () {
+          if (!room || !publication) return undefined;
+          var track = publishedTrack;
+          publication = null;
+          publishedTrack = null;
+          // stopOnUnpublish=false：画布轨留着复用
+          return room.localParticipant.unpublishTrack(track, false).catch(function () {});
+        };
+        if (publishesInFlight > 0) return serial(stop);
+        return afterChain(Promise.resolve(stop()));
+      },
+      idle: function () {
+        return opChain;
       },
       setPeerVid: function (vid) {
         peerVid = vid || peerVid;
@@ -270,7 +291,7 @@
       leave: function () {
         leaving = true;
         joined = false;
-        publishGen += 1;
+        roomGen += 1;
         publication = null;
         publishedTrack = null;
         remotePublication = null;
