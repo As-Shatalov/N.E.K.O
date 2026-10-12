@@ -214,3 +214,22 @@ def test_malformed_explicit_visit_id_is_refused(mint_mod, bad):
     with pytest.raises(mint_mod.DevMintError):
         mint_mod.build_claims(role="guest", visit_id=bad, visit_uid=VISIT_UID, iat=NOW)
     assert mint_mod.build_claims(role="guest", visit_id=VISIT_ID, visit_uid=VISIT_UID, iat=NOW)["visit_id"] == VISIT_ID
+
+
+@pytest.mark.parametrize("field,bad", (
+    ("visit_uid", "abc"),
+    ("visit_uid", "G" * 24),
+    ("vid", "h_" + "0" * 24),          # guest 票不能用 host 的 vid
+    ("vid", "g_" + "0" * 23),
+    ("char_tag", "abc"),
+    ("char_tag", "Z" * 32),
+    ("jti", "short"),
+))
+def test_malformed_explicit_identifiers_are_refused(mint_mod, field, bad):
+    kwargs = {"role": "guest", "visit_id": VISIT_ID, "visit_uid": VISIT_UID, "iat": NOW}
+    kwargs[field] = bad
+    with pytest.raises(mint_mod.DevMintError):
+        mint_mod.build_claims(**kwargs)
+    good = mint_mod.build_claims(role="guest", visit_id=VISIT_ID, visit_uid=VISIT_UID, iat=NOW,
+                                 vid="g_" + "0" * 24, char_tag="a" * 32, jti="J" * 22)
+    assert good["vid"] == "g_" + "0" * 24 and good["char_tag"] == "a" * 32 and good["jti"] == "J" * 22

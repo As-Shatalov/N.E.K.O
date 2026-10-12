@@ -70,6 +70,11 @@ with contextlib.redirect_stdout(sys.stderr):
 ROLES = ("guest", "host")
 TRANSPORTS = ("livekit", "trtc")
 VISIT_ID_RE = re.compile(r"[A-Za-z0-9_-]{22}")
+# Shapes the production credentials path issues (contract §4.7): sub = HMAC[:24] hex,
+# vid = role initial + "_" + 24 hex, char_tag = 32 hex, jti = 22 base64url characters
+VISIT_UID_RE = re.compile(r"[0-9a-f]{24}")
+CHAR_TAG_RE = re.compile(r"[0-9a-f]{32}")
+JTI_RE = re.compile(r"[A-Za-z0-9_-]{22}")
 
 
 class DevMintError(Exception):
@@ -159,6 +164,14 @@ def build_claims(
     if visit_id and not VISIT_ID_RE.fullmatch(visit_id):
         # The transport page and the backend session both require this format; never sign an unusable ticket
         raise DevMintError("visit_id must be 22 characters of [A-Za-z0-9_-]")
+    if visit_uid and not VISIT_UID_RE.fullmatch(visit_uid):
+        raise DevMintError("visit_uid must be 24 lowercase hex characters")
+    if vid and not re.fullmatch(rf"{role[0]}_[0-9a-f]{{24}}", vid):
+        raise DevMintError(f"vid must be '{role[0]}_' followed by 24 lowercase hex characters for role {role}")
+    if char_tag and not CHAR_TAG_RE.fullmatch(char_tag):
+        raise DevMintError("char_tag must be 32 lowercase hex characters")
+    if jti and not JTI_RE.fullmatch(jti):
+        raise DevMintError("jti must be 22 characters of [A-Za-z0-9_-]")
     visit_id = visit_id or secrets.token_urlsafe(16)
     visit_uid = visit_uid or secrets.token_hex(12)
     iat = int(time.time()) if iat is None else int(iat)

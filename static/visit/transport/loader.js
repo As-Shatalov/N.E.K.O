@@ -178,6 +178,7 @@
     this.softencSince = null;
     this.statsMark = null;
     this.statsGen = 0;
+    this.statsSeq = 0;
     this.codecOverride = null;
     this.publishRetries = 0;
     this.publishRetryTimer = null;
@@ -729,6 +730,8 @@
     var next = !!on;
     if (next === this.hidden) return;
     this.hidden = next;
+    // 隐藏期间对端报的低帧率不代表恢复显示后的连接
+    if (!next) this.peerRxFps = null;
     this.scheduleHiddenReport();
   };
 
@@ -759,6 +762,7 @@
     var now = this.now();
     var self = this;
     var gen = this.statsGen;
+    var seq = ++this.statsSeq;
     var base = this.adapter ? this.adapter.stats() : {};
     var out = { type: 'stats', dc_queue: this.core.queueLength() };
     ['enc_fps', 'tx_kbps', 'tx_w', 'tx_h', 'rx_kbps', 'rtt_ms', 'loss_pct'].forEach(function (k) {
@@ -777,6 +781,7 @@
     }
     var finish = function (extra) {
       if (gen !== self.statsGen) return;   // 取样期间离开了在房状态：这拍作废
+      if (seq !== self.statsSeq) return;   // 比这拍更新的取样已经发出：慢回来的旧拍不再发、不喂阶梯
       if (extra) {
         ['enc_fps', 'tx_kbps', 'tx_w', 'tx_h'].forEach(function (key) {
           if (typeof extra[key] === 'number' && isFinite(extra[key])) out[key] = extra[key];
@@ -822,6 +827,11 @@
 
   P.stepLadder = function (now) {
     if (!this.ladder || !this.media.publish) return;
+    if (this.hidden) {
+      // 模型被隐藏 / 最小化时本来就不出帧，对端 rx_fps 为 0 不是拥塞：计时器重新起算，不降档
+      this.ladder.reset(this.ladder.crop, this.ladder.level);
+      return;
+    }
     var rxFps = this.peerRxFps && now - this.peerRxFps.at <= PEER_STATS_FRESH_MS ? this.peerRxFps.value : undefined;
     // 丢包样本与对端接收帧率同样只认新鲜的（重连期间 SDK 可能不再回调质量）
     var current = this.adapter && typeof this.adapter.currentLossPct === 'function' ? this.adapter.currentLossPct() : undefined;

@@ -425,6 +425,8 @@
           if (!inbound) return null;
           var mark = { at: nowMs, bytes: inbound.bytesReceived || 0, lost: inbound.packetsLost || 0, recv: inbound.packetsReceived || 0 };
           var prev = rxMark;
+          // 慢回来的旧取样（比当前基准还早）不覆盖基准
+          if (prev && !(mark.at > prev.at)) return null;
           rxMark = mark;
           var out = {};
           if (rttS !== null) out.rtt_ms = Math.round(rttS * 1000);
@@ -456,6 +458,7 @@
           // 浏览器不给 framesPerSecond 时用 framesSent 推，不能退回打包器的出帧数（编码器丢帧看不出来）
           if (typeof s.timestamp === 'number') {
             var prev = txMark;
+            if (prev && !(s.timestamp > prev.at)) return null;
             txMark = { at: s.timestamp, bytes: s.bytesSent, frames: s.framesSent };
             if (prev && txMark.at > prev.at) {
               var dt = txMark.at - prev.at;

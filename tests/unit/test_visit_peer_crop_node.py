@@ -451,3 +451,24 @@ def test_live2d_capture_flag_follows_a_replaced_manager():
         files=BRIDGE_FILES,
     )
     assert out == {"before": True, "after": {"old": False, "current": True}, "ended": False}
+
+
+def test_inactive_live2d_manager_is_not_flagged_or_hooked():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge();
+        let type = 'live2d';
+        h.ctx.avatarPortrait.normalizeModelType = () => type;
+        await open(h, 'guest');
+        change(h, 'started');
+        await advance(700);
+        const live = { flag: h.ctx.live2dManager._visitCaptureActive, hooked: !!h.handlers.postrender };
+        type = 'vrm';
+        await advance(1500);
+        const vrm = { flag: h.ctx.live2dManager._visitCaptureActive, hooked: !!h.handlers.postrender };
+        change(h, 'ended');
+        return { live, vrm };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out == {"live": {"flag": True, "hooked": True}, "vrm": {"flag": False, "hooked": False}}

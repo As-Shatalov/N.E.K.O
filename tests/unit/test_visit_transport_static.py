@@ -1861,3 +1861,83 @@ def test_stalled_connect_attempt_is_bounded():
         """
     )
     assert out == {"first": {"closed": True, "retried": True}, "reconnect": {"terminal": True, "within": True}}
+
+
+def test_slow_stats_sample_overtaken_by_a_newer_one_is_dropped():
+    out = run_visit_js(
+        """
+        const h = await joinedController('host');
+        h.c.media.subscribe = true;
+        const releases = [];
+        h.c.adapter.receiverStats = () => new Promise((r) => releases.push(r));
+        h.c.collectStats();          // 旧拍：慢
+        h.c.collectStats();          // 新拍：先回来
+        releases[1]({ rx_kbps: 200 });
+        await settle();
+        releases[0]({ rx_kbps: 999 });
+        await settle();
+        return h.ws.sent.filter((m) => m.type === 'stats').map((m) => m.rx_kbps);
+        """
+    )
+    assert out == [200]
+
+
+def test_livekit_older_receiver_sample_does_not_rewind_the_baseline():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9' } });
+        await a.setSubscribe(true);
+        const holds = [];
+        const report = (bytes) => new Map([['in', { type: 'inbound-rtp', kind: 'video', bytesReceived: bytes, packetsReceived: 0, packetsLost: 0 }]]);
+        const receiver = { getStats: () => new Promise((r) => holds.push(r)) };
+        const pub = { kind: 'video', setSubscribed() {} };
+        LK.Room.last.emit('TrackPublished', pub, { identity: 'g_peer' });
+        LK.Room.last.emit('TrackSubscribed', { kind: 'video', mediaStreamTrack: {}, receiver }, pub, { identity: 'g_peer' });
+        const older = a.receiverStats(5000);
+        const newer = a.receiverStats(10000);
+        holds[1](report(700000));
+        await newer;
+        holds[0](report(350000));
+        const stale = await older;
+        const p = a.receiverStats(15000);
+        holds[2](report(1050000));
+        const next = await p;
+        return { stale, next: next.rx_kbps };
+        """
+    )
+    assert out == {"stale": None, "next": 560}
+
+
+def test_hidden_avatar_pauses_the_congestion_ladder():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        const run = (hidden) => {
+          h.c.ladder.reset('upper', 0);
+          h.c.hidden = hidden;
+          let level = 0;
+          for (const t of [0, 5000, 10000, 15000, 20000]) {
+            h.c.peerRxFps = { value: 0, at: t };
+            h.c.stepLadder(t);
+            level = h.c.ladder.level;
+          }
+          h.c.setGeometry('upper', 0);
+          return level;
+        };
+        const hidden = run(true);
+        const shown = run(false);
+        h.c.peerRxFps = { value: 0, at: 0 };
+        h.c.hidden = true;
+        h.c.onParentHidden(false);
+        return { hidden, shown, clearedOnShow: h.c.peerRxFps };
+        """
+    )
+    assert out["hidden"] == 0 and out["shown"] >= 1 and out["clearedOnShow"] is None
