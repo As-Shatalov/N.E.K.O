@@ -449,7 +449,7 @@ _FAKE_LIVEKIT = """
 function makeFakeLK(log) {
   const RoomEvent = {};
   ['ParticipantConnected', 'ParticipantDisconnected', 'TrackPublished', 'TrackUnpublished', 'TrackSubscribed',
-   'TrackUnsubscribed', 'DataReceived', 'Reconnecting', 'Reconnected', 'Disconnected', 'ConnectionQualityChanged']
+   'TrackUnsubscribed', 'TrackSubscriptionFailed', 'DataReceived', 'Reconnecting', 'Reconnected', 'Disconnected', 'ConnectionQualityChanged']
     .forEach((n) => { RoomEvent[n] = n; });
   const sender = {
     params: { encodings: [{ maxBitrate: 560000, maxFramerate: 30 }] },
@@ -1257,3 +1257,105 @@ def test_packer_flips_mirrored_sources():
         """
     )
     assert out == {"plain": 0, "mirrored": 2, "restored": True}
+
+
+def test_livekit_publish_reports_a_profile_that_did_not_apply():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp8' } });
+        LK.sender.setParameters = () => Promise.reject(new Error('busy'));
+        const profile = { width: 256, height: 704, frameRate: 15, bitrate: 400 };
+        const track = { id: 'pack' };
+        return [await a.publish(track, profile), await a.publish(track, profile)];
+        """
+    )
+    assert out == ["profile_failed", "profile_failed"]
+
+
+def test_controller_retries_a_profile_the_publication_could_not_apply():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        const orig = h.c.adapter.publish;
+        h.c.adapter.publish = (t, p) => orig(t, p).then((ok) => ok === true ? 'profile_failed' : ok);
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        return { updates: kinds(h.log).filter((k) => k === 'updateLocalVideo').length,
+                 announced: h.posted.filter((m) => m.t === 'publish').map((m) => m.on) };
+        """
+    )
+    assert out == {"updates": 1, "announced": [True]}
+
+
+def test_queue_reset_sends_the_backpressure_falling_edge_once():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const reports = [];
+        const core = new ctx.NekoVisitTransport.TransportCore({ visitId: VISIT_ID, onRecv() {}, onBackpressure: (b) => reports.push(b.on) });
+        core.reset();
+        core.backpressure = true;
+        core.reset();
+        core.reset();
+        return reports;
+        """
+    )
+    assert out == [False]
+
+
+def test_trtc_leave_waits_for_a_pending_profile_update():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        let finish;
+        h.trtc.updateLocalVideo = () => new Promise((r) => { finish = r; });
+        h.c.adapter.updateProfile({ width: 256, height: 704, frameRate: 30, bitrate: 400 });
+        await settle();
+        let left = false;
+        h.c.adapter.leave().then(() => { left = true; });
+        await settle();
+        const before = left;
+        finish();
+        await settle();
+        return { before, after: left };
+        """
+    )
+    assert out == {"before": False, "after": True}
+
+
+def test_livekit_failed_subscription_is_retried():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9' } });
+        const room = LK.Room.last;
+        const calls = [];
+        const pub = { kind: 'video', trackSid: 'TR_1', setSubscribed: (on) => calls.push(on) };
+        const peer = { identity: 'g_peer' };
+        room.emit('TrackPublished', pub, peer);
+        await a.setSubscribe(true);
+        room.emit('TrackSubscriptionFailed', 'TR_1', peer);
+        await advance(1900);
+        const early = calls.slice();
+        await advance(200);
+        room.emit('TrackSubscriptionFailed', 'TR_1', peer);
+        await a.setSubscribe(false);
+        await advance(10000);
+        return { early, all: calls };
+        """
+    )
+    assert out == {"early": [True], "all": [True, False, True, False]}

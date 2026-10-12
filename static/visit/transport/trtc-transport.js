@@ -235,9 +235,13 @@
           });
         }).then(done, function (err) { done(); throw err; });
       },
+      /** 与发布 / 撤销共用一条队列：离房的完成等它，先后两次修改不会倒序生效。 */
       updateProfile: function (profile) {
-        if (!trtc || !publishing) return Promise.resolve(false);
-        return trtc.updateLocalVideo({ option: { profile: profile } }).then(function () { return true; });
+        var gen = roomGen;
+        return serial(function () {
+          if (!trtc || !publishing || gen !== roomGen) return false;
+          return trtc.updateLocalVideo({ option: { profile: profile } }).then(function () { return true; });
+        });
       },
       unpublish: function () {
         var stop = function () {

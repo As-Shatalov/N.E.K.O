@@ -409,11 +409,14 @@
     var track = this.packer.ensureTrack();
     var sent = this.profile();
     this.adapter.publish(track, sent).then(function (ok) {
+      // 'profile_failed'：轨已发布，但发送端码率 / 帧率上限没设上，交给 pushProfile 重试
+      var profileFailed = ok === 'profile_failed';
+      if (profileFailed) ok = true;
       if (ok === true && self.media.publish && !self.stopped) {
         self.publishRetries = 0;
         // 发布挂起期间构图 / 阶梯 / 取帧帧率变了（那时 updateProfile 因未发布而无效）：补一次
         var now = self.profile();
-        if (now.width !== sent.width || now.height !== sent.height || now.frameRate !== sent.frameRate || now.bitrate !== sent.bitrate) {
+        if (profileFailed || now.width !== sent.width || now.height !== sent.height || now.frameRate !== sent.frameRate || now.bitrate !== sent.bitrate) {
           self.pushProfile();
         }
         self.announcePublish(true);

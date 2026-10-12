@@ -10,6 +10,8 @@
   'use strict';
 
   var NVT = root.NekoVisitTransport = root.NekoVisitTransport || {};
+  var SUB_RETRY_BASE_MS = 2000;      // 订阅失败后的首次重试间隔，之后翻倍
+  var SUB_RETRY_MAX_MS = 30000;
 
   function reasonName(LK, reason) {
     var table = LK && LK.DisconnectReason;
@@ -69,6 +71,8 @@
     var txMark = null;
     var localQuality = null;
     var entering = null;
+    var subRetries = 0;
+    var subRetryTimer = null;
 
     function vendorOf(c) {
       return (c && c.vendor && c.vendor.livekit) || {};
@@ -111,8 +115,28 @@
     function considerPublication(pub, participant) {
       if (!participant || !isPeer(participant.identity)) return;
       if (!pub || pub.kind !== 'video') return;
+      if (pub !== remotePublication) subRetries = 0;
       remotePublication = pub;
       if (subscribeWanted) pub.setSubscribed(true);
+    }
+
+    function clearSubRetry() {
+      if (subRetryTimer !== null) clearTimeout(subRetryTimer);
+      subRetryTimer = null;
+    }
+
+    /** 订阅失败（暂时性协商失败）：同一发布仍想看时按退避重新请求，直到取消订阅 / 对端撤销发布 / 离房。 */
+    function retrySubscription(pub) {
+      clearSubRetry();
+      var gen = roomGen;
+      var delay = Math.min(SUB_RETRY_MAX_MS, SUB_RETRY_BASE_MS * Math.pow(2, subRetries));
+      subRetries += 1;
+      subRetryTimer = setTimeout(function () {
+        subRetryTimer = null;
+        if (gen !== roomGen || !subscribeWanted || pub !== remotePublication) return;
+        pub.setSubscribed(false);
+        pub.setSubscribed(true);
+      }, delay);
     }
 
     function bind() {
@@ -135,12 +159,15 @@
       });
       room.on(E.TrackUnpublished, function (pub, participant) {
         if (pub === remotePublication && participant && isPeer(participant.identity)) {
+          clearSubRetry();
           remotePublication = null;
           handlers.onRemoteTrack(null);
         }
       });
       room.on(E.TrackSubscribed, function (track, pub, participant) {
         if (!participant || !isPeer(participant.identity) || track.kind !== 'video' || !subscribeWanted) return;
+        subRetries = 0;
+        clearSubRetry();
         remoteTrack = track;
         rxMark = null;
         handlers.onRemoteTrack(track.mediaStreamTrack);
@@ -151,6 +178,13 @@
           remoteTrack = null;
           handlers.onRemoteTrack(null);
         }
+      });
+      room.on(E.TrackSubscriptionFailed, function (trackSid, participant) {
+        var pub = remotePublication;
+        if (!pub || !subscribeWanted || !participant || !isPeer(participant.identity)) return;
+        if (pub.trackSid && trackSid && pub.trackSid !== trackSid) return;
+        handlers.onLog('warn', 'livekit subscription failed', 'subscribe_failed');
+        retrySubscription(pub);
       });
       room.on(E.DataReceived, function (payload, participant, kind, topic) {
         if (!participant) return;
@@ -254,7 +288,7 @@
           // 同一条轨已在发布：SDK 整体重连时会按发布时的选项重发（码率 / 帧率回到房间默认），
           // 这里按调用方给的当前 profile 再设一次发送端参数
           if (publication && publishedTrack === track) {
-            return applyProfile(profile).then(function () { return true; }, function () { return true; });
+            return applyProfile(profile).then(function () { return true; }, function () { return 'profile_failed'; });
           }
           var gen = roomGen;
           var current = room;
@@ -275,8 +309,9 @@
             publication = pub;
             publishedTrack = track;
             txMark = null;
-            // 发布时就按传入的 profile 设码率 / 帧率上限（重连恢复的降档级别、兼容模式 15 fps）
-            return applyProfile(profile).then(function () { return true; }, function () { return true; });
+            // 发布时就按传入的 profile 设码率 / 帧率上限（重连恢复的降档级别、兼容模式 15 fps）；
+            // 设不上不算发布失败，但要让控制器走 pushProfile 的重试（返回 'profile_failed'）
+            return applyProfile(profile).then(function () { return true; }, function () { return 'profile_failed'; });
           });
         }).then(done, function (err) { done(); throw err; });
       },
@@ -285,7 +320,11 @@
        * （T14 验证；不接受时退 replaceTrack），码率上限与帧率上限改在发送端编码参数上。
        */
       updateProfile: function (profile) {
-        return applyProfile(profile);
+        var gen = roomGen;
+        return serial(function () {
+          if (gen !== roomGen) return false;
+          return applyProfile(profile);
+        });
       },
       unpublish: function () {
         var stop = function () {
@@ -307,6 +346,7 @@
       },
       setSubscribe: function (on) {
         subscribeWanted = !!on;
+        if (!subscribeWanted) clearSubRetry();
         if (remotePublication) remotePublication.setSubscribed(subscribeWanted);
         if (!subscribeWanted) handlers.onRemoteTrack(null);
         return Promise.resolve();
@@ -323,6 +363,8 @@
         rxMark = null;
         txMark = null;
         localQuality = null;
+        subRetries = 0;
+        clearSubRetry();
         if (!room) return Promise.resolve();
         var disconnecting = room.disconnect(false).catch(function () {});
         return Promise.all([disconnecting, opChain, entering]).then(function () {});
