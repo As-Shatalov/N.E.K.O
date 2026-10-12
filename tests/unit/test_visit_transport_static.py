@@ -1118,3 +1118,102 @@ def test_trtc_leave_waits_for_a_pending_enter_room():
         """
     )
     assert out == {"leftBefore": False, "leftAfter": True, "states": ["joining"], "canSend": False}
+
+
+def test_failed_manual_rejoin_is_retried_within_the_window():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        let fails = 2;
+        const orig = h.trtc.enterRoom;
+        h.trtc.enterRoom = (p) => { if (fails > 0) { fails -= 1; h.log.push(['enterRoom-fail']); return Promise.reject(new Error('transient')); } return orig(p); };
+        h.c.rejoin();
+        await settle();
+        await advance(1100); await settle();
+        await advance(2100); await settle();
+        return { calls: kinds(h.log).filter((k) => k.startsWith('enterRoom')),
+                 errors: h.ws.sent.filter((m) => m.type === 'state' && m.state === 'error').length };
+        """
+    )
+    assert out == {"calls": ["enterRoom", "enterRoom-fail", "enterRoom-fail", "enterRoom"], "errors": 0}
+
+
+def test_manual_rejoin_reports_error_once_the_window_is_spent():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.trtc.enterRoom = () => { h.log.push(['enterRoom-fail']); return Promise.reject(new Error('down')); };
+        h.c.rejoin();
+        await settle();
+        for (let i = 0; i < 8; i++) { await advance(5000); await settle(); }
+        return { fails: kinds(h.log).filter((k) => k === 'enterRoom-fail').length,
+                 errors: h.ws.sent.filter((m) => m.type === 'state' && m.state === 'error').length };
+        """
+    )
+    assert out["errors"] == 1
+    assert 3 <= out["fails"] <= 5
+
+
+def test_leaving_the_room_state_drops_cached_peer_fps():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.c.peerRxFps = { value: 5, at: clock.now };
+        h.c.onVendorState('reconnecting', {});
+        const afterState = h.c.peerRxFps;
+        h.c.peerRxFps = { value: 5, at: clock.now };
+        h.c.stopAllMedia();
+        return [afterState, h.c.peerRxFps];
+        """
+    )
+    assert out == [None, None]
+
+
+def test_livekit_late_unsubscribe_of_an_old_track_keeps_the_new_one():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        const tracks = [];
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack(t) { tracks.push(t ? t.id : null); }, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9' } });
+        await a.setSubscribe(true);
+        const room = LK.Room.last;
+        const oldT = { kind: 'video', mediaStreamTrack: { id: 'old' } };
+        const newT = { kind: 'video', mediaStreamTrack: { id: 'new' } };
+        room.emit('TrackSubscribed', oldT, {}, { identity: 'g_peer' });
+        room.emit('TrackSubscribed', newT, {}, { identity: 'g_peer' });
+        room.emit('TrackUnsubscribed', oldT);
+        const afterOld = tracks.slice();
+        room.emit('TrackUnsubscribed', newT);
+        return { afterOld, all: tracks };
+        """
+    )
+    assert out == {"afterOld": ["old", "new"], "all": ["old", "new", None]}
+
+
+def test_livekit_republish_of_the_same_track_reapplies_the_profile():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const log = [];
+        const LK = makeFakeLK(log);
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp8', bitrate_kbps: 560, fps: 30 } });
+        const track = { id: 'pack' };
+        const profile = { width: 256, height: 704, frameRate: 15, bitrate: 400 };
+        await a.publish(track, profile);
+        // SDK 整体重连按发布选项重发：发送端参数回到默认
+        LK.sender.params = { encodings: [{ maxBitrate: 560000, maxFramerate: 30 }] };
+        const mark = log.length;
+        const ok = await a.publish(track, profile);
+        return { ok, again: log.slice(mark).filter((e) => e[0] === 'setParameters'), publishes: log.filter((e) => e[0] === 'publishTrack').length };
+        """
+    )
+    assert out == {"ok": True, "again": [["setParameters", 400000, 15]], "publishes": 1}

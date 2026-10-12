@@ -146,8 +146,9 @@
         handlers.onRemoteTrack(track.mediaStreamTrack);
       });
       room.on(E.TrackUnsubscribed, function (track) {
-        if (track && track.kind === 'video') {
-          if (track === remoteTrack) remoteTrack = null;
+        // 只认当前那条轨：迟到的旧轨取消订阅不能把已经换上的新轨也撤掉
+        if (track && track.kind === 'video' && track === remoteTrack) {
+          remoteTrack = null;
           handlers.onRemoteTrack(null);
         }
       });
@@ -250,7 +251,11 @@
         var done = function (v) { publishesInFlight -= 1; return v; };
         return serial(function () {
           if (!room || !joined) return false;
-          if (publication && publishedTrack === track) return true;
+          // 同一条轨已在发布：SDK 整体重连时会按发布时的选项重发（码率 / 帧率回到房间默认），
+          // 这里按调用方给的当前 profile 再设一次发送端参数
+          if (publication && publishedTrack === track) {
+            return applyProfile(profile).then(function () { return true; }, function () { return true; });
+          }
           var gen = roomGen;
           var current = room;
           var before = publication ? current.localParticipant.unpublishTrack(publishedTrack, false) : Promise.resolve();

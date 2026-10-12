@@ -30,6 +30,9 @@
   var SOFTENC_FPS_RATIO = 0.9;        // 27 / 30：编码帧率低于目标帧率的 90 % 算软编跟不上
   var PUBLISH_RETRY_BASE_MS = 2000;   // SDK 拒绝发布后的首次重试间隔，之后翻倍
   var PUBLISH_RETRY_MAX_MS = 30000;
+  // 后端判自己断线是断开后 25 s：手动重新入房失败时在这个窗口内按退避再试，不让一次暂时性失败拖到判死
+  var REJOIN_RETRY_WINDOW_MS = 20000;
+  var REJOIN_RETRY_BASE_MS = 1000;
   var VISIT_ID_RE = /^[A-Za-z0-9_-]{22}$/;
   var IN_ROOM = { joined: 1, connected: 1 };
 
@@ -177,6 +180,9 @@
     this.codecOverride = null;
     this.publishRetries = 0;
     this.publishRetryTimer = null;
+    this.rejoinUntil = 0;
+    this.rejoinAttempts = 0;
+    this.rejoinTimer = null;
     var self = this;
     this.core = new NVT.TransportCore({
       visitId: this.visitId,
@@ -338,14 +344,45 @@
     if (this.stopped || !this.creds) return;
     var adapter = this.ensureAdapter();
     var self = this;
+    var gen = this.connGen;
     adapter.join(this.creds).then(function () {
+      self.rejoinUntil = 0;
+      self.rejoinAttempts = 0;
       self.core.flush();
       self.reapplyMedia();
     }, function (err) {
       var code = (err && err.errorCode) || 'join_failed';
       self.log('warn', 'vendor join failed', code);
+      if (self.scheduleRejoinRetry(gen)) return;
       self.onVendorState('error', { error_code: code });
     });
+  };
+
+  /** 手动重新入房失败：还在重试窗口里、传输 WS 没换代就按退避再试一次；排上了返回 true。 */
+  P.scheduleRejoinRetry = function (gen) {
+    if (!this.rejoinUntil || this.stopped || gen !== this.connGen || !this.link.ws) return false;
+    var delay = REJOIN_RETRY_BASE_MS * Math.pow(2, this.rejoinAttempts);
+    if (this.now() + delay >= this.rejoinUntil) {
+      this.rejoinUntil = 0;
+      return false;
+    }
+    this.rejoinAttempts += 1;
+    var self = this;
+    this.cancelRejoinRetry(true);
+    this.rejoinTimer = setTimeout(function () {
+      self.rejoinTimer = null;
+      if (!self.stopped && gen === self.connGen && self.link.ws) self.join();
+    }, delay);
+    return true;
+  };
+
+  P.cancelRejoinRetry = function (keepWindow) {
+    if (this.rejoinTimer) clearTimeout(this.rejoinTimer);
+    this.rejoinTimer = null;
+    if (!keepWindow) {
+      this.rejoinUntil = 0;
+      this.rejoinAttempts = 0;
+    }
   };
 
   /**
@@ -412,6 +449,8 @@
   P.rejoin = function () {
     if (this.stopped || this.rejoining || !this.adapter || !this.creds) return;
     this.rejoining = true;
+    this.rejoinUntil = this.now() + REJOIN_RETRY_WINDOW_MS;
+    this.rejoinAttempts = 0;
     var self = this;
     this.stopAllMedia();
     this.adapter.leave().then(function () {
@@ -425,8 +464,9 @@
   P.onVendorState = function (state, extra) {
     this.vendorState = state;
     if (!IN_ROOM[state]) {
-      // 断线 / 重连期间的观测不代表恢复后的连接：丢掉旧丢包样本，阶梯两个计时器重新起算
+      // 断线 / 重连期间的观测不代表恢复后的连接：丢掉旧丢包样本与对端接收帧率，阶梯两个计时器重新起算
       this.loss = null;
+      this.peerRxFps = null;
       if (this.ladder) this.ladder.reset(this.ladder.crop, this.ladder.level);
     }
     if (state === 'kicked') {
@@ -561,6 +601,7 @@
     this.media.publish = false;
     this.cancelPublishRetry();
     this.loss = null;
+    this.peerRxFps = null;
     this.announcePublish(false);
     this.media.subscribe = false;
     if (this.packer) this.packer.active = false;
@@ -577,6 +618,7 @@
   P.leaveRoom = function () {
     // 传输 WS 断了：这一代连接上还没跑完的 SDK 加载 / 能力门不能再去入房（重连后按新凭证重来）
     this.connGen += 1;
+    this.cancelRejoinRetry(false);
     this.peerPresent = false;
     this.vendorState = 'left';
     return this.adapter ? this.adapter.leave() : Promise.resolve();
@@ -604,6 +646,7 @@
 
   P.teardown = function () {
     this.cancelPublishRetry();
+    this.cancelRejoinRetry(false);
     if (this.statsTimer) clearInterval(this.statsTimer);
     this.statsTimer = null;
     if (this.hiddenTimer) clearTimeout(this.hiddenTimer);
