@@ -91,3 +91,58 @@ def test_controller_steps_the_ladder_from_peer_stats_in_place():
     assert out["same"]
     assert out["updates"][0] == [208, 896, 400]
     assert out["size"] in ([208, 896], [160, 704])
+
+
+def test_congestion_level_survives_reconnect_and_reload():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        const store = new Map();
+        h.ctx.sessionStorage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)) };
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'full', ladder: 0 });
+        await settle();
+        h.c.setGeometry('full', 1);                       // 拥塞阶梯降了一级
+        // 传输 WS 重连：首发凭证 + 后端快照（ladder 恒 0）
+        h.ws.serverClose(1006);
+        await advance(1100);
+        const ws2 = h.sockets[h.sockets.length - 1];
+        ws2.serverOpen();
+        ws2.serverSend(credsFor('guest', { crop: 'full' }));
+        await settle();
+        ws2.serverSend({ type: 'media', publish: true, crop: 'full', ladder: 0 });
+        await settle();
+        const afterReconnect = [h.c.media.ladder, h.c.packer.pack.width, h.c.packer.pack.height];
+        // Pet 页重载（同一标签页）：新控制器从 sessionStorage 接着用
+        const c2 = new h.NVT.loader.VisitTransportController({ window: h.ctx, document: h.ctx.document, side: 'guest',
+          visitId: VISIT_ID, post: () => {}, log: () => {}, loadSdk: () => Promise.resolve(h.TRTC) });
+        c2.preflight = { ok: true };
+        c2.onCredentials(credsFor('guest', { crop: 'full' }));
+        const afterReload = [c2.media.ladder, c2.packer.pack.width];
+        // 换构图从 0 级开始
+        c2.onCredentials(credsFor('guest', { crop: 'upper' }));
+        return { afterReconnect, afterReload, otherCrop: c2.media.ladder };
+        """
+    )
+    assert out["afterReconnect"] == [1, 208, 896]
+    assert out["afterReload"] == [1, 208]
+    assert out["otherCrop"] == 0
+
+
+def test_duplicate_publish_snapshots_while_pending_publish_once():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        let finish;
+        const orig = h.trtc.startLocalVideo;
+        h.trtc.startLocalVideo = (c) => { h.log.push(['start-pending']); return new Promise((r) => { finish = () => r(orig(c)); }); };
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        finish();
+        await settle();
+        await settle();
+        return kinds(h.log).filter((k) => k.indexOf('LocalVideo') !== -1 || k === 'start-pending');
+        """
+    )
+    # 第二个快照排在第一个之后执行，看到同一条轨已发布就不再调 SDK，也不撤销
+    assert out == ["start-pending", "startLocalVideo"]

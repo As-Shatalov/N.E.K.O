@@ -5,7 +5,7 @@
 | 文件 | 作用 |
 |---|---|
 | `docker-compose.yml` | 两个服务：`caddy`（现场用 xcaddy 构建 caddy-l4）与 `livekit`（`livekit/livekit-server`），都用 host 网络 |
-| `Caddyfile` | 443 上的四层 SNI 分流：TURN 域名 → LiveKit TURN/TLS，信令域名 → LiveKit HTTP / WebSocket |
+| `Caddyfile` | 443 上的四层 SNI 分流：TURN 域名 → LiveKit TURN/TLS（带 PROXY v2 头，配合 `turn.proxy_protocol: true` 保住客户端地址；需 livekit-server ≥ v1.13.7），信令域名 → LiveKit HTTP / WebSocket |
 | `livekit.yaml` | LiveKit 配置：`auto_create:false`、`max_participants:2`、`departure_timeout:60` 等 |
 | `.env`（自己建，不入库） | 域名、证书邮箱、API key / secret |
 
@@ -82,7 +82,7 @@ API key / secret 只出现在本机 `.env` 与 Servers 的密钥托管里；客�
 
 ## 验收清单（上线前全部通过）
 
-1. **只放行 TCP 443 的客户端能经 TURN/TLS 入房**：在一台出站只允许 TCP 443 的机器（或防火墙规则模拟）上用浏览器入房，`chrome://webrtc-internals` 里选中的 candidate pair 的本地候选是 `relay`、协议 `tls`，视频与数据通道都正常。
+1. **只放行 TCP 443 的客户端能经 TURN/TLS 入房**：在一台出站只允许 TCP 443 的机器（或防火墙规则模拟）上用浏览器入房，`chrome://webrtc-internals` 里选中的 candidate pair 的本地候选是 `relay`、协议 `tls`，视频与数据通道都正常；再用 Firefox 测一次（Caddy 的 PROXY v2 头与 `turn.proxy_protocol: true` 缺一边时，TURN 会把 `127.0.0.1` 当映射地址回给客户端，Firefox 直接拒绝）。
 2. **`DeleteRoom` 后未过期的 JWT 连接必须失败**：Servers `CreateRoom` → 签一张 10 min JWT → 入房成功后退出 → `DeleteRoom` → 用同一张 JWT 再连，必须失败、且服务端没有新建房间（`ListRooms` 里没有它）。
 3. **未 `CreateRoom` 的房间名不能入房**：用合法签名、指向不存在房间的 JWT 连接必须失败（`auto_create:false` 生效）。
 4. **第三人进不来**：同一房间第三个参与者入房被拒（`max_participants:2`）。

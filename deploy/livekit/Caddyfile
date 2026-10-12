@@ -19,7 +19,13 @@
 			@turn tls sni {$TURN_DOMAIN}
 			route @turn {
 				tls
-				proxy 127.0.0.1:5349
+				proxy {
+					# 终结 TLS 后是从本机回环连 LiveKit：带 PROXY v2 头把真实客户端地址交过去，
+					# 否则 TURN 把 127.0.0.1 当 XOR-MAPPED-ADDRESS 回给客户端（Firefox 直接拒绝）。
+					# 与 livekit.yaml 的 turn.proxy_protocol: true 成对，两边缺一个 TURN/TLS 就连不上
+					proxy_protocol v2
+					upstream 127.0.0.1:5349
+				}
 			}
 
 			@signal tls sni {$LIVEKIT_DOMAIN}

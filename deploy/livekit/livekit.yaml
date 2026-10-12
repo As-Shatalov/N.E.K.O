@@ -46,6 +46,10 @@ turn:
   # TLS 由 Caddy 终结，LiveKit 在 tls_port 上收到的是已解密的 TURN 流
   external_tls: true
   tls_port: 5349
+  # Caddy 终结 TLS 后从回环连进来：用 PROXY protocol 拿真实客户端地址（Caddyfile 里发 v2 头）。
+  # 打开后 tls_port 上每条连接都必须带头；只信任回环来源（proxy_protocol_trusted_cidrs 默认值）。
+  # 需要 livekit-server ≥ v1.13.7
+  proxy_protocol: true
   # TURN/UDP（防火墙放行 UDP 3478）
   udp_port: 3478
 

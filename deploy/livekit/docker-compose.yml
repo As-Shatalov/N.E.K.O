@@ -34,7 +34,8 @@ services:
 
   livekit:
     # 版本按上线前压测通过的那一版钉死，升级前重跑 README 的验收清单
-    image: livekit/livekit-server:v1.13.6
+    # ≥ v1.13.7：TURN TCP 监听支持 PROXY protocol（经 Caddy 终结 TLS 后保住客户端地址，见 livekit.yaml turn.proxy_protocol）
+    image: livekit/livekit-server:v1.13.9
     network_mode: host
     restart: unless-stopped
     command: --config /etc/livekit.yaml

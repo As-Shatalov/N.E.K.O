@@ -100,6 +100,33 @@
     });
   }
 
+  /**
+   * 拥塞阶梯级别由传输页自己决定（后端不维护），按场次记进 sessionStorage：传输 WS 重连
+   * 或 Pet 页重载（同一标签页）后接着用，不在已经拥塞的连接上先退回 560 kbps 再等一轮。
+   */
+  function ladderKey(visitId) {
+    return 'neko-visit-ladder:' + visitId;
+  }
+
+  function loadLadder(win, visitId) {
+    try {
+      var raw = win.sessionStorage && win.sessionStorage.getItem(ladderKey(visitId));
+      var v = raw ? JSON.parse(raw) : null;
+      if (v && (v.crop === 'upper' || v.crop === 'full') && Number.isInteger(v.level)) return v;
+    } catch (_) {
+      // 存储不可用：从 0 级开始
+    }
+    return null;
+  }
+
+  function saveLadder(win, visitId, crop, level) {
+    try {
+      if (win.sessionStorage) win.sessionStorage.setItem(ladderKey(visitId), JSON.stringify({ crop: crop, level: level }));
+    } catch (_) {
+      // 存储不可用：只是重连后从 0 级开始
+    }
+  }
+
   function finiteOr(value, fallback) {
     return typeof value === 'number' && isFinite(value) && value >= 0 ? value : fallback;
   }
@@ -152,6 +179,7 @@
     if (this.side === 'guest') {
       this.packer = new NVT.pack.Packer({ document: this.doc, crop: 'upper' });
       this.ladder = new NVT.pack.LadderController({ crop: 'upper', targetFps: this.captureFps });
+      this.savedLadder = loadLadder(this.win, this.visitId);
       NVT.packer = this.packer;
     } else if (env.video && env.canvas) {
       this.unpacker = new NVT.unpack.Unpacker({ video: env.video, canvas: env.canvas, post: this.post });
@@ -217,10 +245,13 @@
     this.creds = msg;
     if (typeof msg.peer_vid === 'string' && msg.peer_vid) this.core.setPeerVid(msg.peer_vid);
     if (this.packer) {
-      this.media.crop = msg.crop === 'full' ? 'full' : 'upper';
-      this.media.ladder = 0;
-      this.ladder.reset(this.media.crop, 0);
-      this.packer.setGeometry(this.media.crop, 0);
+      var crop = msg.crop === 'full' ? 'full' : 'upper';
+      // 同一构图下沿用已降的级别（传输 WS 重连 / 页面重载）；换了构图从 0 级开始
+      var level = this.keptLevel(crop);
+      this.media.crop = crop;
+      this.media.ladder = level;
+      this.ladder.reset(crop, level);
+      this.packer.setGeometry(crop, level);
       this.announceGeometry();
     }
     var gen = this.connGen;
@@ -382,10 +413,18 @@
     this.post({ t: 'geometry', crop: d.crop, level: d.level, cropW: d.cropW, cropH: d.cropH });
   };
 
+  P.keptLevel = function (crop) {
+    if (crop === this.media.crop && this.media.ladder > 0) return this.media.ladder;
+    var saved = this.savedLadder;
+    return saved && saved.crop === crop ? saved.level : 0;
+  };
+
   P.setGeometry = function (crop, level) {
     var changed = this.packer.setGeometry(crop, level);
     this.media.crop = this.packer.dims.crop;
     this.media.ladder = this.packer.dims.level;
+    this.savedLadder = { crop: this.media.crop, level: this.media.ladder };
+    saveLadder(this.win, this.visitId, this.media.crop, this.media.ladder);
     if (changed) {
       this.announceGeometry();
       if (this.media.publish && this.adapter) {
@@ -406,7 +445,8 @@
     if (msg.peer_crop === 'upper' || msg.peer_crop === 'full') this.media.peerCrop = msg.peer_crop;
     if (this.side === 'guest') {
       var crop = msg.crop === 'full' || msg.crop === 'upper' ? msg.crop : this.media.crop;
-      var level = Number.isInteger(msg.ladder) ? msg.ladder : this.media.ladder;
+      // 后端快照里的 ladder 只当下限：级别由本页的拥塞阶梯决定，快照不能把已降的级别抬回去
+      var level = Math.max(Number.isInteger(msg.ladder) ? msg.ladder : 0, crop === this.media.crop ? this.media.ladder : 0);
       if (crop !== this.media.crop || level !== this.media.ladder) this.ladder.reset(crop, level);
       this.setGeometry(crop, level);
       if (msg.publish === true) {
