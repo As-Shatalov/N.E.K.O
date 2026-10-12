@@ -448,14 +448,30 @@ def _handed_over(env_side, name, *, owner_uid="e" * 32, new="Moved"):
     return marker
 
 
-def _configured(monkeypatch, uid_of):
-    async def readable(**_kw):
+class _TmpConfig:
+    """Config-manager stand-in: never the real runtime directory."""
+
+    def __init__(self, root):
+        self.root = root
+
+    def get_config_path(self, name):
+        return self.root / name
+
+    def get_runtime_config_path(self, name):
+        return self.root / name
+
+
+def _configured(monkeypatch, uid_of, root=None):
+    async def readable(*_a, **_kw):
         return None
+
+    if root is not None:
+        monkeypatch.setattr(local_chars, "get_config_manager", lambda: _TmpConfig(root))
 
     async def load():
         return dict(uid_of)
 
-    monkeypatch.setattr(local_chars, "ensure_characters_readable", readable)
+    monkeypatch.setattr(local_chars, "ensure_characters_file_readable", readable)
     monkeypatch.setattr(local_chars, "load_local_characters", load)
 
 
@@ -464,7 +480,7 @@ async def test_a_handed_over_name_refuses_rooms_and_join_while_its_rename_cannot
         raise OSError("spool locked")
 
     monkeypatch.setattr(VisitSpool, "rename_own_char", busy)
-    _configured(monkeypatch, {"Host": HOST_CHAR_UID, "Guest": GUEST_CHAR_UID, "Moved": "e" * 32})
+    _configured(monkeypatch, {"Host": HOST_CHAR_UID, "Guest": GUEST_CHAR_UID, "Moved": "e" * 32}, env.host.config_dir)
     host_marker = _handed_over(env.host, "Host")
     # 原角色的条目还在 Host 名下没迁走：现在串门写下的条目与场次会随迁移归到原角色（变异：不查必红）
     resp = await _rooms(env)
@@ -479,7 +495,7 @@ async def test_a_handed_over_name_refuses_rooms_and_join_while_its_rename_cannot
 
 
 async def test_a_handed_over_name_is_admitted_once_its_rename_settles(env, monkeypatch):
-    _configured(monkeypatch, {"Host": HOST_CHAR_UID, "Moved": "e" * 32})
+    _configured(monkeypatch, {"Host": HOST_CHAR_UID, "Moved": "e" * 32}, env.host.config_dir)
     _handed_over(env.host, "Host")
     # 准入时先对一次账：迁完就照常建房（变异：不先对账、一律拒绝必红）
     assert (await _rooms(env)).status_code == 202
@@ -498,8 +514,16 @@ async def test_a_name_handed_over_to_another_character_does_not_block(env, monke
 
 
 async def test_a_handed_over_name_with_a_missing_character_config_refuses(env, monkeypatch, tmp_path):
+    seed = tmp_path / "seed" / "characters.json"
+    seed.parent.mkdir()
+    seed.write_text(json.dumps({"猫娘": {"Host": {"_reserved": {"character_uid": HOST_CHAR_UID}}}}), encoding="utf-8")
+
     class Config:
         def get_config_path(self, name):
+            # 运行时文件不在时退回项目自带的种子文件（真实 ConfigManager 的行为）
+            return seed
+
+        def get_runtime_config_path(self, name):
             return tmp_path / "missing" / name
 
         async def aload_characters(self):
@@ -509,7 +533,7 @@ async def test_a_handed_over_name_with_a_missing_character_config_refuses(env, m
     monkeypatch.setattr(local_chars, "get_config_manager", lambda: Config())
     _handed_over(env.host, "Host")
     # 有交接标记说明这台机器有过角色：文件不在不能当成全新安装、拿默认角色去对账（会把原角色当成
-    # 已删除、撤掉标记不迁移），按对不完账拒绝（变异：允许缺文件必红）
+    # 已删除、撤掉标记不迁移），按对不完账拒绝（变异：允许缺文件 / 查种子文件必红）
     resp = await _rooms(env)
     assert resp.status_code == 409 and resp.json()["reason"] == "handover_pending" and _no_slot()
     peers = json.loads((env.host.config_dir / "visit_peers.json").read_text(encoding="utf-8"))
@@ -517,10 +541,11 @@ async def test_a_handed_over_name_with_a_missing_character_config_refuses(env, m
 
 
 async def test_a_handed_over_name_with_an_unreadable_character_config_refuses(env, monkeypatch):
-    async def broken(**_kw):
+    async def broken(*_a, **_kw):
         raise OSError("characters.json unreadable")
 
-    monkeypatch.setattr(local_chars, "ensure_characters_readable", broken)
+    monkeypatch.setattr(local_chars, "ensure_characters_file_readable", broken)
+    monkeypatch.setattr(local_chars, "get_config_manager", lambda: _TmpConfig(env.host.config_dir))
     _handed_over(env.host, "Host")
     # 对账要读角色配置，读不出就对不完账：先不接（下一次再试），不能当成没有交接
     resp = await _rooms(env)

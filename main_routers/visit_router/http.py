@@ -261,7 +261,11 @@ async def _strict_local_names() -> tuple[set[str], dict[str, str] | None]:
     characters: a missing file must not let the loader fall back to the seed
     profiles (reconciliation would take the marker's character for deleted).
     """
-    await local_chars.ensure_characters_readable(missing_ok=False)
+    config = local_chars.get_config_manager()
+    runtime_path = getattr(config, "get_runtime_config_path", None)
+    # 要查的是运行时目录里那份：get_config_path 在运行时文件不在时会退回项目自带的种子文件
+    path = runtime_path("characters.json") if callable(runtime_path) else config.get_config_path("characters.json")
+    await local_chars.ensure_characters_file_readable(path, missing_ok=False)
     uid_of = await local_chars.load_local_characters()
     return set(uid_of), uid_of
 
