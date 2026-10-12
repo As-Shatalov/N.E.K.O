@@ -1034,5 +1034,7 @@ async def test_terminal_fact_counters_inconsistent_with_the_request_are_not_trus
     data[f"visit-facts:{VISIT}"].update(written=0, deduped=0)
     Path(idempotency.keys_path(NAME)).write_text(json.dumps(data), encoding="utf-8")
     body = await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
-    # 按事实池核对出真实条数，而不是照抄记录里的 0
+    # 按事实池核对出真实条数，而不是照抄记录里的 0；核对后把计数写回记录，下次直接走终态快路径
     assert body["duplicate"] is True and body["written"] == 2
+    record = await _key_record(f"visit-facts:{VISIT}")
+    assert (record["written"], record["deduped"]) == (2, 0)

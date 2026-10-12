@@ -1386,9 +1386,10 @@ def _done_repairing(**fields: object):
             return None
         stored = old.get("content_hash")
         hash_ok = isinstance(stored, str) and bool(stored)
+        # 计数要与刚按存储核对出的值一致（不只是「是个非负整数」）：不一致就写回核对值
         counters_ok = all(
-            isinstance(old.get(name), int) and not isinstance(old.get(name), bool) and old.get(name) >= 0
-            for name in ("written", "deduped") if name in fields
+            isinstance(old.get(name), int) and not isinstance(old.get(name), bool) and old.get(name) == fields[name]
+            for name in ("written", "deduped") if fields.get(name) is not None
         )
         needs_hash = not hash_ok and bool(fields.get("content_hash"))
         if not needs_hash and counters_ok:
