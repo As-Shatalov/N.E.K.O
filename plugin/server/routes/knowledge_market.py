@@ -470,19 +470,14 @@ async def _execute_subscription(task_id: str, payload: KnowledgeSubscribeRequest
         }
         _stage(task, "installing", 0.6, "正在写入本地知识库")
         result = await _install_with_retry(task, subscription, raw)
-        raw = b""
+        del raw  # the artifact lives in the staged job now; do not hold it while waiting
         job_id = str(result.get("job_id") or "")
         if job_id and result.get("state") != "active":
             # Staged: the bytes live in the Memory Server's job now, so
             # neither they nor a download slot outlive the activation wait.
             task["job_id"] = job_id
             task["slot_released"] = True
-            activation = await _wait_for_job(
-                task,
-                job_id=job_id,
-                pack_id=descriptor.pack_id,
-                artifact_sha256=descriptor.artifacts.knowledge.sha256,
-            )
+            activation = await _wait_for_job(task, job_id=job_id, subscription=subscription)
             result = {**result, "activation": activation}
         task.update(
             result=result,
@@ -562,9 +557,7 @@ async def _apply_subscription(subscription: dict[str, str], raw: bytes) -> dict[
         return {"ok": False, "reason": exc.code}
 
 
-async def _wait_for_job(
-    task: dict[str, Any], *, job_id: str, pack_id: str, artifact_sha256: str
-) -> dict[str, Any]:
+async def _wait_for_job(task: dict[str, Any], *, job_id: str, subscription: dict[str, str]) -> dict[str, Any]:
     """Keep the subscription pending until the staged import is active."""
     _stage(task, "indexing", 0.8, "正在建立知识库索引")
     loop = asyncio.get_running_loop()
@@ -587,8 +580,8 @@ async def _wait_for_job(
             if job is None:
                 # Terminal jobs are pruned, so an activated one can vanish
                 # between two polls. The installed registry is the durable
-                # record: accept it only for this exact pack and artifact.
-                if await _installed_pack_matches(pack_id, artifact_sha256):
+                # record: accept it only for this exact package, pack and artifact.
+                if await _installed_pack_matches(subscription):
                     return {"job_id": job_id, "state": "active", "reconciled": "registry"}
                 raise _TaskError("job_not_found", "知识包导入任务已不存在")
             state = str(job.get("state") or "")
@@ -611,15 +604,25 @@ def _market_subscription(pack: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-async def _installed_pack_matches(pack_id: str, artifact_sha256: str) -> bool:
+_RECONCILED_FIELDS = ("provider_package_id", "remote_id", "artifact_sha256")
+
+
+async def _installed_pack_matches(expected: dict[str, str]) -> bool:
+    """Whether the installed registry holds this very subscription (package, pack, artifact).
+
+    The pack id and bytes alone are not enough: after a removal another
+    package could have installed the same bytes under the same pack id.
+    """
     try:
         payload = await _main_call("GET", "packs")
     except _TaskError:
         return False
     for pack in payload.get("packs", ()):
-        if isinstance(pack, dict) and pack.get("pack_id") == pack_id:
-            subscription = _market_subscription(pack)
-            return subscription is not None and subscription.get("artifact_sha256") == artifact_sha256
+        if isinstance(pack, dict) and pack.get("pack_id") == expected["pack_id"]:
+            installed = _market_subscription(pack)
+            return installed is not None and all(
+                installed.get(field) == expected[field] for field in _RECONCILED_FIELDS
+            )
     return False
 
 
@@ -790,7 +793,10 @@ def _cancelled_result() -> dict[str, Any]:
 
 
 async def _settle_unsubscribe(payload: KnowledgeUnsubscribeRequest, deadline: float) -> dict[str, Any]:
-    cancelled = await _stop_active_subscription(payload, deadline)
+    stopped = await _stop_active_subscription(payload, deadline)
+    # Always, not only after stopping a worker this process remembers: after a
+    # restart the Memory Server may still hold an import staged before it.
+    cancelled = await _cancel_package_imports(payload.package_id, payload.pack_id, deadline) or stopped
     pack_id, remote_id = await _resolve_owned_pack(payload, deadline, cancelled=cancelled)
     if not pack_id:
         # Only an install that never landed was stopped; there is nothing to remove.
@@ -839,8 +845,9 @@ async def _stop_active_subscription(payload: KnowledgeUnsubscribeRequest, deadli
     """Stop an in-flight subscription of the package; whether one was stopped.
 
     A worker is cancelled outright, but an install request it already sent is
-    waited for (bounded) and an import it staged is cancelled on the Memory
-    Server, so nothing lands after the unsubscribe answered.
+    waited for (bounded); the import it may have staged is cancelled by the
+    caller (``_cancel_package_imports``), so nothing lands after the
+    unsubscribe answered.
     """
     task_id = _active_package_tasks.get(payload.package_id)
     task = _tasks.get(task_id) if task_id else None
@@ -864,15 +871,15 @@ async def _stop_active_subscription(payload: KnowledgeUnsubscribeRequest, deadli
                 await asyncio.gather(asyncio.shield(installation), return_exceptions=True)
         except TimeoutError as exc:
             raise _unsubscribe_error("knowledge_busy", 503, retryable=True) from exc
-    await _cancel_package_imports(payload.package_id, deadline)
     return True
 
 
-async def _cancel_package_imports(package_id: int, deadline: float) -> None:
+async def _cancel_package_imports(package_id: int, pack_id: str, deadline: float) -> bool:
     """Cancel every staged import of this package; wait for any past its commit point to land.
 
     Found by the package id each job carries, not by a remembered job id: an
-    install request whose answer was lost may still have staged one.
+    install request whose answer was lost, or one sent before this process
+    restarted, may still have staged one. Returns whether there was any.
     """
     cancelled: set[str] = set()
     while _remaining(deadline) > 0:
@@ -891,7 +898,9 @@ async def _cancel_package_imports(package_id: int, deadline: float) -> None:
             ]
             if not active:
                 # None left: the registry now says whether any of them landed.
-                return
+                return bool(cancelled)
+            if any(job["subscription"].get("pack_id") != pack_id for job in active):
+                raise _unsubscribe_error("subscription_identity_mismatch")
             for job in active:
                 job_id = str(job.get("job_id") or "")
                 if job_id and job_id not in cancelled:

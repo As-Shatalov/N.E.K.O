@@ -118,6 +118,8 @@ def env(monkeypatch):
         reports.append(("unsubscribe", package_id))
         return True
 
+    # No staged imports unless a test says otherwise (every unsubscribe looks).
+    main.on("GET", "packs/jobs", {"ok": True, "jobs": []})
     monkeypatch.setattr(km, "_main_call", main)
     monkeypatch.setattr(km, "_sleep", fast_sleep)
     monkeypatch.setattr(km, "_fetch_version_descriptor", fetch)
@@ -203,6 +205,16 @@ async def test_pruned_job_with_another_artifact_installed_is_a_failure(env):
     main.on("POST", "subscriptions/apply", {"ok": True, "job_id": "j1", "state": "queued"})
     main.on("GET", "packs/jobs", {"ok": True, "jobs": []})
     main.on("GET", "packs", {"ok": True, "packs": [_installed(sha="0" * 64)]})
+    task = await _finished(env["http"], await _subscribe(env["http"]))
+    assert task["status"] == "failed" and task["error_code"] == "job_not_found"
+
+
+async def test_pruned_job_with_the_pack_now_owned_by_another_package_is_a_failure(env):
+    main = env["main"]
+    main.on("POST", "subscriptions/apply", {"ok": True, "job_id": "j1", "state": "queued"})
+    main.on("GET", "packs/jobs", {"ok": True, "jobs": []})
+    # Same pack id and bytes, but installed by another market package.
+    main.on("GET", "packs", {"ok": True, "packs": [_installed(package_id="99")]})
     task = await _finished(env["http"], await _subscribe(env["http"]))
     assert task["status"] == "failed" and task["error_code"] == "job_not_found"
 
@@ -445,6 +457,29 @@ async def test_unsubscribe_cancels_a_staged_import_before_removing(env):
     cancels = [kwargs["json_body"]["job_id"] for method, path, kwargs in main.calls if path == "packs/jobs/cancel"]
     # Only this package's import, never another package's.
     assert cancels == ["j1"]
+
+
+async def test_unsubscribe_after_a_restart_still_cancels_a_staged_import(env):
+    """No worker is remembered (the plugin server restarted), but the import is staged."""
+    main = env["main"]
+    state = {"j9": "queued"}
+
+    async def jobs():
+        return {"ok": True, "jobs": [_job("j9", state["j9"])]}
+
+    async def cancel():
+        state["j9"] = "cancelled"
+        return {"ok": True, "job_id": "j9"}
+
+    main.on("GET", "packs/jobs", jobs)
+    main.on("POST", "packs/jobs/cancel", cancel)
+    main.on("GET", "packs", {"ok": True, "packs": []})
+    response = await _unsubscribe(env["http"])
+    assert response.status_code == 200 and response.json()["cancelled"] is True
+    assert "POST packs/jobs/cancel" in main.paths()
+    # A staged import of this package under another pack id is not this caller's to cancel.
+    state["j9"] = "queued"
+    assert (await _unsubscribe(env["http"], pack_id="another-pack")).status_code == 409
 
 
 async def test_unsubscribe_cancels_an_import_whose_install_answer_was_lost(env):

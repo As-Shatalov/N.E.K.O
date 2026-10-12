@@ -635,6 +635,13 @@ class KnowledgeService:
         if operation_id in self._removals:
             # A retry of the same request: never remove twice.
             return self.removal_status(operation_id)
+        if len(self._removals) >= MAX_REMOVAL_OPERATIONS and all(
+            item["status"] == "pending" for item in self._removals.values()
+        ):
+            # No settled outcome could make room: accepting this one would
+            # evict the next outcome as soon as it settles, before its caller
+            # could ask for it.
+            raise KnowledgeUnavailable("knowledge_busy")
         self._note_removal(operation_id, "pending")
         removal = asyncio.ensure_future(self._remove_pack_tracked(pack_id, expected_identity, operation_id))
         self._detached.add(removal)

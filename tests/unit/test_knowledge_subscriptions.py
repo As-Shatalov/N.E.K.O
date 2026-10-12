@@ -359,6 +359,28 @@ async def test_pending_removals_are_never_evicted(tmp_path, monkeypatch):
         await service.stop()
 
 
+async def test_tracked_removals_are_refused_while_every_slot_is_pending(tmp_path, monkeypatch):
+    monkeypatch.setattr(service_module, "MAX_REMOVAL_OPERATIONS", 2)
+    service = await _started(tmp_path)
+    try:
+        await _subscribe(service)
+        service._note_removal("pending-operation-1", "pending")
+        service._note_removal("pending-operation-2", "pending")
+        with pytest.raises(service_module.KnowledgeUnavailable) as excinfo:
+            await service.remove_pack("market-memes", operation_id="op-over-capacity-1")
+        assert excinfo.value.reason == "knowledge_busy"
+        assert service.removal_status("op-over-capacity-1")["operation_status"] == "unknown"
+        assert {pack["pack_id"] for pack in await service.list_packs()} == {"market-memes"}
+
+        # Once one has settled there is room: the settled one makes way, the new one is kept.
+        service._note_removal("pending-operation-1", "failed", {"ok": False, "reason": "not_found"})
+        result = await service.remove_pack("market-memes", operation_id="op-with-room-0001")
+        assert result["operation_status"] == "committed"
+        assert service.removal_status("op-with-room-0001")["operation_status"] == "committed"
+    finally:
+        await service.stop()
+
+
 # ── routes ──────────────────────────────────────────────────────────
 
 

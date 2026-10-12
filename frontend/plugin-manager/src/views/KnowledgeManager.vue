@@ -580,7 +580,7 @@ import {
   vectorStateTagType,
   visibleDiagnosticQueries,
 } from '@/utils/knowledgeDisplay'
-import { openExternalUrl } from '@/utils/openExternal'
+import { openExternalUrl, prepareExternalWindow } from '@/utils/openExternal'
 import { getMarketUrl } from '@/api/market'
 
 const MATERIAL_FOLLOW = '__follow__'
@@ -1071,15 +1071,19 @@ async function toggleEntry(row: KnowledgeEntry, disabled: boolean) {
 }
 
 async function openKnowledgeMarket() {
+  // Before any await: a browser only allows a popup inside the click itself.
+  const target = prepareExternalWindow()
   marketOpening.value = true
   try {
     const base = await getMarketUrl()
     if (!base) {
+      target.cancel()
       ElMessage.error(t('knowledge.marketUnavailable'))
       return
     }
-    openExternalUrl(knowledgeMarketUrl(base, await createMarketPairing()))
+    target.open(knowledgeMarketUrl(base, await createMarketPairing()))
   } catch {
+    target.cancel()
     ElMessage.error(t('knowledge.marketPairFailed'))
   } finally {
     marketOpening.value = false
