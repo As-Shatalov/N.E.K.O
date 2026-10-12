@@ -97,6 +97,7 @@
       ready: false,
       readyTimer: null,
       portraitExports: 0,
+      liveGen: 0,   // 每收到一条实时 visit_state_change 加一：重载恢复的快照若早于它就作废
       authTimer: null,
       authGen: 0,
       tickTimer: null,
@@ -843,6 +844,7 @@
 
     function onStateChange(msg) {
       if (!msg || msg.type !== 'visit_state_change') return;
+      state.liveGen += 1;
       var action = msg.action;
       if (msg.peer_crop === 'upper' || msg.peer_crop === 'full') state.peerCrop = msg.peer_crop;
       if (action === 'pending') {
@@ -889,6 +891,7 @@
 
     function recoverAfterReload(lanlanName) {
       if (!lanlanName || typeof win.fetch !== 'function') return Promise.resolve(false);
+      var gen = state.liveGen;
       // /api/visit/state 要 CSRF：重载后页面配置一时取不到 token 时不能直接空着头去请求（403 后就再也不恢复）
       return acquireToken(0, now() + RECOVER_TOKEN_WINDOW_MS).then(function (token) {
         if (!token) return null;
@@ -898,6 +901,8 @@
         return res && res.ok ? res.json() : null;
       }).then(function (snap) {
         if (!snap || !snap.active || !snap.visit_id || !snap.side || snap.phase === 'ended' || snap.phase === 'ending') return false;
+        // 查询期间实时通道已经推过新状态（比如已经结束）：这份快照过时了，不能拿它重建
+        if (gen !== state.liveGen) return false;
         if (state.frame) return false;
         var actionByPhase = { pending: 'pending', invite_ready: 'invite_ready', joining: 'joining', awaiting_accept: 'awaiting_accept', active: 'started', wrap_up: 'wrap_up' };
         var action = actionByPhase[snap.phase];

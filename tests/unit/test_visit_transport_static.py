@@ -1963,3 +1963,44 @@ def test_consistently_slow_stats_are_still_emitted_in_order():
         """
     )
     assert out == [100, 200, 300]
+
+
+def test_trtc_drops_an_unverified_remote_video_candidate():
+    out = run_visit_js(
+        """
+        const h = await joinedController('host');
+        h.c.adapter.setPeerVid(null);
+        h.trtc.emit('REMOTE_VIDEO_AVAILABLE', { userId: 'g_intruder', streamType: 'main' });
+        await h.c.adapter.setSubscribe(true);
+        await settle();
+        h.c.adapter.setPeerVid('g_peer');
+        await settle();
+        const afterVerify = kinds(h.log).filter((k) => k === 'startRemoteVideo' || k === 'stopRemoteVideo');
+        await h.c.adapter.setSubscribe(true);
+        await settle();
+        return { afterVerify, starts: h.log.filter((e) => e[0] === 'startRemoteVideo').map((e) => e[1]) };
+        """
+    )
+    assert out == {"afterVerify": ["startRemoteVideo", "stopRemoteVideo"], "starts": ["g_intruder"]}
+
+
+def test_livekit_drops_an_unverified_publication_candidate():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        const tracks = [];
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack(t) { tracks.push(t ? t.id : null); }, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9' } });
+        const calls = [];
+        const pub = { kind: 'video', setSubscribed: (on) => calls.push(on) };
+        LK.Room.last.emit('TrackPublished', pub, { identity: 'g_intruder' });
+        a.setPeerVid('g_peer');
+        await a.setSubscribe(true);
+        return { calls, tracks };
+        """
+    )
+    assert out == {"calls": [False], "tracks": [None]}

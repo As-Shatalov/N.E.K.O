@@ -472,3 +472,23 @@ def test_inactive_live2d_manager_is_not_flagged_or_hooked():
         files=BRIDGE_FILES,
     )
     assert out == {"live": {"flag": True, "hooked": True}, "vrm": {"flag": False, "hooked": False}}
+
+
+def test_reload_snapshot_is_ignored_once_live_state_moved_on():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge();
+        let respond;
+        h.ctx.fetch = () => new Promise((r) => { respond = r; });
+        let result;
+        h.bridge.recoverAfterReload('Neko').then((r) => { result = r; });
+        await settle();
+        h.side = 'guest';
+        change(h, 'ended');                       // 实时通道先到：已经结束
+        respond({ ok: true, json: () => Promise.resolve({ active: true, visit_id: VISIT_ID, side: 'guest', phase: 'active' }) });
+        await settle();
+        return { result, frame: !!h.ctx.document.getElementById('visit-frame') };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out == {"result": False, "frame": False}

@@ -272,6 +272,21 @@
       },
       setPeerVid: function (vid) {
         peerVid = vid || peerVid;
+        // 核验前按「房里另一个人」暂记的远端视频若不是核验出来的对端：丢掉，已经开始的订阅停掉
+        if (!peerVid || !remoteVideoUser || remoteVideoUser === peerVid) return;
+        var stale = remoteVideoUser;
+        var wasStarted = remoteStarted;
+        remoteVideoUser = null;
+        remoteStarted = false;
+        remoteAttempt += 1;
+        clearRemoteRetry();
+        handlers.onRemoteTrack(null);
+        if (!wasStarted || !trtc) return;
+        var gen = roomGen;
+        serial(function () {
+          if (gen !== roomGen || !trtc) return undefined;
+          return trtc.stopRemoteVideo({ userId: stale, streamType: TRTC.TYPE.STREAM_TYPE_MAIN }).catch(function () {});
+        });
       },
       setSubscribe: function (on) {
         subscribeWanted = !!on;

@@ -67,6 +67,7 @@
     var subscribeWanted = false;
     var peerVid = opts.peerVid || null;
     var remotePublication = null;
+    var remoteIdentity = null;   // remotePublication 属于谁（核验出对端后据此丢掉不匹配的候选）
     var remoteTrack = null;
     var rxMark = null;
     var txMark = null;
@@ -124,6 +125,7 @@
       if (!pub || pub.kind !== 'video') return;
       if (pub !== remotePublication) subRetries = 0;
       remotePublication = pub;
+      remoteIdentity = participant.identity;
       if (subscribeWanted) pub.setSubscribed(true);
     }
 
@@ -359,6 +361,20 @@
       },
       setPeerVid: function (vid) {
         peerVid = vid || peerVid;
+        // 核验前按「房里另一个人」暂记的远端发布若不是核验出来的对端：退订、丢掉
+        if (!peerVid || !remotePublication || remoteIdentity === peerVid) return;
+        var stale = remotePublication;
+        remotePublication = null;
+        remoteIdentity = null;
+        remoteTrack = null;
+        rxMark = null;
+        clearSubRetry();
+        try {
+          stale.setSubscribed(false);
+        } catch (_) {
+          // 发布已不在
+        }
+        handlers.onRemoteTrack(null);
       },
       setSubscribe: function (on) {
         subscribeWanted = !!on;
