@@ -328,11 +328,28 @@
     var self = this;
     adapter.join(this.creds).then(function () {
       self.core.flush();
+      self.reapplyMedia();
     }, function (err) {
       var code = (err && err.errorCode) || 'join_failed';
       self.log('warn', 'vendor join failed', code);
       self.onVendorState('error', { error_code: code });
     });
+  };
+
+  /**
+   * 入房完成后按当前期望的媒体状态再应用一次：入房期间到达的 media{publish/subscribe}
+   * 会被适配器以「未入房」丢掉，不能等下一个快照才恢复视频。
+   */
+  P.reapplyMedia = function () {
+    if (this.stopped || !this.adapter) return;
+    var self = this;
+    if (this.side === 'guest' && this.media.publish && this.packer) {
+      this.adapter.publish(this.packer.ensureTrack(), this.profile()).catch(function (err) {
+        self.log('warn', 'publish failed', String(err && err.code));
+      });
+    } else if (this.side === 'host' && this.media.subscribe) {
+      this.adapter.setSubscribe(true);
+    }
   };
 
   /** SDK 自动重连失败（旧凭证鉴权失败）：用最新凭证、同一个 vid 手动重新入房。 */

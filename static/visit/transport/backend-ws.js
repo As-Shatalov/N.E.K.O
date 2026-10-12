@@ -99,11 +99,20 @@
         }, RECONNECT_DELAY_MS);
       });
       var leftOrGaveUp = Promise.race([
-        Promise.resolve(leaving).then(null, function () {}),
-        new Promise(function (resolve) { setTimeout(resolve, Math.max(0, RECONNECT_WINDOW_MS - (now - self.lostAt))); }),
+        Promise.resolve(leaving).then(function () { return 'left'; }, function () { return 'left'; }),
+        new Promise(function (resolve) {
+          setTimeout(function () { resolve('deadline'); }, Math.max(0, RECONNECT_WINDOW_MS - (now - self.lostAt)));
+        }),
       ]);
-      Promise.all([delayDone, leftOrGaveUp]).then(function () {
-        if (!self.terminal && !self.ws) self.connect();
+      Promise.all([delayDone, leftOrGaveUp]).then(function (res) {
+        if (self.terminal || self.ws) return;
+        if (res[1] === 'deadline') {
+          // 离房到重连窗口结束都没完成：不能在同一个 vendor 实例上重新入房，按连不上处理
+          self.terminal = true;
+          self.hooks.onTerminal(code);
+          return;
+        }
+        self.connect();
       });
     };
     ws.onerror = function () {

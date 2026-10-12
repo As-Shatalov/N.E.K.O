@@ -666,3 +666,47 @@ def test_superseded_while_publish_in_flight_still_stops_before_destroy():
     )
     # 被顶掉（4409）不离房，但在途的发布完成后必须停掉，然后才销毁实例
     assert out == ["start-pending", "stopLocalVideo", "destroy"]
+
+
+def test_publish_requested_during_join_is_applied_after_join():
+    out = run_visit_js(
+        """
+        const h = makeController('guest');
+        h.c.onAuthToken('tok');
+        const ws = sockets[sockets.length - 1];
+        ws.serverOpen();
+        let finishEnter;
+        const origCreate = h.TRTC.create;
+        h.TRTC.create = () => {
+          const inst = origCreate();
+          const origEnter = inst.enterRoom;
+          inst.enterRoom = (p) => new Promise((r) => { finishEnter = () => r(origEnter(p)); });
+          return inst;
+        };
+        ws.serverSend(credsFor('guest'));
+        await settle();
+        // 入房还没完成就收到发布快照
+        ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        const before = h.log.filter((e) => e[0] === 'startLocalVideo').length;
+        finishEnter();
+        await settle();
+        await settle();
+        return { before, after: h.log.filter((e) => e[0] === 'startLocalVideo').length };
+        """
+    )
+    assert out == {"before": 0, "after": 1}
+
+
+def test_stuck_vendor_exit_ends_in_terminal_instead_of_reconnecting():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.trtc.exitRoom = () => new Promise(() => {});      // 永远不结束
+        const n = h.sockets.length;
+        h.ws.serverClose(1006);
+        await advance(25000);
+        return { newSockets: h.sockets.length - n, closed: h.posted.filter((m) => m.t === 'closed').length };
+        """
+    )
+    assert out == {"newSockets": 0, "closed": 1}
