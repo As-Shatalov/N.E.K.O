@@ -348,7 +348,6 @@
    */
   P.reapplyMedia = function () {
     if (this.stopped || !this.adapter) return;
-    var self = this;
     if (this.side === 'guest' && this.media.publish && this.packer) {
       this.publishNow();
     } else if (this.side === 'host' && this.media.subscribe) {
@@ -483,7 +482,6 @@
   };
 
   P.applyMedia = function (msg) {
-    var self = this;
     if (typeof msg.peer_vid === 'string' && msg.peer_vid) {
       this.core.setPeerVid(msg.peer_vid);
       if (this.adapter) this.adapter.setPeerVid(msg.peer_vid);
