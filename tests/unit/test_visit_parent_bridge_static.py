@@ -1,4 +1,4 @@
-"""Static gates of the visit parent bridge (design §5 PR-11, §5 总则 static gates ①⑤)."""
+"""Static gates of the visit parent bridge (design section 5 PR-11 and the general static gates 1 and 5)."""
 
 from __future__ import annotations
 
