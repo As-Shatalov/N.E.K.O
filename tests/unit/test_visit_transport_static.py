@@ -778,3 +778,91 @@ def test_leave_completion_also_waits_for_the_late_stop():
         """
     )
     assert out == {"beforeStop": 0, "after": 1}
+
+
+def test_failed_publish_tells_the_parent_to_stop_capturing():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        let fail = true;
+        const orig = h.trtc.startLocalVideo;
+        h.trtc.startLocalVideo = (c) => { if (fail) { fail = false; return Promise.reject(new Error('x')); } return orig(c); };
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        const afterFail = h.posted.filter((m) => m.t === 'publish').map((m) => m.on);
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        return { afterFail, afterRetry: h.posted.filter((m) => m.t === 'publish').map((m) => m.on) };
+        """
+    )
+    # 失败时父页从没被告知开始（或已被告知停）；重试成功后才通知开始
+    assert out["afterFail"] in ([], [False])
+    assert out["afterRetry"][-1] is True
+
+
+def test_video_gate_requires_a_manual_frame_track():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const doc = ctx.document;
+        const orig = doc.createElement.bind(doc);
+        doc.createElement = (tag) => {
+          const el = orig(tag);
+          if (tag === 'canvas') el.captureStream = () => ({ getVideoTracks: () => [{ kind: 'video', stop() {} }] });
+          return el;
+        };
+        const h = { c: new ctx.NekoVisitTransport.loader.VisitTransportController({ window: ctx, document: doc, side: 'guest',
+          visitId: VISIT_ID, post: () => {}, log: () => {}, loadSdk: () => Promise.resolve(makeFakeTRTC([])) }) };
+        h.c.preflight = { ok: true };
+        const sent = [];
+        h.c.sendBackend = (m) => sent.push(m);
+        h.c.onCredentials(credsFor('guest'));
+        await settle();
+        const caps = sent.find((m) => m.type === 'caps' && m.stage === 'sdk');
+        return { transport_ok: caps.transport_ok, video_ok: caps.video_ok };
+        """
+    )
+    assert out == {"transport_ok": True, "video_ok": False}
+
+
+def test_stale_loss_sample_expires():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.c.startStats();
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        h.trtc.emit('NETWORK_QUALITY', { uplinkLoss: 40, uplinkRTT: 100 });   // 一次很差的样本，之后再无回调
+        const peerStats = () => {
+          const pieces = h.NVT.fragment(JSON.stringify({ t: 'stats', v: 1, rx_fps: 30 }), { visitId: VISIT_ID, msgId: Math.floor(Math.random() * 1e6) });
+          h.trtc.emit('CUSTOM_MESSAGE', { userId: 'h_peer', cmdId: 3, data: new TextEncoder().encode(pieces[0]).buffer });
+        };
+        for (let k = 0; k < 12; k++) { peerStats(); await advance(5000); }
+        return h.c.media.ladder;
+        """
+    )
+    # 旧的丢包样本 12 s 后过期，之后只看健康的 rx_fps：至多被它压下一级，不会一路压到最低档
+    assert out <= 1
+
+
+def test_host_rejoin_waits_for_a_pending_remote_subscription():
+    out = run_visit_js(
+        """
+        const h = await joinedController('host');
+        let finish;
+        h.trtc.startRemoteVideo = () => { h.log.push(['startRemote-pending']); return new Promise((r) => { finish = r; }); };
+        h.ws.serverSend({ type: 'media', subscribe: true, peer_vid: 'g_peer' });
+        h.trtc.emit('REMOTE_VIDEO_AVAILABLE', { userId: 'g_peer', streamType: 'main' });
+        await settle();
+        const n = h.sockets.length;
+        h.ws.serverClose(1006);
+        await advance(3000);
+        const before = h.sockets.length - n;
+        finish();
+        await settle();
+        await settle();
+        return { before, after: h.sockets.length - n };
+        """
+    )
+    assert out == {"before": 0, "after": 1}

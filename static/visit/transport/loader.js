@@ -55,7 +55,13 @@
   function guestVideoPrimitives(doc) {
     try {
       var c = doc.createElement('canvas');
-      return !!c.getContext('2d', { alpha: false }) && typeof c.captureStream === 'function';
+      if (!c.getContext('2d', { alpha: false }) || typeof c.captureStream !== 'function') return false;
+      // 打包靠 captureStream(0) + requestFrame() 手动出帧：实际建一次轨确认，不只看方法在不在
+      var stream = c.captureStream(0);
+      var track = stream && stream.getVideoTracks && stream.getVideoTracks()[0];
+      var ok = !!track && typeof track.requestFrame === 'function';
+      if (track && typeof track.stop === 'function') track.stop();
+      return ok;
     } catch (_) {
       return false;
     }
@@ -163,7 +169,7 @@
     this.captureFps = 30;
     this.media = { publish: false, subscribe: false, crop: 'upper', ladder: 0, peerCrop: null };
     this.peerRxFps = null;
-    this.lossPct = null;
+    this.loss = null;
     this.softencSince = null;
     this.statsMark = null;
     this.codecOverride = null;
@@ -313,7 +319,7 @@
         onPeer: function (kind, vid, reason, explicit) { self.onPeer(kind, vid, reason, explicit); },
         onState: function (state, extra) { self.onVendorState(state, extra); },
         onRemoteTrack: function (track) { self.onRemoteTrack(track); },
-        onNetwork: function (info) { if (info && typeof info.lossPct === 'number') self.lossPct = info.lossPct; },
+        onNetwork: function (info) { if (info && typeof info.lossPct === 'number') self.loss = { value: info.lossPct, at: self.now() }; },
         onNeedRejoin: function () { self.rejoin(); },
         onLog: function (level, msg, code) { self.log(level, msg, code); },
       },
@@ -344,12 +350,26 @@
     if (this.stopped || !this.adapter) return;
     var self = this;
     if (this.side === 'guest' && this.media.publish && this.packer) {
-      this.adapter.publish(this.packer.ensureTrack(), this.profile()).catch(function (err) {
-        self.log('warn', 'publish failed', String(err && err.code));
-      });
+      this.publishNow();
     } else if (this.side === 'host' && this.media.subscribe) {
       this.adapter.setSubscribe(true);
     }
+  };
+
+  /**
+   * 发布当前画布轨（轨已被结束就从同一块画布建新轨）。只有真的发布成功才告诉父页开始取帧，
+   * 失败就让父页停下；下一次发布（快照 / 入房后补应用）成功时再通知开始。
+   */
+  P.publishNow = function () {
+    var self = this;
+    var track = this.packer.ensureTrack();
+    this.adapter.publish(track, this.profile()).then(function (ok) {
+      if (ok === true && self.media.publish && !self.stopped) self.announcePublish(true);
+      else if (ok === false) self.announcePublish(false);
+    }, function (err) {
+      self.log('warn', 'publish failed', String(err && err.code));
+      self.announcePublish(false);
+    });
   };
 
   /** SDK 自动重连失败（旧凭证鉴权失败）：用最新凭证、同一个 vid 手动重新入房。 */
@@ -425,9 +445,9 @@
   };
 
   /** 父页只在真的发布视频时取帧（纯文字串门不拉帧率、不挂钩子、不报 hidden）。 */
-  P.announcePublish = function () {
+  P.announcePublish = function (on) {
     if (!this.packer) return;
-    var on = !!this.media.publish;
+    on = !!on;
     if (this.publishAnnounced === on) return;
     this.publishAnnounced = on;
     this.post({ t: 'publish', on: on });
@@ -477,18 +497,11 @@
       this.setGeometry(crop, level);
       if (msg.publish === true) {
         this.media.publish = true;
-        this.announcePublish();
         this.packer.active = true;
-        if (this.adapter) {
-          // 轨已被结束（SDK 或浏览器）就从同一块画布建新轨，接回父页的同任务取帧再发布
-          var track = this.packer.ensureTrack();
-          this.adapter.publish(track, this.profile()).catch(function (err) {
-            self.log('warn', 'publish failed', String(err && err.code));
-          });
-        }
+        if (this.adapter) this.publishNow();
       } else if (msg.publish === false) {
         this.media.publish = false;
-        this.announcePublish();
+        this.announcePublish(false);
         this.packer.active = false;
         if (this.adapter) this.adapter.unpublish();
       }
@@ -505,7 +518,8 @@
   /** 停掉全部媒体（不离房、不 stop 画布轨）：guest 取消发布，host 取消订阅。同步执行。 */
   P.stopAllMedia = function () {
     this.media.publish = false;
-    this.announcePublish();
+    this.loss = null;
+    this.announcePublish(false);
     this.media.subscribe = false;
     if (this.packer) this.packer.active = false;
     if (this.adapter) {
@@ -673,7 +687,9 @@
   P.stepLadder = function (now) {
     if (!this.ladder || !this.media.publish) return;
     var rxFps = this.peerRxFps && now - this.peerRxFps.at <= PEER_STATS_FRESH_MS ? this.peerRxFps.value : undefined;
-    var level = this.ladder.feed({ nowMs: now, rxFps: rxFps, lossPct: this.lossPct === null ? undefined : this.lossPct });
+    // 丢包样本与对端接收帧率同样只认新鲜的（重连期间 SDK 可能不再回调质量）
+    var lossPct = this.loss && now - this.loss.at <= PEER_STATS_FRESH_MS ? this.loss.value : undefined;
+    var level = this.ladder.feed({ nowMs: now, rxFps: rxFps, lossPct: lossPct });
     if (level !== null) this.setGeometry(this.media.crop, level);
   };
 

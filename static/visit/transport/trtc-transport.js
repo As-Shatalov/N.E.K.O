@@ -116,19 +116,25 @@
       });
     }
 
+    // 订阅 / 取消订阅与发布共用一条队列：离房的「完成」也等它们，迟到的旧 stopRemoteVideo
+    // 不会落在重新入房后的新订阅上
     function maybeStartRemote() {
       if (!subscribeWanted || !remoteVideoUser || remoteStarted || !trtc) return;
       remoteStarted = true;
       var user = remoteVideoUser;
-      trtc.startRemoteVideo({ userId: user, streamType: TRTC.TYPE.STREAM_TYPE_MAIN, view: null })
-        .then(function () {
-          var track = trtc.getVideoTrack({ userId: user, streamType: TRTC.TYPE.STREAM_TYPE_MAIN });
-          if (track && subscribeWanted && user === remoteVideoUser) handlers.onRemoteTrack(track);
-        })
-        .catch(function (err) {
-          remoteStarted = false;
-          handlers.onLog('warn', 'trtc startRemoteVideo failed', String(err && err.code));
-        });
+      var gen = roomGen;
+      serial(function () {
+        if (gen !== roomGen || !trtc) return undefined;
+        return trtc.startRemoteVideo({ userId: user, streamType: TRTC.TYPE.STREAM_TYPE_MAIN, view: null })
+          .then(function () {
+            if (gen !== roomGen) return;
+            var track = trtc.getVideoTrack({ userId: user, streamType: TRTC.TYPE.STREAM_TYPE_MAIN });
+            if (track && subscribeWanted && user === remoteVideoUser) handlers.onRemoteTrack(track);
+          }, function (err) {
+            remoteStarted = false;
+            handlers.onLog('warn', 'trtc startRemoteVideo failed', String(err && err.code));
+          });
+      });
     }
 
     function enterRoom() {
@@ -231,7 +237,12 @@
         handlers.onRemoteTrack(null);
         if (!trtc || !remoteStarted || !remoteVideoUser) return Promise.resolve();
         remoteStarted = false;
-        return trtc.stopRemoteVideo({ userId: remoteVideoUser, streamType: TRTC.TYPE.STREAM_TYPE_MAIN }).catch(function () {});
+        var user = remoteVideoUser;
+        var gen = roomGen;
+        return serial(function () {
+          if (gen !== roomGen || !trtc) return undefined;
+          return trtc.stopRemoteVideo({ userId: user, streamType: TRTC.TYPE.STREAM_TYPE_MAIN }).catch(function () {});
+        });
       },
       /** 停媒体并离房；画布轨不 stop（自定义轨归调用方，重连后复用）。 */
       leave: function () {

@@ -46,7 +46,7 @@ const out = await evaluate(`(async () => {
   ctl.packer.active = true;
   // 父页只在传输页报「在发布」时取帧：走与真实 media{publish:true} 相同的通知
   ctl.media.publish = true;
-  ctl.announcePublish();
+  ctl.announcePublish(true);
   const diag = { frames: 0, blank: 0, blanks: [] };
   const origOnFrame = ctl.packer.onFrame.bind(ctl.packer);
   const pctx0 = ctl.packer.pack.getContext('2d');

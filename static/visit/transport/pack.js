@@ -216,7 +216,7 @@
     }
     pctx.drawImage(this.scratch, 0, h);
     this.frames += 1;
-    if (this.track && this.track.readyState !== 'ended') {
+    if (this.track && this.track.readyState !== 'ended' && typeof this.track.requestFrame === 'function') {
       this.track.requestFrame();
       this.requestFrames += 1;
     }
