@@ -230,3 +230,21 @@ def test_user_frame_rate_change_during_a_visit_wins():
     assert out["hold"] is None
     assert out["after"] == 45
     assert out["calls"] == [30, 45]
+
+
+def test_visitor_layer_fits_a_narrow_viewport():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge();
+        h.ctx.innerWidth = 360; h.ctx.innerHeight = 640;
+        h.ctx.live2dManager.getModelScreenBounds = () => ({ left: 40, top: 0, right: 320, bottom: 640, width: 280, height: 640 });
+        const frame = await open(h, 'host');
+        change(h, 'started', { peer_crop: 'upper' });
+        await advance(600);
+        return { left: parseFloat(frame.style.left), width: parseFloat(frame.style.width), height: parseFloat(frame.style.height) };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out["left"] >= 0
+    assert out["left"] + out["width"] <= 360 + 1
+    assert abs(out["width"] / out["height"] - 320 / 448) < 0.01

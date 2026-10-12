@@ -146,3 +146,19 @@ def test_duplicate_publish_snapshots_while_pending_publish_once():
     )
     # 第二个快照排在第一个之后执行，看到同一条轨已发布就不再调 SDK，也不撤销
     assert out == ["start-pending", "startLocalVideo"]
+
+
+def test_no_fresh_telemetry_neither_steps_up_nor_down():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const L = new ctx.NekoVisitTransport.pack.LadderController({ crop: 'upper', level: 2, targetFps: 30 });
+        const events = [];
+        for (let t = 0; t <= 60000; t += 5000) { const lv = L.feed({ nowMs: t }); if (lv !== null) events.push(lv); }
+        // 有样本后才开始计「干净」
+        for (let t = 65000; t <= 95000; t += 5000) { const lv = L.feed({ nowMs: t, rxFps: 30 }); if (lv !== null) events.push([t, lv]); }
+        return events;
+        """
+    )
+    assert out == [[95000, 1]]

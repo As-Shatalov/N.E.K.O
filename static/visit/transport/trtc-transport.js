@@ -186,7 +186,11 @@
           var p = publishing ? trtc.updateLocalVideo(config) : trtc.startLocalVideo(config);
           // 发布成功才记状态：失败（暂时性）时下一次 media{publish:true} 还要真的再发一次
           return p.then(function () {
-            if (gen !== roomGen) return false;
+            if (gen !== roomGen) {
+              // 离房后才完成的发布：本地视频已不属于任何房间，停掉
+              if (trtc) trtc.stopLocalVideo().catch(function () {});
+              return false;
+            }
             publishing = true;
             publishedTrack = track;
             return true;
@@ -237,7 +241,10 @@
         publishing = false;
         publishedTrack = null;
         if (!trtc) return Promise.resolve();
-        return trtc.exitRoom().catch(function () {});
+        // exitRoom 立即发出；交给重连的「离房完成」还要等在途的发布 / 撤销跑完，
+        // 免得旧的 SDK 调用与新一次 enterRoom 交错
+        var exiting = trtc.exitRoom().catch(function () {});
+        return Promise.all([exiting, opChain]).then(function () {});
       },
       destroy: function () {
         if (trtc) {

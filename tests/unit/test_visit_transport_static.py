@@ -710,3 +710,46 @@ def test_stuck_vendor_exit_ends_in_terminal_instead_of_reconnecting():
         """
     )
     assert out == {"newSockets": 0, "closed": 1}
+
+
+def test_leave_completion_waits_for_in_flight_publish():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        let finish;
+        h.trtc.startLocalVideo = (c) => { h.log.push(['start-pending']); return new Promise((r) => { finish = r; }); };
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        const n = h.sockets.length;
+        h.ws.serverClose(1006);
+        await advance(3000);
+        const reconnectedBeforePublishSettled = h.sockets.length - n;
+        finish();
+        await settle();
+        await settle();
+        return { reconnectedBeforePublishSettled, after: h.sockets.length - n,
+                 kinds: kinds(h.log).filter((k) => ['start-pending', 'stopLocalVideo', 'exitRoom'].includes(k)) };
+        """
+    )
+    assert out["reconnectedBeforePublishSettled"] == 0
+    assert out["after"] == 1
+    # exitRoom 立即发出；离房后才完成的发布被停掉
+    assert out["kinds"] == ["start-pending", "exitRoom", "stopLocalVideo"]
+
+
+def test_livekit_initial_publication_uses_the_supplied_profile():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const log = [];
+        const LK = makeFakeLK(log);
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9', bitrate_kbps: 560, fps: 30 } });
+        await a.publish({ id: 'pack' }, { width: 160, height: 704, frameRate: 15, bitrate: 300 });
+        return log.filter((e) => e[0] === 'setParameters');
+        """
+    )
+    assert out == [["setParameters", 300000, 15]]

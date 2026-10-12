@@ -95,6 +95,16 @@
       });
     }
 
+    function applyProfile(profile) {
+      var sender = publication && publication.track && publication.track.sender;
+      if (!sender || typeof sender.getParameters !== 'function' || !profile) return Promise.resolve(false);
+      var params = sender.getParameters();
+      if (!params.encodings || !params.encodings.length) return Promise.resolve(false);
+      params.encodings[0].maxBitrate = profile.bitrate * 1000;
+      params.encodings[0].maxFramerate = profile.frameRate;
+      return sender.setParameters(params).then(function () { return true; });
+    }
+
     function considerPublication(pub, participant) {
       if (!participant || !isPeer(participant.identity)) return;
       if (!pub || pub.kind !== 'video') return;
@@ -225,7 +235,7 @@
         var sending = room.localParticipant.publishData(bytes, options);
         if (sending && typeof sending.catch === 'function') sending.catch(function () {});
       },
-      publish: function (track) {
+      publish: function (track, profile) {
         publishesInFlight += 1;
         var done = function (v) { publishesInFlight -= 1; return v; };
         return serial(function () {
@@ -243,10 +253,14 @@
               degradationPreference: 'maintain-framerate',
             });
           }).then(function (pub) {
-            if (gen !== roomGen) return false;
+            if (gen !== roomGen) {
+              current.localParticipant.unpublishTrack(track, false).catch(function () {});
+              return false;
+            }
             publication = pub;
             publishedTrack = track;
-            return true;
+            // 发布时就按传入的 profile 设码率 / 帧率上限（重连恢复的降档级别、兼容模式 15 fps）
+            return applyProfile(profile).then(function () { return true; }, function () { return true; });
           });
         }).then(done, function (err) { done(); throw err; });
       },
@@ -255,13 +269,7 @@
        * （T14 验证；不接受时退 replaceTrack），码率上限与帧率上限改在发送端编码参数上。
        */
       updateProfile: function (profile) {
-        var sender = publication && publication.track && publication.track.sender;
-        if (!sender || typeof sender.getParameters !== 'function' || !profile) return Promise.resolve(false);
-        var params = sender.getParameters();
-        if (!params.encodings || !params.encodings.length) return Promise.resolve(false);
-        params.encodings[0].maxBitrate = profile.bitrate * 1000;
-        params.encodings[0].maxFramerate = profile.frameRate;
-        return sender.setParameters(params).then(function () { return true; });
+        return applyProfile(profile);
       },
       unpublish: function () {
         var stop = function () {
@@ -298,7 +306,8 @@
         remoteTrack = null;
         rxMark = null;
         if (!room) return Promise.resolve();
-        return room.disconnect(false).catch(function () {});
+        var disconnecting = room.disconnect(false).catch(function () {});
+        return Promise.all([disconnecting, opChain]).then(function () {});
       },
       destroy: function () {
         room = null;

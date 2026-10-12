@@ -93,6 +93,12 @@
   LadderController.prototype.feed = function (sample) {
     var now = sample.nowMs;
     var last = CONGESTION_LADDER[this.crop].length - 1;
+    if (typeof sample.rxFps !== 'number' && typeof sample.lossPct !== 'number') {
+      // 没有任何新鲜观测（对端在重连 / 暂时离开）：不能当成「干净」去升级，两个计时器都重新起算
+      this.badSince = null;
+      this.cleanSince = null;
+      return null;
+    }
     if (this.isBad(sample)) {
       this.cleanSince = null;
       if (this.badSince === null) this.badSince = now;

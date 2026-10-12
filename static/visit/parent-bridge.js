@@ -591,8 +591,10 @@
       if (!b) return;
       var vw = win.innerWidth || 0;
       var vh = win.innerHeight || 0;
-      var h = Math.max(200, Math.min(900, b.height * 0.9));
-      var w = h * (CROP_ASPECT[state.peerCrop] || CROP_ASPECT.upper);
+      var aspect = CROP_ASPECT[state.peerCrop] || CROP_ASPECT.upper;
+      // 竖屏 / 窄视口：宽度不能超出视口（否则右侧摆放算出负的 left，访客被裁掉一截）
+      var h = Math.min(Math.max(200, Math.min(900, b.height * 0.9)), vw / aspect, vh || Infinity);
+      var w = h * aspect;
       var spaceLeft = b.x;
       var spaceRight = vw - (b.x + b.width);
       var left = spaceRight >= spaceLeft
