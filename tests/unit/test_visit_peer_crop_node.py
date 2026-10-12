@@ -381,3 +381,26 @@ def test_token_lookup_is_retried_until_the_iframe_can_authenticate():
         files=BRIDGE_FILES,
     )
     assert out == {"early": None, "got": "tok", "calls": 4, "later": 4}
+
+
+def test_reload_recovery_waits_for_a_token_before_asking_the_backend():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const runs = {};
+        for (const [name, seq] of [['late', ['', '', 'tok']], ['never', ['']]]) {
+          let calls = 0;
+          const h = makeBridge({ getToken: () => Promise.resolve(seq[Math.min(calls++, seq.length - 1)]) });
+          const fetched = [];
+          h.ctx.fetch = (url, opts) => { fetched.push(opts.headers['X-CSRF-Token'] || null); return Promise.resolve({ ok: true, json: () => Promise.resolve({ active: false }) }); };
+          let result;
+          h.bridge.recoverAfterReload('Neko').then((r) => { result = r; });
+          for (let i = 0; i < 20; i++) await advance(1000);
+          runs[name] = { fetched, result, lookups: calls };
+        }
+        return runs;
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out["late"] == {"fetched": ["tok"], "result": False, "lookups": 3}
+    assert out["never"]["fetched"] == [] and out["never"]["result"] is False
+    assert 3 <= out["never"]["lookups"] <= 5

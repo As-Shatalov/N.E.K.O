@@ -25,6 +25,7 @@
   var TOKEN_LOOKUP_TIMEOUT_MS = 5000;   // 取 CSRF token 卡住时按失败处理
   var TOKEN_RETRY_BASE_MS = 1000;       // 取不到 token 时的重试间隔，之后翻倍
   var TOKEN_RETRY_MAX_MS = 15000;
+  var RECOVER_TOKEN_WINDOW_MS = 12000;  // 重载恢复取 token 的总时限（页面重载宽限 20 s 之内）
   var PEER_AWAY_OPACITY = '0.6';
   var CROP_ASPECT = { upper: 320 / 448, full: 256 / 560 };   // 与传输页 CROP_GEOMETRY 同一构图
   var HOST_FRAME_STYLE = 'position:fixed;z-index:4;border:0;background:transparent;pointer-events:none;' +
@@ -842,10 +843,27 @@
     }
 
     /** 页面重载后：GET /api/visit/state 得知在飞场次就重建 iframe（20 s 页面重载宽限内重入房）。 */
+    /**
+     * 有限次重取 token：页面配置一时没就绪时先给空结果，按退避经 refreshToken 再取，
+     * 截止时间内仍取不到就给空（调用方按失败处理）。
+     */
+    function acquireToken(attempt, deadline) {
+      return boundedToken(attempt === 0 ? getToken() : refreshTokenLookup()).then(function (token) {
+        if (token) return token;
+        var delay = Math.min(TOKEN_RETRY_MAX_MS, TOKEN_RETRY_BASE_MS * Math.pow(2, attempt));
+        if (now() + delay >= deadline) return '';
+        return new Promise(function (resolve) { setTimeoutFn(resolve, delay); }).then(function () {
+          return acquireToken(attempt + 1, deadline);
+        });
+      });
+    }
+
     function recoverAfterReload(lanlanName) {
       if (!lanlanName || typeof win.fetch !== 'function') return Promise.resolve(false);
-      return getToken().then(function (token) {
-        var headers = token ? { 'X-CSRF-Token': token } : {};
+      // /api/visit/state 要 CSRF：重载后页面配置一时取不到 token 时不能直接空着头去请求（403 后就再也不恢复）
+      return acquireToken(0, now() + RECOVER_TOKEN_WINDOW_MS).then(function (token) {
+        if (!token) return null;
+        var headers = { 'X-CSRF-Token': token };
         return win.fetch('/api/visit/state?catgirl=' + encodeURIComponent(lanlanName), { headers: headers, cache: 'no-store', credentials: 'same-origin' });
       }).then(function (res) {
         return res && res.ok ? res.json() : null;

@@ -171,6 +171,8 @@
       });
       room.on(E.TrackSubscribed, function (track, pub, participant) {
         if (!participant || !isPeer(participant.identity) || track.kind !== 'video' || !subscribeWanted) return;
+        // 迟到的旧发布订阅成功：当前已换成新发布，不能拿旧轨顶掉新轨
+        if (remotePublication && pub && pub !== remotePublication) return;
         subRetries = 0;
         clearSubRetry();
         remoteTrack = track;
@@ -434,12 +436,19 @@
             qlr: s.qualityLimitationReason,
             enc: s.encoderImplementation,
           };
-          // 发送码率：两次取样之间的 bytesSent 差（timestamp 单位 ms）
-          if (typeof s.bytesSent === 'number' && typeof s.timestamp === 'number') {
+          // 发送码率与编码帧率：两次取样之间的 bytesSent / framesSent 差（timestamp 单位 ms）。
+          // 浏览器不给 framesPerSecond 时用 framesSent 推，不能退回打包器的出帧数（编码器丢帧看不出来）
+          if (typeof s.timestamp === 'number') {
             var prev = txMark;
-            txMark = { at: s.timestamp, bytes: s.bytesSent };
-            if (prev && txMark.at > prev.at && txMark.bytes >= prev.bytes) {
-              out.tx_kbps = Math.round((txMark.bytes - prev.bytes) * 8 / (txMark.at - prev.at));
+            txMark = { at: s.timestamp, bytes: s.bytesSent, frames: s.framesSent };
+            if (prev && txMark.at > prev.at) {
+              var dt = txMark.at - prev.at;
+              if (typeof txMark.bytes === 'number' && typeof prev.bytes === 'number' && txMark.bytes >= prev.bytes) {
+                out.tx_kbps = Math.round((txMark.bytes - prev.bytes) * 8 / dt);
+              }
+              if (typeof out.enc_fps !== 'number' && typeof txMark.frames === 'number' && typeof prev.frames === 'number' && txMark.frames >= prev.frames) {
+                out.enc_fps = (txMark.frames - prev.frames) * 1000 / dt;
+              }
             }
           }
           return out;

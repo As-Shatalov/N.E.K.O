@@ -1521,3 +1521,75 @@ def test_trtc_capabilities_require_the_overall_verdict():
         """
     )
     assert out == [True, False]
+
+
+def test_livekit_ignores_late_subscription_of_a_superseded_publication():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        const tracks = [];
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack(t) { tracks.push(t ? t.id : null); }, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9' } });
+        await a.setSubscribe(true);
+        const room = LK.Room.last;
+        const peer = { identity: 'g_peer' };
+        const oldPub = { kind: 'video', trackSid: 'TR_old', setSubscribed() {} };
+        const newPub = { kind: 'video', trackSid: 'TR_new', setSubscribed() {} };
+        room.emit('TrackPublished', oldPub, peer);
+        room.emit('TrackPublished', newPub, peer);
+        room.emit('TrackSubscribed', { kind: 'video', mediaStreamTrack: { id: 'new' } }, newPub, peer);
+        room.emit('TrackSubscribed', { kind: 'video', mediaStreamTrack: { id: 'old' } }, oldPub, peer);
+        return tracks;
+        """
+    )
+    assert out == ["new"]
+
+
+def test_livekit_derives_encoder_fps_from_frames_sent():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        let sample = { frameWidth: 256, frameHeight: 704, bytesSent: 0, framesSent: 0, timestamp: 1000 };
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9' } });
+        LK.Room.last.localParticipant.publishTrack = () => Promise.resolve({ track: { sender: LK.sender, getSenderStats: () => Promise.resolve([sample]) } });
+        await a.publish({ id: 'pack' });
+        const first = await a.senderStats();
+        sample = Object.assign({}, sample, { framesSent: 100, bytesSent: 350000, timestamp: 6000 });
+        const second = await a.senderStats();
+        sample = Object.assign({}, sample, { framesPerSecond: 29, framesSent: 150, timestamp: 11000 });
+        const reported = await a.senderStats();
+        return { first: first.enc_fps ?? null, second: second.enc_fps, reported: reported.enc_fps };
+        """
+    )
+    assert out == {"first": None, "second": 20, "reported": 29}
+
+
+def test_softenc_window_restarts_after_leaving_the_room_state():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.c.creds.publish.codec = 'vp9';
+        h.c.media.publish = true;
+        const first = { enc_fps: 5 };
+        h.c.checkSoftenc(first, 0);
+        h.c.onVendorState('reconnecting', {});
+        const afterState = h.c.softencSince;
+        h.c.onVendorState('joined', {});
+        h.c.media.publish = true;
+        const late = { enc_fps: 5 };
+        h.c.checkSoftenc(late, 60000);
+        h.c.softencSince = 1;
+        h.c.stopAllMedia();
+        return { afterState, flagged: !!late.softenc_overloaded, afterStop: h.c.softencSince };
+        """
+    )
+    assert out == {"afterState": None, "flagged": False, "afterStop": None}

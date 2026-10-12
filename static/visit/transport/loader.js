@@ -505,6 +505,7 @@
       // 断线 / 重连期间的观测不代表恢复后的连接：丢掉旧丢包样本与对端接收帧率，阶梯两个计时器重新起算
       this.loss = null;
       this.peerRxFps = null;
+      this.softencSince = null;   // 不在房里时不编码：软编过载窗口重新起算
       if (this.ladder) this.ladder.reset(this.ladder.crop, this.ladder.level);
     }
     if (state === 'kicked') {
@@ -637,6 +638,7 @@
     this.cancelProfileRetry();
     this.loss = null;
     this.peerRxFps = null;
+    this.softencSince = null;
     this.announcePublish(false);
     this.media.subscribe = false;
     if (this.packer) this.packer.active = false;
