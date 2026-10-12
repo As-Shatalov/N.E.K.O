@@ -233,3 +233,10 @@ def test_malformed_explicit_identifiers_are_refused(mint_mod, field, bad):
     good = mint_mod.build_claims(role="guest", visit_id=VISIT_ID, visit_uid=VISIT_UID, iat=NOW,
                                  vid="g_" + "0" * 24, char_tag="a" * 32, jti="J" * 22)
     assert good["vid"] == "g_" + "0" * 24 and good["char_tag"] == "a" * 32 and good["jti"] == "J" * 22
+
+
+def test_overlong_display_name_is_refused(mint_mod):
+    ok = mint_mod.build_claims(role="guest", visit_id=VISIT_ID, visit_uid=VISIT_UID, iat=NOW, display_name="N" * 64)
+    assert ok["display_name"] == "N" * 64
+    with pytest.raises(mint_mod.DevMintError):
+        mint_mod.build_claims(role="guest", visit_id=VISIT_ID, visit_uid=VISIT_UID, iat=NOW, display_name="N" * 65)

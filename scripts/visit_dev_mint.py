@@ -75,6 +75,7 @@ VISIT_ID_RE = re.compile(r"[A-Za-z0-9_-]{22}")
 VISIT_UID_RE = re.compile(r"[0-9a-f]{24}")
 CHAR_TAG_RE = re.compile(r"[0-9a-f]{32}")
 JTI_RE = re.compile(r"[A-Za-z0-9_-]{22}")
+DISPLAY_NAME_MAX = 64  # contract: display_name?:str(<=64); the verifier hard-rejects anything over 256
 
 
 class DevMintError(Exception):
@@ -172,6 +173,8 @@ def build_claims(
         raise DevMintError("char_tag must be 32 lowercase hex characters")
     if jti and not JTI_RE.fullmatch(jti):
         raise DevMintError("jti must be 22 characters of [A-Za-z0-9_-]")
+    if display_name is not None and len(display_name) > DISPLAY_NAME_MAX:
+        raise DevMintError(f"display_name must be at most {DISPLAY_NAME_MAX} characters")
     visit_id = visit_id or secrets.token_urlsafe(16)
     visit_uid = visit_uid or secrets.token_hex(12)
     iat = int(time.time()) if iat is None else int(iat)
