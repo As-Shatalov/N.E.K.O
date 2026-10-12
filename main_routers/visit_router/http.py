@@ -255,8 +255,13 @@ async def _resolve_uid(name: str) -> Optional[str]:
 
 
 async def _strict_local_names() -> tuple[set[str], dict[str, str] | None]:
-    """The configured names and uids, read the way startup recovery reads them (unreadable: raises)."""
-    await local_chars.ensure_characters_readable()
+    """The configured names and uids, read strictly (unreadable or missing: raises).
+
+    Only called while a handover marker exists, which proves the machine has
+    characters: a missing file must not let the loader fall back to the seed
+    profiles (reconciliation would take the marker's character for deleted).
+    """
+    await local_chars.ensure_characters_readable(missing_ok=False)
     uid_of = await local_chars.load_local_characters()
     return set(uid_of), uid_of
 

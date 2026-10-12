@@ -449,7 +449,7 @@ def _handed_over(env_side, name, *, owner_uid="e" * 32, new="Moved"):
 
 
 def _configured(monkeypatch, uid_of):
-    async def readable():
+    async def readable(**_kw):
         return None
 
     async def load():
@@ -497,8 +497,27 @@ async def test_a_name_handed_over_to_another_character_does_not_block(env, monke
     assert (await _rooms(env)).status_code == 202
 
 
+async def test_a_handed_over_name_with_a_missing_character_config_refuses(env, monkeypatch, tmp_path):
+    class Config:
+        def get_config_path(self, name):
+            return tmp_path / "missing" / name
+
+        async def aload_characters(self):
+            # 文件不在时常规读取退回的种子角色：只有 Host，原角色（uid e…）不在里面
+            return {"猫娘": {"Host": {"_reserved": {"character_uid": HOST_CHAR_UID}}}}
+
+    monkeypatch.setattr(local_chars, "get_config_manager", lambda: Config())
+    _handed_over(env.host, "Host")
+    # 有交接标记说明这台机器有过角色：文件不在不能当成全新安装、拿默认角色去对账（会把原角色当成
+    # 已删除、撤掉标记不迁移），按对不完账拒绝（变异：允许缺文件必红）
+    resp = await _rooms(env)
+    assert resp.status_code == 409 and resp.json()["reason"] == "handover_pending" and _no_slot()
+    peers = json.loads((env.host.config_dir / "visit_peers.json").read_text(encoding="utf-8"))
+    assert "pending_rename" in peers
+
+
 async def test_a_handed_over_name_with_an_unreadable_character_config_refuses(env, monkeypatch):
-    async def broken():
+    async def broken(**_kw):
         raise OSError("characters.json unreadable")
 
     monkeypatch.setattr(local_chars, "ensure_characters_readable", broken)

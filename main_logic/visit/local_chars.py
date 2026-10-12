@@ -57,14 +57,16 @@ def _check_characters_file(path: str, missing_ok: bool = True) -> None:
         seen.add(uid)
 
 
-async def ensure_characters_readable() -> None:
+async def ensure_characters_readable(*, missing_ok: bool = True) -> None:
     """Raise :class:`CharactersUnreadable` when ``characters.json`` exists but is unreadable.
 
     The regular loader silently falls back to the default characters; an
     erase that enumerates "every local character" must not take those
-    defaults for the real scope.
+    defaults for the real scope. ``missing_ok=False`` also refuses a missing
+    file (see :func:`ensure_characters_file_readable`).
     """
-    await ensure_characters_file_readable(get_config_manager().get_config_path("characters.json"))
+    await ensure_characters_file_readable(
+        get_config_manager().get_config_path("characters.json"), missing_ok=missing_ok)
 
 
 async def ensure_characters_file_readable(path: Any, *, missing_ok: bool = True) -> None:
