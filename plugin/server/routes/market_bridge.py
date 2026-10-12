@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import secrets
+import sys
 import time
 import tomllib
 from datetime import UTC, datetime
@@ -92,6 +93,16 @@ _MARKET_RELEASE_CHECK_TIMEOUT = 10.0
 # 短期一次性配对码；成功交换后立即消费。
 _ONE_TIME_CODES: dict[str, float] = {}
 _ONE_TIME_CODE_TTL_SECONDS = 5 * 60
+_PLUGIN_MANAGER_DEV_PORT = 5173
+# The repository's Vite dev server (plugin-manager `npm run dev`) proxies
+# /market/* with the browser's Origin intact, so the bridge accepts 5173
+# while developing. A packaged build never runs that server, and there any
+# unrelated local page on 5173 (another project's dev server) would otherwise
+# be able to read the bridge token. Nuitka marks compiled modules with
+# __compiled__, PyInstaller sets sys.frozen.
+_ALLOW_PLUGIN_MANAGER_DEV_ORIGIN = not (
+    bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
+)
 
 # OAuth 登录状态存储在本机用户目录，仅供本地插件面板使用。
 _OAUTH_CLIENT_ID = NEKO_AUTH_CLIENT_ID
@@ -183,9 +194,10 @@ def _is_loopback_host(host: str) -> bool:
     return normalized in {"localhost", "127.0.0.1", "::1"}
 
 
-def _is_local_bridge_origin(origin: str, expected_port: int) -> bool:
+def _is_local_bridge_origin(origin: str, expected_ports: set[int]) -> bool:
     try:
         parsed = urlparse(origin)
+        port = parsed.port or 80
     except ValueError:
         return False
     if parsed.scheme != "http" or not parsed.hostname or not _is_loopback_host(parsed.hostname):
@@ -194,7 +206,7 @@ def _is_local_bridge_origin(origin: str, expected_port: int) -> bool:
         return False
     if parsed.params or parsed.query or parsed.fragment:
         return False
-    return (parsed.port or 80) == expected_port
+    return port in expected_ports
 
 
 def _require_local_bridge_token_access(request: Request) -> None:
@@ -202,6 +214,11 @@ def _require_local_bridge_token_access(request: Request) -> None:
 
     Remote Market origins are intentionally excluded here even when CORS trusts
     them; remote pages must pair through /token-exchange instead.
+
+    The manager page is served by Main (packaged), by this server directly, or
+    by the repository's Vite dev server; a POST carries its Origin, so the
+    origin may be Main's port, the port this request reached, or (only when
+    running from source) the Vite port.
     """
 
     if request.scope.get("neko.market_remote_authorized") or has_forwarding_metadata(request.headers):
@@ -209,15 +226,21 @@ def _require_local_bridge_token_access(request: Request) -> None:
 
     host_header = request.headers.get("host", "")
     try:
-        host = urlparse(f"//{host_header}").hostname or ""
+        parsed_host = urlparse(f"//{host_header}")
+        host = parsed_host.hostname or ""
+        request_port = parsed_host.port or 80
     except ValueError:
         host = ""
+        request_port = 0
     client_host = request.client.host if request.client else ""
     if not _is_loopback_host(client_host) or not _is_loopback_host(host):
         raise HTTPException(status_code=403, detail="仅允许本地同源访问")
 
     origin = request.headers.get("origin")
-    if origin and not _is_local_bridge_origin(origin, _main_server_port()):
+    expected_ports = {request_port, _main_server_port()}
+    if _ALLOW_PLUGIN_MANAGER_DEV_ORIGIN:
+        expected_ports.add(_PLUGIN_MANAGER_DEV_PORT)
+    if origin and not _is_local_bridge_origin(origin, expected_ports):
         raise HTTPException(status_code=403, detail="仅允许本地同源访问")
 
 
@@ -495,6 +518,15 @@ class MarketBridgeTokenResponse(BaseModel):
     """供同源前端（plugin-manager UI）直接获取 bridge token。"""
     bridge_token: str
     port: int = 48911
+
+
+class MarketPairCodeResponse(BaseModel):
+    """A one-time code the local manager hands to a remote Market page."""
+    one_time_code: str
+    # Main's port, like bridge.json: the Market page reaches this server
+    # through Main's /market proxy, which passes CORS headers back unchanged.
+    port: int = 48911
+    expires_in: int = _ONE_TIME_CODE_TTL_SECONDS
 
 
 class MarketOAuthStartResponse(BaseModel):
@@ -1652,6 +1684,17 @@ async def market_bridge_token(request: Request):
     _require_local_bridge_token_access(request)
 
     return MarketBridgeTokenResponse(bridge_token=_BRIDGE_TOKEN, port=_main_server_port())
+
+
+@router.post("/pair-code", response_model=MarketPairCodeResponse)
+async def market_pair_code(request: Request):
+    """Issue a short-lived code the local manager passes to a remote Market page.
+
+    The page exchanges it at ``/token-exchange``. Same local-only gate as
+    ``/bridge-token``; the returned port is Main's (see the response model).
+    """
+    _require_local_bridge_token_access(request)
+    return MarketPairCodeResponse(one_time_code=_issue_one_time_code(), port=_main_server_port())
 
 
 @router.post("/oauth/start", response_model=MarketOAuthStartResponse)

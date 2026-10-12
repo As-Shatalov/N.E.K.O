@@ -21,6 +21,8 @@ Earlier drafts kept knowledge in the Main Server. That meant a second copy of th
 ```text
 plugin-manager page ──► plugin server /market/knowledge/*   (bridge token, loopback)
                      ──► Main /api/public-knowledge/*        (CSRF + Origin, size cap, streamed)
+Market page ──► plugin server /market/knowledge/subscribe … (paired bridge token, via Main's /market proxy)
+   plugin server subscription worker ──► Main /api/public-knowledge/subscriptions/apply (streamed)
 Main session ──► query_public_knowledge tool (HTTP, timeout, failure = no result)
                      │
                      ▼
@@ -64,7 +66,18 @@ Matches are returned as one block between paired `======以下为本地公共知
 - `query_public_knowledge` tool (`main_logic/public_knowledge.py`): an HTTP call to `/internal/knowledge/query` with a timeout; any failure reads as "no result". The tool is registered only while at least one usable pack exists and the global switch is on. Main caches that flag, refreshes it in the background and from every proxied management reply, and re-syncs session tools when it flips.
 - `/api/public-knowledge/*` (`main_routers/public_knowledge_router.py`): a thin proxy. Writes require the local CSRF token and an allowed Origin before any body is read; bodies are size-capped and streamed through unparsed, so multipart uploads pass the same way as JSON. Only allowlisted paths are forwarded.
 
+## Market subscriptions
+
+A pack can also be installed from the plugin market. The Market page is paired with the local client: the manager page asks the plugin server for a one-time code (`POST /market/pair-code`, local origins only) and opens the Market with it; the page exchanges the code for the bridge token at `/market/token-exchange`. The returned port is Main's, like `bridge.json`: the page reaches the plugin server through Main's `/market` proxy, which hands the plugin server's CORS answer back unchanged.
+
+The plugin server (`plugin/server/routes/knowledge_market.py`) then runs one worker per subscription: it reads the version descriptor from the market API, downloads the raw pack artifact (HTTPS, allowlisted hosts and redirect targets, size and SHA-256 checked), and sends it with its subscription metadata to Main's `subscriptions/apply`, which streams it to the Memory Server like any write. It never calls the Memory Server directly. The browser-facing bridge does not forward `subscriptions/apply`, so a page holding the bridge token cannot push a pack labelled as a market subscription.
+
+- **Metadata** (`knowledge/subscriptions.py`): provider (`plugin-market`), package id, remote id, pack id, version, channel, artifact SHA-256 and material type, stored in the pack's registry record. The Memory Server installs the artifact only if its SHA-256, pack id and material type match.
+- **Identity rules**: a pack is local or subscribed for good (neither overwrites the other); a subscribed pack keeps its provider, package id and remote id; one market package installs as one pack. Checked when the import is admitted and again under the write lock when it commits.
+- **v1 has no prebuilt vectors**: the artifact is raw text; vectors are backfilled locally like any import. Index artifacts a descriptor lists are ignored.
+- **Bounds**: at most 4 workers download or install at once; a worker gives its slot back once the import is staged, while the total number of live workers is capped at 32. A job pruned while being polled is checked against the installed registry (pack id, provider, artifact SHA-256). Busy answers (write lock, import slots, a service starting) are retried for a while and then reported as a retryable `knowledge_busy`, never as an invalid pack.
+- **Unsubscribe** stops an in-flight install (waiting for an install request already sent and cancelling an import it staged), then removes the pack with `expected_subscription` (only the subscribed pack it names) and an `operation_id`. If the answer is lost, the request polls `packs/remove/status` at a short fixed interval within its budget; after that a background drain keeps confirming with exponential backoff (0.25 s doubling, capped at 30 s) and reports the unsubscribe to the market once the removal commits. A tracked removal runs to its end on the Memory Server even if its caller stops waiting.
+
 ## Not yet in scope
 
 - Automatic per-turn context (with a general turn-context interface in core).
-- Market subscriptions (`subscriptions/apply`, streamed through Main).

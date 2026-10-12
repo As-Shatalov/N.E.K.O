@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -51,6 +52,13 @@ from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartParser
 
 from knowledge.service import MAX_PENDING_IMPORTS, KnowledgeService, KnowledgeUnavailable
+from knowledge.subscriptions import (
+    SUBSCRIPTION_PROTOCOL_VERSION,
+    KnowledgeSubscription,
+    SubscriptionError,
+    parse_expected_identity,
+    parse_subscription_json,
+)
 from utils.http.knowledge_proxy import JSON_BODY_MAX_BYTES, PACK_BODY_MAX_BYTES
 
 from ._shared import logger
@@ -75,6 +83,7 @@ _service: KnowledgeService | None = None
 # Import requests allowed to read their body at once (see knowledge_import_pack).
 _import_slots = asyncio.Semaphore(MAX_PENDING_IMPORTS)
 _start_task: asyncio.Task[None] | None = None
+_OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 
 
 class _SharedEmbedder:
@@ -484,7 +493,96 @@ async def knowledge_pack_material_type(request: Request):
 
 @router.post("/packs/remove")
 async def knowledge_pack_remove(request: Request):
+    """Remove a pack.
+
+    An unsubscribe also sends ``expected_subscription`` (only the subscribed
+    pack it names is removed) and an ``operation_id`` whose outcome
+    ``packs/remove/status`` reports if this request's answer is lost.
+    """
     payload = await _json_object(request)
     if payload is None or not _pack_id(payload):
         return _failure("invalid_request", 400)
-    return await _call(lambda svc: svc.remove_pack(_pack_id(payload)))
+    operation_id = payload.get("operation_id", "")
+    if not isinstance(operation_id, str) or (operation_id and not _OPERATION_ID_RE.fullmatch(operation_id)):
+        return _failure("invalid_request", 400)
+    expected = None
+    if payload.get("expected_subscription") is not None:
+        try:
+            expected = parse_expected_identity(payload["expected_subscription"])
+        except SubscriptionError as exc:
+            return _failure(exc.reason, 400)
+    return await _call(
+        lambda svc: svc.remove_pack(
+            _pack_id(payload), expected_identity=expected, operation_id=operation_id
+        )
+    )
+
+
+@router.get("/packs/remove/status")
+async def knowledge_pack_remove_status(operation_id: str = Query(..., min_length=16, max_length=64)):
+    if not _OPERATION_ID_RE.fullmatch(operation_id):
+        return _failure("invalid_request", 400)
+
+    async def run(svc: KnowledgeService) -> dict[str, Any]:
+        return svc.removal_status(operation_id)
+
+    return await _call(run)
+
+
+async def _subscription_from_multipart(
+    request: Request, body: bytes
+) -> tuple[bytes, KnowledgeSubscription] | str:
+    """The pack file and subscription metadata of an apply body, or a refusal reason."""
+
+    async def stream():
+        yield body
+
+    try:
+        form = await MultiPartParser(
+            request.headers, stream(), max_files=1, max_fields=4,
+            max_part_size=_JSON_BODY_MAX_BYTES,
+        ).parse()
+    except Exception:
+        return "invalid_request"
+    try:
+        if form.get("protocol_version") != str(SUBSCRIPTION_PROTOCOL_VERSION):
+            return "unsupported_protocol"
+        metadata = form.get("subscription")
+        upload = form.get("pack")
+        if not isinstance(metadata, str) or not isinstance(upload, UploadFile):
+            return "invalid_request"
+        try:
+            subscription = parse_subscription_json(metadata)
+        except SubscriptionError as exc:
+            return exc.reason
+        return await upload.read(), subscription
+    finally:
+        await form.close()
+
+
+@router.post("/subscriptions/apply")
+async def knowledge_apply_subscription(request: Request):
+    """Install a plugin-market artifact the plugin server downloaded and verified.
+
+    Reached only through Main's ``/api/public-knowledge/subscriptions/apply``
+    (CSRF + Origin), which the plugin server calls; the browser-facing bridge
+    does not forward this path. The pack must be the exact artifact named by
+    the subscription (same SHA-256, pack id and material type).
+    """
+    service = _service
+    if service is None:
+        return _failure("knowledge_starting", 503)
+    if _media_type(request) != "multipart/form-data":
+        return _failure("invalid_request", 400)
+    # Same admission as a local import: the body is read into memory.
+    if _import_slots.locked() or service.import_busy():
+        return {"ok": False, "reason": "knowledge_busy", **service.availability()}
+    async with _import_slots:
+        raw = await _read_body(request, max_bytes=_PACK_BODY_MAX_BYTES)
+        if raw is None:
+            return _failure("pack_too_large", 413)
+        parsed = await _subscription_from_multipart(request, raw)
+        if isinstance(parsed, str):
+            return _failure(parsed, 400)
+        pack, subscription = parsed
+        return await _call(lambda svc: svc.import_pack(pack, subscription=subscription))

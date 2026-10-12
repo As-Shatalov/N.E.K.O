@@ -77,6 +77,7 @@ from .registry import (
     utc_now,
 )
 from .chunking import chunk_bodies
+from .subscriptions import KnowledgeSubscription, identity_conflict
 from .render import RenderCard, render_reference_block
 from .retrieval import (
     LEXICAL_CANDIDATES,
@@ -120,6 +121,9 @@ MAX_TRACKED_JOBS = 50
 MAX_PENDING_IMPORTS = 3
 # Packs are listed whole on the management page; keep that list small.
 MAX_PACKS = 200
+# Removals that carried an operation id, kept so a caller whose request timed
+# out can learn whether it committed. Pending ones are never evicted.
+MAX_REMOVAL_OPERATIONS = 64
 STATUS_SOURCES = 12
 ACTIVE_JOB_STATES = frozenset({"queued", "building"})
 TERMINAL_JOB_STATES = frozenset({"active", "failed", "cancelled"})
@@ -183,6 +187,8 @@ class ImportJob:
     # Set once the index write commits; from then on the import is no longer
     # cancellable. The lock makes "cancel" and "commit" exclusive.
     committed: bool = False
+    # Market metadata of a subscription install; None for a local import.
+    subscription: KnowledgeSubscription | None = None
     gate: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def to_json(self) -> dict[str, Any]:
@@ -195,6 +201,7 @@ class ImportJob:
             "chunks_total": self.chunks_total,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "subscription": self.subscription.to_json() if self.subscription else None,
         }
 
 
@@ -307,6 +314,8 @@ class KnowledgeService:
         self._removal_settled = asyncio.Event()
         self._vectors_built_for: tuple[int, str] | None = None
         self._vector_task: asyncio.Task[Any] | None = None
+        # operation id -> {"status": pending|committed|failed, "result": ...}
+        self._removals: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
     # ── lifecycle ───────────────────────────────────────────────────
 
@@ -608,7 +617,70 @@ class KnowledgeService:
 
         return await self._locked(run)
 
-    async def remove_pack(self, pack_id: str) -> dict[str, Any]:
+    async def remove_pack(
+        self,
+        pack_id: str,
+        *,
+        expected_identity: tuple[str, str, str] | None = None,
+        operation_id: str = "",
+    ) -> dict[str, Any]:
+        """Remove a pack; with ``expected_identity`` only the subscribed pack it names.
+
+        With ``operation_id`` the outcome is remembered for ``removal_status``,
+        and the removal runs to its end even if the caller stops waiting, so
+        that outcome is always settled.
+        """
+        if not operation_id:
+            return await self._remove_pack_locked(pack_id, expected_identity)
+        if operation_id in self._removals:
+            # A retry of the same request: never remove twice.
+            return self.removal_status(operation_id)
+        self._note_removal(operation_id, "pending")
+        removal = asyncio.ensure_future(self._remove_pack_tracked(pack_id, expected_identity, operation_id))
+        self._detached.add(removal)
+        removal.add_done_callback(self._detached.discard)
+        removal.add_done_callback(_consume)
+        return await asyncio.shield(removal)
+
+    def _note_removal(self, operation_id: str, status: str, result: dict[str, Any] | None = None) -> None:
+        self._removals[operation_id] = {"status": status, "result": result}
+        self._removals.move_to_end(operation_id)
+        while len(self._removals) > MAX_REMOVAL_OPERATIONS:
+            oldest = next(
+                (key for key, item in self._removals.items() if item["status"] != "pending"), None
+            )
+            if oldest is None:
+                break
+            del self._removals[oldest]
+
+    def removal_status(self, operation_id: str) -> dict[str, Any]:
+        """Outcome of a tracked removal; ``unknown`` means it never arrived (or is long gone)."""
+        item = self._removals.get(operation_id)
+        if item is None:
+            return {"ok": False, "reason": "unknown_operation", "operation_id": operation_id,
+                    "operation_status": "unknown"}
+        if item["status"] == "pending":
+            return {"ok": False, "reason": "removal_in_progress", "operation_id": operation_id,
+                    "operation_status": "pending"}
+        return {**(item["result"] or {}), "operation_id": operation_id, "operation_status": item["status"]}
+
+    async def _remove_pack_tracked(
+        self, pack_id: str, expected_identity: tuple[str, str, str] | None, operation_id: str
+    ) -> dict[str, Any]:
+        try:
+            result = await self._remove_pack_locked(pack_id, expected_identity)
+        except KnowledgeUnavailable as exc:
+            self._note_removal(operation_id, "failed", {"ok": False, "reason": exc.reason})
+            raise
+        except BaseException:
+            self._note_removal(operation_id, "failed", {"ok": False, "reason": "knowledge_error"})
+            raise
+        self._note_removal(operation_id, "committed", {"ok": True, **result})
+        return {**result, "operation_id": operation_id, "operation_status": "committed"}
+
+    async def _remove_pack_locked(
+        self, pack_id: str, expected_identity: tuple[str, str, str] | None
+    ) -> dict[str, Any]:
         # Nothing is marked up front, so a failed removal has nothing to undo.
         # While this removal is pending, earlier imports of the pack yield (one
         # may be holding the lock this removal waits for); once it succeeds,
@@ -619,6 +691,8 @@ class KnowledgeService:
             # nothing this removal could commit, so it must not make that
             # import yield either.
             raise KnowledgeUnavailable("not_found")
+        if not self._identity_matches(pack_id, expected_identity):
+            raise KnowledgeUnavailable("subscription_identity_mismatch")
         self._request_seq += 1
         my_seq = self._request_seq
         self._pending_removals[pack_id] = self._pending_removals.get(pack_id, frozenset()) | {my_seq}
@@ -627,6 +701,9 @@ class KnowledgeService:
             record = self._registry.packs.get(pack_id)
             if record is None:
                 raise KnowledgeUnavailable("not_found")
+            if not self._identity_matches(pack_id, expected_identity):
+                # Checked again under the lock: an update may have landed.
+                raise KnowledgeUnavailable("subscription_identity_mismatch")
             registry = self._registry.without_pack(pack_id)
 
             def cleanup() -> None:
@@ -668,6 +745,30 @@ class KnowledgeService:
         self._schedule_vector_refresh()
         return result
 
+    def _identity_matches(self, pack_id: str, expected: tuple[str, str, str] | None) -> bool:
+        if expected is None:
+            return True
+        record = self._registry.packs.get(pack_id)
+        return (
+            record is not None
+            and record.subscription is not None
+            and record.subscription.identity == expected
+        )
+
+    def _identity_conflict(self, pack_id: str, subscription: KnowledgeSubscription | None) -> bool:
+        """Whether installing this would break the rules in ``knowledge.subscriptions``."""
+        installed = {key: record.subscription for key, record in self._registry.packs.items()}
+        if identity_conflict(pack_id, subscription, installed):
+            return True
+        # An import of another pack may already be installing this package.
+        return subscription is not None and any(
+            job.state in ACTIVE_JOB_STATES
+            and job.pack_id != pack_id
+            and job.subscription is not None
+            and job.subscription.provider_package_id == subscription.provider_package_id
+            for job in self._jobs.values()
+        )
+
     def _superseded(self, job: ImportJob) -> bool:
         """Whether a removal of the job's pack overrides this import."""
         return (
@@ -678,7 +779,10 @@ class KnowledgeService:
 
     # ── imports ─────────────────────────────────────────────────────
 
-    async def import_pack(self, raw: bytes) -> dict[str, Any]:
+    async def import_pack(
+        self, raw: bytes, *, subscription: KnowledgeSubscription | None = None
+    ) -> dict[str, Any]:
+        """Import a pack; ``subscription`` marks a verified plugin-market artifact."""
         self._require_ready()
         # Parsing a large pack holds several copies of it in memory: refuse
         # before parsing when imports are already at their limit, and never
@@ -694,7 +798,7 @@ class KnowledgeService:
         parse_work: list[concurrent.futures.Future[Any]] = []
         deferred = False
         try:
-            return await self._import_parsed(raw, arrived_at, parse_work)
+            return await self._import_parsed(raw, arrived_at, parse_work, subscription)
         except asyncio.CancelledError:
             # A cancelled request stops waiting, but its parse thread runs on
             # with the pack in memory: the slot is freed when that ends.
@@ -722,12 +826,26 @@ class KnowledgeService:
         self._parsing -= 1
 
     async def _import_parsed(
-        self, raw: bytes, arrived_at: int, parse_work: list[concurrent.futures.Future[Any]]
+        self,
+        raw: bytes,
+        arrived_at: int,
+        parse_work: list[concurrent.futures.Future[Any]],
+        subscription: KnowledgeSubscription | None = None,
     ) -> dict[str, Any]:
+        if subscription is not None:
+            # The market published these exact bytes; anything else is not
+            # the artifact the subscription names.
+            if await self._parse_thread(parse_work, pack_sha256, raw) != subscription.artifact_sha256:
+                return {"ok": False, "reason": "artifact_hash_mismatch"}
         try:
             pack, canonical, chunks = await self._parse_thread(parse_work, self._prepare_import, raw)
         except KnowledgePackError as exc:
             return {"ok": False, "reason": exc.reason}
+        if subscription is not None:
+            if pack.pack_id != subscription.pack_id:
+                return {"ok": False, "reason": "package_identity_mismatch"}
+            if pack.material_type != subscription.material_type:
+                return {"ok": False, "reason": "material_type_mismatch"}
         if len(canonical) > MAX_PACK_BYTES:
             # Normalization fills in omitted fields and can grow the file; the
             # staged canonical form is what gets read back, so it is what counts.
@@ -738,6 +856,9 @@ class KnowledgeService:
         if (
             existing is not None
             and existing.pack_sha256 == sha
+            # Same content under new market metadata (a re-published version)
+            # still goes through a job, so the record gets the new metadata.
+            and existing.subscription == subscription
             and pack.pack_id not in self._broken_packs
             # The raw file is the source of truth; if it went missing or was
             # altered since startup, import again so it gets rewritten.
@@ -750,6 +871,10 @@ class KnowledgeService:
             and not self._pending_removals.get(pack.pack_id)
         ):
             return {"ok": True, "pack_id": pack.pack_id, "unchanged": True, "state": "active"}
+        # After the awaits above and with none before the reservation below;
+        # the commit checks once more under the lock.
+        if self._identity_conflict(pack.pack_id, subscription):
+            return {"ok": False, "reason": "subscription_identity_mismatch"}
         # Admission is checked and reserved without an await in between, so
         # two requests for the same pack cannot both get through, and staged
         # files (written before the single runner gets to them) stay bounded.
@@ -762,7 +887,7 @@ class KnowledgeService:
 
         async def admit() -> dict[str, Any]:
             try:
-                return await self._admit_import(pack, canonical, chunks, arrived_at)
+                return await self._admit_import(pack, canonical, chunks, arrived_at, subscription)
             finally:
                 self._admitting.pop(pack.pack_id, None)
 
@@ -780,6 +905,7 @@ class KnowledgeService:
         canonical: bytes,
         chunks: int,
         arrived_at: int,
+        subscription: KnowledgeSubscription | None = None,
     ) -> dict[str, Any]:
         registry = self._registry
         others = [record for record in registry.packs.values() if record.pack_id != pack.pack_id]
@@ -795,7 +921,7 @@ class KnowledgeService:
         # another admission's just-written staging file would otherwise be
         # counted on disk and again as that admission's reservation.
         async with self._admission_lock:
-            return await self._stage_import(pack, canonical, chunks, arrived_at)
+            return await self._stage_import(pack, canonical, chunks, arrived_at, subscription)
 
     async def _stage_import(
         self,
@@ -803,6 +929,7 @@ class KnowledgeService:
         canonical: bytes,
         chunks: int,
         arrived_at: int,
+        subscription: KnowledgeSubscription | None = None,
     ) -> dict[str, Any]:
         # Staged files are counted from their jobs, or from the reservation of
         # an admission that has not written one yet; taken together with the
@@ -827,6 +954,7 @@ class KnowledgeService:
             chunks_total=chunks,
             staged_bytes=len(canonical),
             staged_sha256=pack_sha256(canonical),
+            subscription=subscription,
         )
         await self._thread(atomic_write_bytes, self._staging_path(job.job_id), canonical)
         if self._stopping:
@@ -1092,6 +1220,11 @@ class KnowledgeService:
                 raise KnowledgePackError("capacity_chunks")
             if self._installed_pack_bytes(pack.pack_id, active_jobs) + len(raw) > MAX_TOTAL_PACK_BYTES:
                 raise KnowledgePackError("capacity_bytes")
+            # Admission checked identity without the lock too; another import
+            # may have installed this pack or this market package since.
+            installed = {key: r.subscription for key, r in self._registry.packs.items()}
+            if identity_conflict(pack.pack_id, job.subscription, installed):
+                raise KnowledgePackError("subscription_identity_mismatch")
             now = utc_now()
             keys = {entry.key for entry in pack.entries}
             record = PackRecord(
@@ -1109,6 +1242,7 @@ class KnowledgeService:
                 ),
                 installed_at=previous.installed_at if previous else now,
                 updated_at=now,
+                subscription=job.subscription,
             )
             final_path = self.root / PACKS_DIR / record.file_name
             atomic_write_bytes(final_path, raw)
@@ -1830,6 +1964,7 @@ class KnowledgeService:
                         record, chunk, embedding_state, indexing=self._registry.enabled
                     ),
                     "broken": record.pack_id in self._broken_packs,
+                    "subscription": record.subscription.to_json() if record.subscription else None,
                     "installed_at": record.installed_at,
                     "updated_at": record.updated_at,
                 }

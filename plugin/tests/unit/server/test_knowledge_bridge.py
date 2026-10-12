@@ -85,3 +85,15 @@ def test_oversized_bodies_are_refused(bridge, monkeypatch):
     )
     assert response.status_code == 413
     assert seen == []
+
+
+def test_subscription_apply_is_not_reachable_from_the_browser_bridge(bridge):
+    """Only the plugin server's own worker installs market artifacts, via Main."""
+    client, seen = bridge
+    response = client.post(
+        "/market/knowledge/subscriptions/apply",
+        params={"token": get_bridge_token()},
+        files={"pack": ("p.json", b"{}", "application/json")},
+    )
+    assert response.status_code == 404
+    assert seen == []
