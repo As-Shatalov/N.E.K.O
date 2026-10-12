@@ -2004,3 +2004,84 @@ def test_livekit_drops_an_unverified_publication_candidate():
         """
     )
     assert out == {"calls": [False], "tracks": [None]}
+
+
+def test_flooding_fragments_are_dropped_before_reassembly():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const NVT = ctx.NekoVisitTransport;
+        const core = new NVT.TransportCore({ visitId: VISIT_ID, now: () => clock.now });
+        let fed = 0;
+        const orig = core.reassembler.feed.bind(core.reassembler);
+        core.reassembler.feed = (...a) => { fed += 1; return orig(...a); };
+        const piece = new Uint8Array(100);
+        for (let i = 0; i < 100; i++) core.onPiece('g_peer', 2, piece);
+        const firstSecond = { fed, dropped: core.droppedFlood };
+        for (let i = 0; i < 5; i++) core.onPiece('g_other', 2, piece);   // 另一个发送者有自己的预算
+        clock.now += 1000;
+        core.onPiece('g_peer', 2, piece);                                // 窗口滑过后恢复
+        return { firstSecond, total: fed };
+        """
+    )
+    assert out["firstSecond"] == {"fed": 40, "dropped": 60}
+    assert out["total"] == 46
+
+
+def test_reconnect_opening_after_the_window_is_rejected():
+    out = run_visit_js(
+        """
+        const h = makeController('guest');
+        let terminal = null;
+        const orig = h.c.onTerminal.bind(h.c);
+        h.c.onTerminal = (code) => { terminal = code; orig(code); };
+        h.c.onAuthToken('tok');
+        const first = sockets[sockets.length - 1];
+        first.serverOpen();
+        await advance(6000);
+        first.serverClose(1006);
+        await advance(1100);
+        const retry = sockets[sockets.length - 1];
+        h.c.link.clearConnectTimer();     // 模拟主线程卡住：看门狗没来得及跑
+        clock.now += 25000;
+        retry.serverOpen();
+        await settle();
+        return { terminal, retryClosed: retry.readyState === 3, auth: retry.sent.filter((m) => m.type === 'auth').length };
+        """
+    )
+    assert out == {"terminal": 1006, "retryClosed": True, "auth": 0}
+
+
+def test_terminal_close_waits_for_the_vendor_leave():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        let releaseExit;
+        h.trtc.exitRoom = () => { h.log.push(['exitRoom-slow']); return new Promise((r) => { releaseExit = r; }); };
+        let terminalAt = null;
+        const orig = h.c.onTerminal.bind(h.c);
+        h.c.onTerminal = (code) => { terminalAt = clock.now; orig(code); };
+        const start = clock.now;
+        h.ws.serverClose(4403);
+        await settle();
+        const before = terminalAt;
+        await advance(1000);
+        releaseExit();
+        await settle();
+        const after = terminalAt === null ? null : terminalAt - start;
+        // 离房一直不完成时最多等 5 s
+        const h2 = await joinedController('guest');
+        h2.trtc.exitRoom = () => new Promise(() => {});
+        let t2 = null;
+        const orig2 = h2.c.onTerminal.bind(h2.c);
+        h2.c.onTerminal = (code) => { t2 = clock.now; orig2(code); };
+        const s2 = clock.now;
+        h2.ws.serverClose(4404);
+        await advance(6000);
+        return { before, after, capped: t2 === null ? null : t2 - s2 };
+        """
+    )
+    assert out["before"] is None
+    assert out["after"] is not None and out["after"] >= 1000
+    assert out["capped"] is not None and 4900 <= out["capped"] <= 5100

@@ -25,6 +25,7 @@
   var STABLE_OPEN_MS = 5000;
   // 一直停在 CONNECTING（黑洞网络 / 卡住的代理）也要有个头：首连最多等这么久，重连等到重连窗口用完
   var CONNECT_TIMEOUT_MS = 10000;
+  var TERMINAL_LEAVE_WAIT_MS = 5000;  // 终止时等离房的上限
 
   function transportUrl(loc, visitId, side) {
     var scheme = loc.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -77,6 +78,18 @@
     ws.onopen = function () {
       if (ws !== self.ws) return;
       self.clearConnectTimer();
+      // 主线程卡住时连接可能在重连窗口过后才打开：过期的连接不接受，按连不上终止
+      if (self.lostAt !== null && self.now() - self.lostAt >= RECONNECT_WINDOW_MS) {
+        self.ws = null;
+        try {
+          ws.close();
+        } catch (_) {
+          // 已关闭
+        }
+        self.terminal = true;
+        self.hooks.onTerminal(1006);
+        return;
+      }
       // 只是握手成功不算恢复：鉴权前就被关掉的反复连 / 断不能一直把断线时限往后推
       self.clearStable();
       self.stableTimer = setTimeout(function () {
@@ -110,14 +123,14 @@
       var leaving = code !== CLOSE_SUPERSEDED ? self.hooks.leaveRoom('backend_socket_closed') : null;
       if (self.stopped || code === CLOSE_SUPERSEDED || code === CLOSE_UNAUTHORIZED || code === CLOSE_UNKNOWN_VISIT) {
         self.terminal = true;
-        self.hooks.onTerminal(code);
+        self.finishAfterLeave(leaving, code);
         return;
       }
       var now = self.now();
       if (self.lostAt === null) self.lostAt = now;
       if (now - self.lostAt >= RECONNECT_WINDOW_MS) {
         self.terminal = true;
-        self.hooks.onTerminal(code);
+        self.finishAfterLeave(leaving, code);
         return;
       }
       // 重连至少隔 1 s，并且等上一次离房真正结束：同一个 vendor 实例在 exitRoom 未完成时再
@@ -162,6 +175,26 @@
   };
 
   /** 后端 stop 之后本侧主动收线：终态，不再重连。 */
+  /**
+   * 终止前先等离房做完（最多 TERMINAL_LEAVE_WAIT_MS）：否则控制器拆掉适配器时 exitRoom 还在路上，
+   * 对端要等 vendor 超时才看到这边走了。被同 vid 顶号（4409）不离房，直接终止。
+   */
+  BackendLink.prototype.finishAfterLeave = function (leaving, code) {
+    var self = this;
+    if (!leaving) {
+      self.hooks.onTerminal(code);
+      return;
+    }
+    var done = false;
+    var finish = function () {
+      if (done) return;
+      done = true;
+      self.hooks.onTerminal(code);
+    };
+    setTimeout(finish, TERMINAL_LEAVE_WAIT_MS);
+    Promise.resolve(leaving).then(finish, finish);
+  };
+
   BackendLink.prototype.clearConnectTimer = function () {
     if (this.connectTimer !== null) clearTimeout(this.connectTimer);
     this.connectTimer = null;

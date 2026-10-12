@@ -23,6 +23,11 @@
   var WINDOW_MS = 1000;
   var WINDOW_BYTES = 6144;            // VISIT_VENDOR_WINDOW_BYTES
   var WINDOW_PIECES = 20;             // VISIT_VENDOR_WINDOW_MSGS
+  // 收方向每个发送者的片预算：正常对端的发送节流不会超过 WINDOW_BYTES / WINDOW_PIECES，
+  // 留一倍余量吸收网络抖动造成的扎堆到达；超出的片在重组之前就丢，不让「只发不完整片」绕过后端的整条限流
+  var RECV_WINDOW_BYTES = WINDOW_BYTES * 2;
+  var RECV_WINDOW_PIECES = WINDOW_PIECES * 2;
+  var RECV_TRACKED_SENDERS = 4;
   var QUEUE_MAX = 200;                // §4.3 send：出站队列上限
   var DROPPABLE_MAX_AGE_MS = 10000;   // 积压 >10 s 作废可丢类
   var BACKPRESSURE_ON_AGE_MS = 1000;  // 队首积压超过它就回 tx_backpressure{on:true}
@@ -37,6 +42,8 @@
     WINDOW_MS: WINDOW_MS,
     WINDOW_BYTES: WINDOW_BYTES,
     WINDOW_PIECES: WINDOW_PIECES,
+    RECV_WINDOW_BYTES: RECV_WINDOW_BYTES,
+    RECV_WINDOW_PIECES: RECV_WINDOW_PIECES,
     QUEUE_MAX: QUEUE_MAX,
     DROPPABLE_MAX_AGE_MS: DROPPABLE_MAX_AGE_MS,
     TOPICS: CMDS,
@@ -398,7 +405,28 @@
     this.timer = null;
     this.backpressure = false;
     this.droppedUnknownCmd = 0;
+    this.droppedFlood = 0;
+    this.recvWindows = {};
   }
+
+  /** 按发送者记 1 s 滑动窗口里收到的片；超预算返回 false（这片丢掉、不进重组）。 */
+  TransportCore.prototype._chargePiece = function (fromVid, bytes, now) {
+    var w = this.recvWindows[fromVid];
+    if (!w) {
+      var keys = Object.keys(this.recvWindows);
+      if (keys.length >= RECV_TRACKED_SENDERS) delete this.recvWindows[keys[0]];
+      w = this.recvWindows[fromVid] = { items: [], bytes: 0 };
+    }
+    while (w.items.length && now - w.items[0].at >= WINDOW_MS) w.bytes -= w.items.shift().bytes;
+    var size = bytes && typeof bytes.byteLength === 'number' ? bytes.byteLength : 0;
+    if (w.items.length + 1 > RECV_WINDOW_PIECES || w.bytes + size > RECV_WINDOW_BYTES) {
+      this.droppedFlood++;
+      return false;
+    }
+    w.items.push({ at: now, bytes: size });
+    w.bytes += size;
+    return true;
+  };
 
   TransportCore.prototype.attach = function (adapter) {
     this.adapter = adapter;
@@ -473,7 +501,9 @@
       this.droppedUnknownCmd++;
       return null;
     }
-    var payload = this.reassembler.feed(fromVid, bytes, this.now());
+    var now = this.now();
+    if (!this._chargePiece(fromVid, bytes, now)) return null;
+    var payload = this.reassembler.feed(fromVid, bytes, now);
     if (payload) this.onRecv({ from_vid: fromVid, cmd: cmd, payload: payload });
     return payload;
   };
