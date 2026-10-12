@@ -938,3 +938,15 @@ async def test_a_terminal_cache_record_without_its_hash_is_not_trusted(env):
     # 再试一次：存储里已有本键条目，如实回 duplicate、不再写
     status, body = await _cache(env, _diary_request())
     assert body["duplicate"] is True and env.tsdb.stores == 1 and len(_keyed(env)) == 1
+
+
+async def test_a_terminal_facts_record_without_its_hash_is_not_trusted(env):
+    # 键记录是终态却缺 content_hash：不凭它回「已写过」，按事实池里本场的行判定（这里一条都没有 → 照写）
+    from app.memory_server import idempotency
+
+    data = {f"visit-facts:{VISIT}": {"state": "done", "written_at": 1.0, "kind": "visit_facts", "written": 2}}
+    Path(idempotency.keys_path(NAME)).parent.mkdir(parents=True, exist_ok=True)
+    Path(idempotency.keys_path(NAME)).write_text(json.dumps(data), encoding="utf-8")
+    body = await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
+    assert body.get("duplicate") is not True and body["written"] == 2
+    assert len([r for r in _pool(env) if r.get("visit_id") == VISIT]) == 2
