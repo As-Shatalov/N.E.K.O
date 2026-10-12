@@ -486,6 +486,8 @@
     if (this.timer !== null) this.cancel(this.timer);
     this.timer = null;
     this.pacer.clear();
+    // 队列清空，背压标志一起复位：下一次积压才能再报出 on:true 的上升沿
+    this.backpressure = false;
   };
 
   NVT.utf8Len = utf8Len;

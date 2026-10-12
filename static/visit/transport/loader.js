@@ -546,6 +546,8 @@
 
   /** 离开 vendor 房间（同 vid 之后可再入房）。 */
   P.leaveRoom = function () {
+    // 传输 WS 断了：这一代连接上还没跑完的 SDK 加载 / 能力门不能再去入房（重连后按新凭证重来）
+    this.connGen += 1;
     this.peerPresent = false;
     this.vendorState = 'left';
     return this.adapter ? this.adapter.leave() : Promise.resolve();

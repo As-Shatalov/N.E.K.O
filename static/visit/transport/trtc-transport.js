@@ -11,6 +11,8 @@
   'use strict';
 
   var NVT = root.NekoVisitTransport = root.NekoVisitTransport || {};
+  var REMOTE_RETRY_DELAY_MS = 2000;   // startRemoteVideo 失败后的重试间隔
+  var REMOTE_RETRY_MAX = 5;           // 同一次可用之内最多重试几次
 
   function createTrtcAdapter(opts) {
     var TRTC = opts.sdk;
@@ -40,6 +42,8 @@
     var peerVid = opts.peerVid || null;
     var remoteVideoUser = null;
     var remoteStarted = false;
+    var remoteRetries = 0;
+    var remoteRetryTimer = null;
     var lastStats = null;
     var lastNetwork = null;
 
@@ -71,6 +75,7 @@
       trtc.on(E.REMOTE_VIDEO_AVAILABLE, function (ev) {
         if (!isPeer(ev.userId) || ev.streamType !== TRTC.TYPE.STREAM_TYPE_MAIN) return;
         remoteVideoUser = ev.userId;
+        remoteRetries = 0;
         maybeStartRemote();
       });
       trtc.on(E.REMOTE_VIDEO_UNAVAILABLE, function (ev) {
@@ -118,8 +123,14 @@
 
     // 订阅 / 取消订阅与发布共用一条队列：离房的「完成」也等它们，迟到的旧 stopRemoteVideo
     // 不会落在重新入房后的新订阅上
+    function clearRemoteRetry() {
+      if (remoteRetryTimer !== null) clearTimeout(remoteRetryTimer);
+      remoteRetryTimer = null;
+    }
+
     function maybeStartRemote() {
       if (!subscribeWanted || !remoteVideoUser || remoteStarted || !trtc) return;
+      clearRemoteRetry();
       remoteStarted = true;
       var user = remoteVideoUser;
       var gen = roomGen;
@@ -128,11 +139,20 @@
         return trtc.startRemoteVideo({ userId: user, streamType: TRTC.TYPE.STREAM_TYPE_MAIN, view: null })
           .then(function () {
             if (gen !== roomGen) return;
+            remoteRetries = 0;
             var track = trtc.getVideoTrack({ userId: user, streamType: TRTC.TYPE.STREAM_TYPE_MAIN });
             if (track && subscribeWanted && user === remoteVideoUser) handlers.onRemoteTrack(track);
           }, function (err) {
             remoteStarted = false;
             handlers.onLog('warn', 'trtc startRemoteVideo failed', String(err && err.code));
+            // REMOTE_VIDEO_AVAILABLE 只在可用性变化时来一次：同一订阅仍想要时隔一会儿自己重试
+            if (gen !== roomGen || remoteRetries >= REMOTE_RETRY_MAX) return;
+            remoteRetries += 1;
+            clearRemoteRetry();
+            remoteRetryTimer = setTimeout(function () {
+              remoteRetryTimer = null;
+              if (gen === roomGen && user === remoteVideoUser) maybeStartRemote();
+            }, REMOTE_RETRY_DELAY_MS);
           });
       });
     }
@@ -249,6 +269,8 @@
         leaving = true;
         joined = false;
         remoteStarted = false;
+        remoteRetries = 0;
+        clearRemoteRetry();
         roomGen += 1;
         publishing = false;
         publishedTrack = null;

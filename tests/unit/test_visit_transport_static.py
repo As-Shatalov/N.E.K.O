@@ -978,3 +978,58 @@ def test_livekit_sender_stats_report_tx_kbps():
         """
     )
     assert out == {"first": True, "second": 560}
+
+
+def test_queue_reset_clears_the_backpressure_latch():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const reports = [];
+        const core = new ctx.NekoVisitTransport.TransportCore({ visitId: VISIT_ID, onRecv() {}, onBackpressure: (b) => reports.push(b.on) });
+        core.backpressure = true;
+        core.reset();
+        return core.backpressure;
+        """
+    )
+    assert out is False
+
+
+def test_failed_trtc_remote_subscription_is_retried():
+    out = run_visit_js(
+        """
+        const h = await joinedController('host');
+        let fails = 2;
+        const orig = h.trtc.startRemoteVideo;
+        h.trtc.startRemoteVideo = (c) => { if (fails > 0) { fails -= 1; h.log.push(['startRemote-fail']); return Promise.reject(new Error('transient')); } return orig(c); };
+        h.ws.serverSend({ type: 'media', subscribe: true, peer_vid: 'g_peer' });
+        h.trtc.emit('REMOTE_VIDEO_AVAILABLE', { userId: 'g_peer', streamType: 'main' });
+        await settle();
+        await advance(2100);
+        await settle();
+        await advance(2100);
+        await settle();
+        return kinds(h.log).filter((k) => k.startsWith('startRemote'));
+        """
+    )
+    assert out == ["startRemote-fail", "startRemote-fail", "startRemoteVideo"]
+
+
+def test_capability_gate_finishing_after_socket_close_does_not_join():
+    out = run_visit_js(
+        """
+        const h = makeController('guest');
+        let release;
+        h.c.loadSdk = () => new Promise((r) => { release = () => r(h.TRTC); });
+        h.c.onAuthToken('tok');
+        const ws = sockets[sockets.length - 1];
+        ws.serverOpen();
+        ws.serverSend(credsFor('guest'));
+        await settle();
+        ws.serverClose(1006);
+        release();
+        await settle();
+        return { enter: kinds(h.log).filter((k) => k === 'enterRoom').length, sdkCaps: ws.sent.filter((m) => m.type === 'caps' && m.stage === 'sdk').length };
+        """
+    )
+    assert out == {"enter": 0, "sdkCaps": 0}
