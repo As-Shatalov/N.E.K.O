@@ -70,6 +70,7 @@
     var remoteTrack = null;
     var rxMark = null;
     var txMark = null;
+    var statsEpoch = 0;   // 收发统计基准的代号：重置后，之前发出、迟到回来的取样不能把旧基准写回去
     var localQuality = null;
     var entering = null;
     var subRetries = 0;
@@ -377,6 +378,7 @@
         remoteTrack = null;
         rxMark = null;
         txMark = null;
+        statsEpoch += 1;
         localQuality = null;
         subRetries = 0;
         clearSubRetry();
@@ -395,6 +397,7 @@
       },
       /** 断线 / 重连：收发统计的差分基准作废。 */
       resetStats: function () {
+        statsEpoch += 1;
         rxMark = null;
         txMark = null;
       },
@@ -409,7 +412,10 @@
       receiverStats: function (nowMs) {
         var receiver = remoteTrack && remoteTrack.receiver;
         if (!receiver || typeof receiver.getStats !== 'function') return Promise.resolve(null);
+        var epoch = statsEpoch;
+        var sampled = remoteTrack;
         return receiver.getStats().then(function (report) {
+          if (epoch !== statsEpoch || remoteTrack !== sampled) return null;
           var inbound = null;
           var rttS = null;
           report.forEach(function (r) {
@@ -434,7 +440,9 @@
       senderStats: function () {
         var track = publication && publication.track;
         if (!track || typeof track.getSenderStats !== 'function') return Promise.resolve(null);
+        var epoch = statsEpoch;
         return track.getSenderStats().then(function (list) {
+          if (epoch !== statsEpoch || !publication || publication.track !== track) return null;
           var s = Array.isArray(list) ? list[0] : list;
           if (!s) return null;
           var out = {

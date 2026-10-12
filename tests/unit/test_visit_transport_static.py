@@ -1764,3 +1764,65 @@ def test_unpublish_without_pending_operations_still_stops_synchronously():
         """
     )
     assert out == 1
+
+
+def test_livekit_late_stats_do_not_restore_reset_baselines():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9' } });
+        await a.setSubscribe(true);
+        let bytes = 0;
+        let hold = null;
+        const report = () => new Map([['in', { type: 'inbound-rtp', kind: 'video', bytesReceived: bytes, packetsReceived: 0, packetsLost: 0 }]]);
+        const receiver = { getStats: () => hold ? hold : Promise.resolve(report()) };
+        const pub = { kind: 'video', setSubscribed() {} };
+        LK.Room.last.emit('TrackPublished', pub, { identity: 'g_peer' });
+        LK.Room.last.emit('TrackSubscribed', { kind: 'video', mediaStreamTrack: {}, receiver }, pub, { identity: 'g_peer' });
+        let release;
+        hold = new Promise((r) => { release = r; });
+        const pending = a.receiverStats(0);        // 断线前发出、还没回来的取样
+        a.resetStats();
+        hold = null;
+        bytes = 350000;
+        release(report());
+        const stale = await pending;
+        bytes = 350000;
+        const first = await a.receiverStats(5000);  // 重置后的第一拍：没有基准
+        bytes = 700000;
+        const second = await a.receiverStats(10000);
+        return { stale, first: first.rx_kbps ?? null, second: second.rx_kbps };
+        """
+    )
+    assert out == {"stale": None, "first": None, "second": 560}
+
+
+def test_superseded_trtc_subscription_failure_does_not_reset_the_new_attempt():
+    out = run_visit_js(
+        """
+        const h = await joinedController('host');
+        const settles = [];
+        h.trtc.startRemoteVideo = () => { h.log.push(['startRemote']); return new Promise((res, rej) => settles.push({ res, rej })); };
+        h.ws.serverSend({ type: 'media', subscribe: true, peer_vid: 'g_peer' });
+        h.trtc.emit('REMOTE_VIDEO_AVAILABLE', { userId: 'g_peer', streamType: 'main' });
+        await settle();
+        h.trtc.emit('REMOTE_VIDEO_UNAVAILABLE', { userId: 'g_peer', streamType: 'main' });
+        h.trtc.emit('REMOTE_VIDEO_AVAILABLE', { userId: 'g_peer', streamType: 'main' });
+        settles[0].rej(new Error('old attempt'));   // 旧尝试迟到失败
+        await settle();
+        settles[1].res();                           // 新尝试成功
+        await settle();
+        await advance(10000);
+        await settle();
+        const starts = kinds(h.log).filter((k) => k === 'startRemote').length;
+        h.c.adapter.setSubscribe(false);
+        await settle();
+        return { starts, stops: kinds(h.log).filter((k) => k === 'stopRemoteVideo').length };
+        """
+    )
+    assert out == {"starts": 2, "stops": 1}

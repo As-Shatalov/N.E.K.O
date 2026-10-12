@@ -43,6 +43,7 @@
     var peerVid = opts.peerVid || null;
     var remoteVideoUser = null;
     var remoteStarted = false;
+    var remoteAttempt = 0;   // 订阅尝试编号：旧尝试迟到的成功 / 失败不能改新尝试的状态
     var remoteRetries = 0;
     var remoteRetryTimer = null;
     var entering = null;
@@ -71,6 +72,7 @@
         if (ev.userId === remoteVideoUser) {
           remoteVideoUser = null;
           remoteStarted = false;
+          remoteAttempt += 1;
           handlers.onRemoteTrack(null);
         }
       });
@@ -84,6 +86,7 @@
         if (ev.userId !== remoteVideoUser) return;
         remoteVideoUser = null;
         remoteStarted = false;
+        remoteAttempt += 1;
         clearRemoteRetry();
         handlers.onRemoteTrack(null);
       });
@@ -135,19 +138,22 @@
       if (!subscribeWanted || !remoteVideoUser || remoteStarted || !trtc) return;
       clearRemoteRetry();
       remoteStarted = true;
+      var attempt = ++remoteAttempt;
       var user = remoteVideoUser;
       var gen = roomGen;
       serial(function () {
         if (gen !== roomGen || !trtc) return undefined;
         return trtc.startRemoteVideo({ userId: user, streamType: TRTC.TYPE.STREAM_TYPE_MAIN, view: null })
           .then(function () {
-            if (gen !== roomGen) return;
+            if (gen !== roomGen || attempt !== remoteAttempt) return;
             remoteRetries = 0;
             var track = trtc.getVideoTrack({ userId: user, streamType: TRTC.TYPE.STREAM_TYPE_MAIN });
             if (track && subscribeWanted && user === remoteVideoUser) handlers.onRemoteTrack(track);
           }, function (err) {
-            remoteStarted = false;
             handlers.onLog('warn', 'trtc startRemoteVideo failed', String(err && err.code));
+            // 已被更新的尝试取代（对端视频先不可用再可用、取消后又订阅）：旧失败不清新尝试的状态、不排重试
+            if (attempt !== remoteAttempt) return;
+            remoteStarted = false;
             // REMOTE_VIDEO_AVAILABLE 只在可用性变化时来一次：同一订阅仍想要时按退避间隔一直重试
             if (gen !== roomGen) return;
             var delay = Math.min(REMOTE_RETRY_MAX_MS, REMOTE_RETRY_BASE_MS * Math.pow(2, remoteRetries));
@@ -155,7 +161,7 @@
             clearRemoteRetry();
             remoteRetryTimer = setTimeout(function () {
               remoteRetryTimer = null;
-              if (gen === roomGen && user === remoteVideoUser) maybeStartRemote();
+              if (gen === roomGen && user === remoteVideoUser && attempt === remoteAttempt) maybeStartRemote();
             }, delay);
           });
       });
@@ -277,6 +283,7 @@
         handlers.onRemoteTrack(null);
         if (!trtc || !remoteStarted || !remoteVideoUser) return Promise.resolve();
         remoteStarted = false;
+        remoteAttempt += 1;
         var user = remoteVideoUser;
         var gen = roomGen;
         return serial(function () {
@@ -289,6 +296,7 @@
         leaving = true;
         joined = false;
         remoteStarted = false;
+        remoteAttempt += 1;
         remoteRetries = 0;
         clearRemoteRetry();
         roomGen += 1;
