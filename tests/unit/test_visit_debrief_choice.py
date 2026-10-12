@@ -1656,3 +1656,42 @@ async def test_a_void_during_the_preview_push_greys_the_block_and_returns_no_pre
     assert chosen and chosen[-1]["request_id"] == debrief.preview_request_id(vid(1))
     assert chosen[-1]["choice"] == "forget"
     assert (await state_of(env=env))["debrief_pending"] is None
+
+
+async def test_a_void_while_checking_the_caller_still_keeps_the_preview_out(env, monkeypatch):
+    # 作废落在「核角色与账号」的那段 await 里（推送已经结束）：照样不回预览正文
+    from main_logic.visit.debrief_writers import write_forget
+
+    await visit(env)
+    real = debrief._caller_still_current
+
+    async def check_then_void(state, own_char):
+        result = await real(state, own_char)
+        await write_forget(VisitSpool(env.tmp, vid(1)))
+        return result
+
+    monkeypatch.setattr(debrief, "_caller_still_current", check_then_void)
+    status, body = await choose("diary")
+    assert status == 409 and body["choice"] == "forget" and "preview" not in body
+
+
+async def test_an_unreadable_state_after_the_push_returns_no_preview(env, monkeypatch):
+    await visit(env)
+    real = VisitSpool.read_state
+    pushed = {"preview": False}
+    render = env.host.render_chat_blocks
+
+    async def mark_preview(blocks, **kw):
+        if kw.get("request_id") == debrief.preview_request_id(vid(1)):
+            pushed["preview"] = True
+        return await render(blocks, **kw)
+
+    async def read_then_fail(self):
+        if pushed["preview"]:
+            raise OSError("state.json locked")  # 推完预览之后的重读读不出
+        return await real(self)
+
+    env.host.render_chat_blocks = mark_preview
+    monkeypatch.setattr(VisitSpool, "read_state", read_then_fail)
+    status, body = await choose("diary")
+    assert (status, body) == (503, {"retry": True})
