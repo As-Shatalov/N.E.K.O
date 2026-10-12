@@ -1763,7 +1763,7 @@ async def test_a_void_while_reusing_the_preview_returns_no_preview(env, monkeypa
 
 @pytest.fixture
 def void_on_identity_check(env, monkeypatch):
-    """「清除这个人」落在推送前核身份的那段 await 里（重放路径已读过 state 之后）。"""
+    """A "forget this person" void landing in the identity-check await of a replay (after its state read)."""
     from main_logic.visit import local_chars
     from main_logic.visit.debrief_writers import write_forget
 
