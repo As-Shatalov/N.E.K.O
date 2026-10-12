@@ -1465,7 +1465,9 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
         deduped_n = _counter(record.get("deduped")) if record is not None else None
         if (record is not None and record.get("state") in idempotency.TERMINAL_KEY_STATES
                 and isinstance(stored_hash, str) and stored_hash
-                and written_n is not None and deduped_n is not None):
+                and written_n is not None and deduped_n is not None
+                # 我们写下的终态记录总有 written + deduped == 这批事实条数：对不上同样算畸形
+                and written_n + deduped_n == len(texts)):
             return {"ok": True, "written": written_n, "deduped": deduped_n, "duplicate": True}
         # 记录缺内容哈希或计数畸形：不凭它回「已写过」，与没有记录一样按事实池里本场的行判定、只补缺的
         try:

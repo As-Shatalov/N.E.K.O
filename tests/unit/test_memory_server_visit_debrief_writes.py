@@ -1024,3 +1024,15 @@ async def test_an_unverifiable_hash_is_not_stamped_onto_a_malformed_record(env):
     assert "content_hash" not in (await _key_record())
     status, body = await _cache(env, _diary_request())
     assert status == 200 and body["duplicate"] is True
+
+
+async def test_terminal_fact_counters_inconsistent_with_the_request_are_not_trusted(env):
+    from app.memory_server import idempotency
+
+    await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
+    data = json.loads(Path(idempotency.keys_path(NAME)).read_text(encoding="utf-8"))
+    data[f"visit-facts:{VISIT}"].update(written=0, deduped=0)
+    Path(idempotency.keys_path(NAME)).write_text(json.dumps(data), encoding="utf-8")
+    body = await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
+    # 按事实池核对出真实条数，而不是照抄记录里的 0
+    assert body["duplicate"] is True and body["written"] == 2
