@@ -978,24 +978,44 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     lang = _lang()
     await _render(state, preview_blocks(visit_id, pending, lang), preview_request_id(visit_id))
     await _send(state, _state_frame(visit_id, "preview", preview_request_id(visit_id)))
-    # 先核角色与账号（有 await），最后才重读选择：重读之后到返回正文之间不再 await，
-    # 「清除这个人」（不拿这把锁）落在核对的等待里也拦得住
-    caller_current = await _caller_still_current(state, own_char)
     try:
-        now = await spool.read_state()
-    except Exception:  # noqa: BLE001 - 读不出：不回正文（拿不准是否已被作废），bind 重放会以 state.json 为准
+        return await _answer_preview(spool, state, own_char, pending)
+    except TimeoutError:
+        # 按住账号的时限到了：不回正文，预览已落盘，前端重试或 bind 重放都能拿到
         return 503, {"retry": True}
-    if now is None or now["debrief_choice"] != "preview:diary":
-        if now is not None:
-            # 推送期间这场已被作废：把刚推上去的预览块置灰，不回预览正文
-            await _send(now, _state_frame(visit_id, "chosen", preview_request_id(visit_id),
-                                          choice=now["debrief_choice"]))
-            return _already_chosen(now)
-        return 404, {"error": "unknown_or_expired"}
-    if not caller_current:
-        # 生成期间改了名（旧名字可能已归另一只猫）：预览已按 uid 推给它现在的页面，不再回给发起请求的旧页面
-        return 404, {"error": "unknown_or_expired"}
-    return 200, {"ok": True, "applied": "preview", "preview": pending}
+
+
+async def _answer_preview(spool: Any, state: Mapping[str, Any], own_char: str,
+                          pending: Mapping[str, Any]) -> tuple[int, dict]:
+    """The HTTP answer carrying a freshly generated preview, decided with the caller pinned.
+
+    The character lifecycle and the signed-in account are held from the
+    caller check to the final state read (:func:`_pin_push`): no rename or
+    account switch can land after the caller was confirmed. The choice is
+    re-read last, since "forget this person" voids without the visit lock;
+    nothing is awaited between that read and the returned preview.
+    """
+    visit_id = spool.visit_id
+    async with contextlib.AsyncExitStack() as stack:
+        if not await _pin_push(stack, state):
+            # 正在切号 / 角色配置读不出：不回正文（预览已落盘，按 uid 重放给它现在的页面）
+            return 404, {"error": "unknown_or_expired"}
+        caller_current = await _caller_still_current(state, own_char)
+        try:
+            now = await spool.read_state()
+        except Exception:  # noqa: BLE001 - 读不出：不回正文（拿不准是否已被作废），bind 重放会以 state.json 为准
+            return 503, {"retry": True}
+        if now is None or now["debrief_choice"] != "preview:diary":
+            if now is not None:
+                # 推送期间这场已被作废：把刚推上去的预览块置灰，不回预览正文
+                await _send(now, _state_frame(visit_id, "chosen", preview_request_id(visit_id),
+                                              choice=now["debrief_choice"]))
+                return _already_chosen(now)
+            return 404, {"error": "unknown_or_expired"}
+        if not caller_current:
+            # 生成期间改了名（旧名字可能已归另一只猫）/ 换了账号：不再回给发起请求的旧页面
+            return 404, {"error": "unknown_or_expired"}
+        return 200, {"ok": True, "applied": "preview", "preview": dict(pending)}
 
 
 def _parse_choice(payload: Mapping[str, Any]) -> tuple[Optional[str], Optional[str], Optional[int],

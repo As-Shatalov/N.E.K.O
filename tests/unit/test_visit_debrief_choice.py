@@ -1695,3 +1695,46 @@ async def test_an_unreadable_state_after_the_push_returns_no_preview(env, monkey
     monkeypatch.setattr(VisitSpool, "read_state", read_then_fail)
     status, body = await choose("diary")
     assert (status, body) == (503, {"retry": True})
+
+
+# ── Codex 第 24 轮 ───────────────────────────────────────────────────────
+
+
+async def test_the_final_state_read_runs_with_the_caller_pinned(env, monkeypatch):
+    # 核完调用方到最后重读选择之间：角色生命周期与登录账号都按住，改名 / 切号插不进来
+    await visit(env)
+    real = VisitSpool.read_state
+    pushed = {"preview": False}
+    seen = []
+    render = env.host.render_chat_blocks
+
+    async def mark_preview(blocks, **kw):
+        if kw.get("request_id") == debrief.preview_request_id(vid(1)):
+            pushed["preview"] = True
+        return await render(blocks, **kw)
+
+    async def watched_read(self):
+        if pushed["preview"]:
+            seen.append((_lifecycle_held(), bool(runtime._account_bound_pushes)))
+        return await real(self)
+
+    env.host.render_chat_blocks = mark_preview
+    monkeypatch.setattr(VisitSpool, "read_state", watched_read)
+    status, body = await choose("diary")
+    assert status == 200 and body["applied"] == "preview"
+    assert seen and all(held == (True, True) for held in seen)
+
+
+async def test_no_preview_is_returned_while_an_account_change_is_in_progress(env, monkeypatch):
+    await visit(env)
+    real_send = debrief._send
+
+    async def send_then_start_switch(state, frame):
+        shown = await real_send(state, frame)
+        if frame.get("phase") == "preview":
+            monkeypatch.setattr(runtime, "_account_changes", 1)  # 推完预览，切号开始
+        return shown
+
+    monkeypatch.setattr(debrief, "_send", send_then_start_switch)
+    assert await choose("diary") == (404, {"error": "unknown_or_expired"})
+    assert (await state_of(env=env))["debrief_choice"] == "preview:diary"
