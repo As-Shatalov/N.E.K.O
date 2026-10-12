@@ -24,8 +24,8 @@ Identity rules (enforced by the service, see ``identity_conflict``):
 
 * A pack is either local or subscribed, for good: a local import never
   overwrites a subscribed pack and a subscription never overwrites a local one.
-* A subscribed pack keeps its provider, package id and remote id; only the
-  version, channel and artifact may change.
+* A subscribed pack keeps its provider, package id, remote id and material
+  type; only the version, channel and artifact may change.
 * One market package installs as at most one pack.
 """
 
@@ -156,7 +156,11 @@ def identity_conflict(
         current = installed[pack_id]
         if (current is None) != (subscription is None):
             return True
-        if current is not None and subscription is not None and current.identity != subscription.identity:
+        if current is not None and subscription is not None and (
+            current.identity != subscription.identity
+            # Changing what the pack is used for is not an update.
+            or current.material_type != subscription.material_type
+        ):
             return True
     if subscription is None:
         return False

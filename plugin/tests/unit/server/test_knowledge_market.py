@@ -219,6 +219,18 @@ async def test_pruned_job_with_the_pack_now_owned_by_another_package_is_a_failur
     assert task["status"] == "failed" and task["error_code"] == "job_not_found"
 
 
+async def test_pruned_job_with_only_the_previous_release_installed_is_a_failure(env):
+    main = env["main"]
+    main.on("POST", "subscriptions/apply", {"ok": True, "job_id": "j1", "state": "queued"})
+    main.on("GET", "packs/jobs", {"ok": True, "jobs": []})
+    # Same package, pack and bytes, but the record still names the previous release.
+    previous = _installed()
+    previous["subscription"] = {**previous["subscription"], "version": "0.9.0"}
+    main.on("GET", "packs", {"ok": True, "packs": [previous]})
+    task = await _finished(env["http"], await _subscribe(env["http"]))
+    assert task["status"] == "failed" and task["error_code"] == "job_not_found"
+
+
 async def test_busy_answers_are_retried_then_succeed(env):
     main = env["main"]
     main.on(
@@ -350,6 +362,36 @@ async def test_busy_removal_is_reported_as_retryable_busy(env):
     assert response.json()["detail"] == {"code": "knowledge_busy", "retryable": True}
 
 
+async def test_a_definite_refusal_is_busy_at_once_not_an_unknown_outcome(env):
+    main = env["main"]
+    main.on("GET", "packs", {"ok": True, "packs": [_installed()]})
+    # Sent by the Memory Server itself (e.g. its registry is unreadable).
+    main.on("POST", "packs/remove", {"ok": False, "reason": "knowledge_unavailable"})
+    response = await _unsubscribe(env["http"])
+    assert response.status_code == 503
+    assert response.json()["detail"] == {"code": "knowledge_busy", "retryable": True}
+    assert "GET packs/remove/status" not in main.paths()
+    assert 42 not in km._unsubscribing
+
+
+@pytest.mark.parametrize(
+    "status, body, reason",
+    [
+        (503, {"ok": False, "reason": "knowledge_unavailable"}, "memory_server_unreachable"),
+        (504, {"ok": False, "reason": "knowledge_timeout"}, "memory_server_unreachable"),
+        (200, {"ok": False, "reason": "knowledge_unavailable"}, "knowledge_unavailable"),
+        (503, {"ok": False, "reason": "knowledge_starting"}, "knowledge_starting"),
+        (403, {"detail": "csrf"}, "http_403"),
+    ],
+)
+async def test_main_hop_failures_are_told_apart_from_memory_server_answers(monkeypatch, status, body, reason):
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(status, json=body)))
+    monkeypatch.setattr(km, "_client", lambda: client)
+    payload = await km._main_call("POST", "packs/remove", json_body={"pack_id": "x1"})
+    assert payload["reason"] == reason
+    await client.aclose()
+
+
 async def test_unknown_removal_is_confirmed_quickly_then_drained_with_backoff(env, monkeypatch):
     monkeypatch.setattr(km, "_UNSUBSCRIBE_BUDGET_SECONDS", 0.05)
     main = env["main"]
@@ -394,7 +436,8 @@ async def test_subscribe_is_refused_while_a_removal_is_draining(env, monkeypatch
 
     main = env["main"]
     main.on("GET", "packs", {"ok": True, "packs": [_installed()]})
-    main.on("POST", "packs/remove", {"ok": False, "reason": "knowledge_timeout"})
+    # Main gave up on the Memory Server (what _main_call reports for its 504).
+    main.on("POST", "packs/remove", {"ok": False, "reason": "memory_server_unreachable"})
     main.on("GET", "packs/remove/status", {"ok": False, "operation_status": "unknown"})
     assert (await _unsubscribe(env["http"])).status_code == 503
     main.on("GET", "packs/remove/status", held_status)

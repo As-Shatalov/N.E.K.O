@@ -111,13 +111,16 @@ _BUSY_REASONS = frozenset(
         "knowledge_unavailable",
         "knowledge_timeout",
         "main_server_unavailable",
+        "memory_server_unreachable",
     }
 )
-# Failures of a hop in front of the Memory Server (no answer, Main's proxy
-# timing out or not reaching it): a write's outcome is unknown, not refused.
-_OUTCOME_UNKNOWN_REASONS = frozenset(
-    {"main_server_unavailable", "knowledge_timeout", "knowledge_unavailable"}
-)
+# Failures of a hop in front of the Memory Server (no answer from Main, or
+# Main's proxy timing out or not reaching it): a write's outcome is unknown.
+# A refusal the Memory Server itself sent (any other reason) is definite.
+_OUTCOME_UNKNOWN_REASONS = frozenset({"main_server_unavailable", "memory_server_unreachable"})
+# What Main's /api/public-knowledge proxy answers when its own hop failed;
+# the Memory Server sends these reasons with 200, never with these statuses.
+_MAIN_HOP_FAILURES = frozenset({(503, "knowledge_unavailable"), (504, "knowledge_timeout")})
 
 # Activation is the full-text index only (vectors are computed afterwards in
 # the background), so it is minutes at most even behind a queue of imports.
@@ -292,6 +295,9 @@ async def _main_call(
     if response.status_code >= 400 and "reason" not in payload:
         # A refusal by Main itself (e.g. CSRF) rather than a knowledge answer.
         payload = {"ok": False, "reason": f"http_{response.status_code}"}
+    if (response.status_code, payload.get("reason")) in _MAIN_HOP_FAILURES:
+        # Main never got an answer from the Memory Server: not a refusal.
+        payload = {**payload, "reason": "memory_server_unreachable"}
     return payload
 
 
@@ -604,14 +610,13 @@ def _market_subscription(pack: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-_RECONCILED_FIELDS = ("provider_package_id", "remote_id", "artifact_sha256")
-
-
 async def _installed_pack_matches(expected: dict[str, str]) -> bool:
-    """Whether the installed registry holds this very subscription (package, pack, artifact).
+    """Whether the installed registry holds exactly this subscription, every field.
 
     The pack id and bytes alone are not enough: after a removal another
-    package could have installed the same bytes under the same pack id.
+    package could have installed the same bytes under the same pack id, and
+    an update that republishes the same bytes as a new version or channel
+    would otherwise match the record it was meant to replace.
     """
     try:
         payload = await _main_call("GET", "packs")
@@ -621,7 +626,7 @@ async def _installed_pack_matches(expected: dict[str, str]) -> bool:
         if isinstance(pack, dict) and pack.get("pack_id") == expected["pack_id"]:
             installed = _market_subscription(pack)
             return installed is not None and all(
-                installed.get(field) == expected[field] for field in _RECONCILED_FIELDS
+                installed.get(field) == value for field, value in expected.items()
             )
     return False
 

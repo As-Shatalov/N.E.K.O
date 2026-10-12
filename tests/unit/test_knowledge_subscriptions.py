@@ -129,6 +129,8 @@ def test_identity_rules():
     assert identity_conflict("another-pack", _subscription(raw, pack_id="another-pack"), {"market-memes": sub})
     # Same package, new version: allowed.
     assert not identity_conflict("market-memes", _subscription(raw, version="2.0.0"), {"market-memes": sub})
+    # ...but not a change of what the pack is used for.
+    assert identity_conflict("market-memes", _subscription(raw, material_type="corpus"), {"market-memes": sub})
 
 
 # ── service ─────────────────────────────────────────────────────────
@@ -227,6 +229,20 @@ async def test_update_and_republished_metadata_replace_the_record(tmp_path):
         await service.stop()
 
 
+async def test_an_update_cannot_change_the_material_type(tmp_path):
+    service = await _started(tmp_path)
+    try:
+        await _subscribe(service)
+        corpus = _pack(material_type="corpus", content="Now a corpus.")
+        raw = _raw(corpus)
+        result = await service.import_pack(raw, subscription=_subscription(raw, material_type="corpus", version="2.0.0"))
+        assert result == {"ok": False, "reason": "subscription_identity_mismatch"}
+        (pack,) = await service.list_packs()
+        assert pack["subscription"]["material_type"] == "knowledge"
+    finally:
+        await service.stop()
+
+
 async def test_identity_is_rechecked_under_the_lock_at_commit(tmp_path, monkeypatch):
     service = await _started(tmp_path)
     try:
@@ -313,7 +329,13 @@ async def test_removal_outcome_is_tracked_and_never_repeated(tmp_path):
         status = service.removal_status("op-remove-000001")
         assert status["operation_status"] == "committed" and status["ok"] is True
         # A retry of the same operation answers from the record.
-        assert (await service.remove_pack("market-memes", operation_id="op-remove-000001"))["ok"] is True
+        retry = await service.remove_pack("market-memes", expected_identity=IDENTITY, operation_id="op-remove-000001")
+        assert retry["ok"] is True and retry["operation_status"] == "committed"
+        # The same id reused for another removal is refused, not answered with this outcome.
+        for other in (("another-pack", IDENTITY), ("market-memes", None)):
+            with pytest.raises(service_module.KnowledgeUnavailable) as excinfo:
+                await service.remove_pack(other[0], expected_identity=other[1], operation_id="op-remove-000001")
+            assert excinfo.value.reason == "operation_id_conflict"
 
         with pytest.raises(service_module.KnowledgeUnavailable):
             await service.remove_pack("market-memes", operation_id="op-remove-000002")

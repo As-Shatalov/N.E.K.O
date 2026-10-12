@@ -632,7 +632,12 @@ class KnowledgeService:
         """
         if not operation_id:
             return await self._remove_pack_locked(pack_id, expected_identity)
+        target = (pack_id, expected_identity)
         if operation_id in self._removals:
+            if self._removals[operation_id]["target"] != target:
+                # Reused for another removal: answering with the earlier
+                # outcome would report a removal that never ran.
+                raise KnowledgeUnavailable("operation_id_conflict")
             # A retry of the same request: never remove twice.
             return self.removal_status(operation_id)
         if len(self._removals) >= MAX_REMOVAL_OPERATIONS and all(
@@ -642,15 +647,25 @@ class KnowledgeService:
             # evict the next outcome as soon as it settles, before its caller
             # could ask for it.
             raise KnowledgeUnavailable("knowledge_busy")
-        self._note_removal(operation_id, "pending")
+        self._note_removal(operation_id, "pending", target=target)
         removal = asyncio.ensure_future(self._remove_pack_tracked(pack_id, expected_identity, operation_id))
         self._detached.add(removal)
         removal.add_done_callback(self._detached.discard)
         removal.add_done_callback(_consume)
         return await asyncio.shield(removal)
 
-    def _note_removal(self, operation_id: str, status: str, result: dict[str, Any] | None = None) -> None:
-        self._removals[operation_id] = {"status": status, "result": result}
+    def _note_removal(
+        self,
+        operation_id: str,
+        status: str,
+        result: dict[str, Any] | None = None,
+        *,
+        target: tuple[str, tuple[str, str, str] | None] | None = None,
+    ) -> None:
+        previous = self._removals.get(operation_id)
+        if target is None and previous is not None:
+            target = previous["target"]
+        self._removals[operation_id] = {"status": status, "result": result, "target": target}
         self._removals.move_to_end(operation_id)
         while len(self._removals) > MAX_REMOVAL_OPERATIONS:
             oldest = next(
