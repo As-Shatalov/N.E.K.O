@@ -35,8 +35,9 @@ Bounds (kept from the #2951 review):
   workers, including those only waiting for activation, is capped separately
   by ``_MAX_TRACKED_SUBSCRIPTIONS``.
 * Terminal import jobs are pruned on the Memory Server. A job that disappears
-  while being polled is checked against the installed registry (pack id,
-  provider and artifact SHA-256) rather than reported as failed.
+  while being polled is checked against the installed registry (every field
+  of the subscription: package, pack, release and artifact) rather than
+  reported as failed.
 * "Busy" answers (the write lock, import slots, Main or the Memory Server
   starting) are retried, and if they persist they are reported as a
   retryable ``knowledge_busy``, never as an invalid pack.
