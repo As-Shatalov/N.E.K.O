@@ -327,6 +327,15 @@ SPEAKER_TRUST_CHANNEL_MAX_LEN = 16
 # 是人工稀有操作，409 是可接受的失败模式；读时截断不是。
 IDENTITY_MAX_ACCOUNTS_PER_ENTITY_PER_PLATFORM = 8
 
+# 按 platform 覆盖上面的上限（只收紧，不放宽）。
+# neko_visit（串门，即 VISIT_MEMORY_PLATFORM）= 1：同一个 entity 下有两个串门
+# account，串门清除就会扇出到另一个 account；串门客户端还没接上 target_epochs，
+# 扇出目标没有持久墓碑，迟到的旧写入会把已清除的记忆写回。接上之前不许关联，
+# 见 issue #3405。
+IDENTITY_MAX_ACCOUNTS_PER_ENTITY_BY_PLATFORM = {
+    "neko_visit": 1,
+}
+
 
 def _assert_activity_bonus_reachable() -> None:
     """Startup assertion: the activity count cap must be able to reach MAX_BONUS.

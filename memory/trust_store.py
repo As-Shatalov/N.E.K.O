@@ -1473,7 +1473,10 @@ async def areconcile_from_facts(fact_store, character_names) -> dict:
 def _account_limit_guard(
     entity: dict[str, Any], platform: str, incoming: Iterable[str],
 ) -> None:
-    from config import IDENTITY_MAX_ACCOUNTS_PER_ENTITY_PER_PLATFORM
+    from config import (
+        IDENTITY_MAX_ACCOUNTS_PER_ENTITY_BY_PLATFORM,
+        IDENTITY_MAX_ACCOUNTS_PER_ENTITY_PER_PLATFORM,
+    )
 
     existing = {
         account_id for account_id in (entity.get("accounts") or {})
@@ -1483,13 +1486,26 @@ def _account_limit_guard(
         account_id for account_id in incoming
         if account_platform(account_id) == platform
     )
-    if len(existing) > IDENTITY_MAX_ACCOUNTS_PER_ENTITY_PER_PLATFORM:
+    limit = min(
+        IDENTITY_MAX_ACCOUNTS_PER_ENTITY_PER_PLATFORM,
+        IDENTITY_MAX_ACCOUNTS_PER_ENTITY_BY_PLATFORM.get(
+            platform, IDENTITY_MAX_ACCOUNTS_PER_ENTITY_PER_PLATFORM,
+        ),
+    )
+    if len(existing) <= limit:
+        return
+    if platform in IDENTITY_MAX_ACCOUNTS_PER_ENTITY_BY_PLATFORM:
+        # 按平台收紧的上限各有原因（见配置注释），报错要说清楚，不能只报一个数字
         raise TrustIdentityError(
-            f"该实体在 {platform} 已有 "
-            f"{IDENTITY_MAX_ACCOUNTS_PER_ENTITY_PER_PLATFORM} 个 account，"
-            f"无法再绑定；请先解绑一个",
+            f"{platform} 平台的 account 暂不支持与同平台其它 account 关联"
+            f"（每个实体最多 {limit} 个）：清除的扇出目标还没有持久墓碑，"
+            f"见 issue #3405",
             status_code=409,
         )
+    raise TrustIdentityError(
+        f"该实体在 {platform} 已有 {limit} 个 account，无法再绑定；请先解绑一个",
+        status_code=409,
+    )
 
 
 def _merge_entities_locked(
