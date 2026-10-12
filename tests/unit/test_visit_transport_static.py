@@ -753,3 +753,28 @@ def test_livekit_initial_publication_uses_the_supplied_profile():
         """
     )
     assert out == [["setParameters", 300000, 15]]
+
+
+def test_leave_completion_also_waits_for_the_late_stop():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        let finishStart, finishStop;
+        h.trtc.startLocalVideo = () => new Promise((r) => { finishStart = r; });
+        h.trtc.stopLocalVideo = () => { h.log.push(['stop-pending']); return new Promise((r) => { finishStop = r; }); };
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        const n = h.sockets.length;
+        h.ws.serverClose(1006);
+        await advance(1500);
+        finishStart();                      // 离房后发布才完成 → 迟到的停止开始、还没结束
+        await settle();
+        await advance(1500);
+        const beforeStop = h.sockets.length - n;
+        finishStop();
+        await settle();
+        await settle();
+        return { beforeStop, after: h.sockets.length - n };
+        """
+    )
+    assert out == {"beforeStop": 0, "after": 1}

@@ -254,8 +254,8 @@
             });
           }).then(function (pub) {
             if (gen !== roomGen) {
-              current.localParticipant.unpublishTrack(track, false).catch(function () {});
-              return false;
+              return Promise.resolve(current.localParticipant.unpublishTrack(track, false))
+                .then(null, function () {}).then(function () { return false; });
             }
             publication = pub;
             publishedTrack = track;

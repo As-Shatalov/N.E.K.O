@@ -187,9 +187,10 @@
           // 发布成功才记状态：失败（暂时性）时下一次 media{publish:true} 还要真的再发一次
           return p.then(function () {
             if (gen !== roomGen) {
-              // 离房后才完成的发布：本地视频已不属于任何房间，停掉
-              if (trtc) trtc.stopLocalVideo().catch(function () {});
-              return false;
+              // 离房后才完成的发布：本地视频已不属于任何房间，停掉；停止也留在队列里等它完成，
+              // 「离房完成」之后的重新入房不会被这次迟到的停止波及
+              if (!trtc) return false;
+              return trtc.stopLocalVideo().then(null, function () {}).then(function () { return false; });
             }
             publishing = true;
             publishedTrack = track;
