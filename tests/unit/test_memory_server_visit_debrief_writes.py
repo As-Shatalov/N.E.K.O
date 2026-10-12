@@ -1008,3 +1008,19 @@ async def test_a_terminal_cache_record_without_its_hash_is_repaired_after_recove
     assert record["content_hash"] == routes._canonical_history_hash(_diary_request().input_history)
     status, _body = await _cache(env, _diary_request("改过的日记"))
     assert status == 422
+
+
+async def test_an_unverifiable_hash_is_not_stamped_onto_a_malformed_record(env):
+    # 存储里已有本键日记（内容 A），键记录是缺哈希的终态：带另一份内容 B 的请求只能凭「键写过」回 duplicate，
+    # 不能把 B 的哈希补进记录；之后用 A 重试照常是 duplicate，不会被 422 误拒
+    from app.memory_server import idempotency
+
+    await _cache(env, _diary_request())
+    data = json.loads(Path(idempotency.keys_path(NAME)).read_text(encoding="utf-8"))
+    data[KEY].pop("content_hash")
+    Path(idempotency.keys_path(NAME)).write_text(json.dumps(data), encoding="utf-8")
+    status, body = await _cache(env, _diary_request("改过的日记"))
+    assert body["duplicate"] is True
+    assert "content_hash" not in (await _key_record())
+    status, body = await _cache(env, _diary_request())
+    assert status == 200 and body["duplicate"] is True

@@ -1354,7 +1354,10 @@ async def _cache_keyed(lanlan_name: str, raw_history: str, input_history: list, 
         # 两处存储已确认（本次写成或早已写过）：标 done 只为之后少做一次核对，记不上（云存档维护期、
         # 键文件一时写不了）也不影响如实回结果——存储里的证据就是「写过」，重试会判为 duplicate
         try:
-            await idempotency.update_key(lanlan_name, key, _done_repairing(content_hash=content_hash, kind="cache"))
+            # 只在这次真把本请求的内容写进了两处存储时才记它的哈希：present / retired 只证明「这个键写过」，
+            # 比对不了正文，用本请求的哈希去补一条缺哈希的记录，可能把别的内容的哈希钉成这个键的身份
+            await idempotency.update_key(lanlan_name, key, _done_repairing(
+                content_hash=content_hash if outcome == "written" else None, kind="cache"))
         except Exception as exc:  # noqa: BLE001
             logger.info(f"[MemoryServer] keyed cache {lanlan_name}: done not recorded: {exc!r}")
     if outcome != "written":
@@ -1387,7 +1390,9 @@ def _done_repairing(**fields: object):
             isinstance(old.get(name), int) and not isinstance(old.get(name), bool) and old.get(name) >= 0
             for name in ("written", "deduped") if name in fields
         )
-        if hash_ok and counters_ok:
+        needs_hash = not hash_ok and bool(fields.get("content_hash"))
+        if not needs_hash and counters_ok:
+            # 完好，或缺的哈希这次也给不出已核对过的值：不动
             return None
         record = dict(old)
         record.update({name: value for name, value in fields.items() if value is not None})
