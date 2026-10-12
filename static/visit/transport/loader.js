@@ -163,7 +163,7 @@
         onOpen: function () { self.onSocketOpen(); },
         onMessage: function (msg) { self.onDownlink(msg); },
         stopAllMedia: function () { self.stopAllMedia(); },
-        leaveRoom: function (reason) { self.leaveRoom(reason); },
+        leaveRoom: function (reason) { return self.leaveRoom(reason); },
         onTerminal: function (code) { self.onTerminal(code); },
       },
     });
@@ -452,7 +452,7 @@
   P.leaveRoom = function () {
     this.peerPresent = false;
     this.vendorState = 'left';
-    if (this.adapter) this.adapter.leave();
+    return this.adapter ? this.adapter.leave() : Promise.resolve();
   };
 
   P.onStop = function () {

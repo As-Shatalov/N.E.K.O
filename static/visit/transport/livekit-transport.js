@@ -46,6 +46,8 @@
     var leaving = false;
     var publication = null;
     var publishedTrack = null;
+    // 发布代数：同 TRTC 适配器，停止之后才完成的发布立即撤销
+    var publishGen = 0;
     var subscribeWanted = false;
     var peerVid = opts.peerVid || null;
     var remotePublication = null;
@@ -213,6 +215,7 @@
       publish: function (track) {
         if (!room || !joined) return Promise.resolve(false);
         if (publication && publishedTrack === track) return Promise.resolve(true);
+        var gen = ++publishGen;
         var before = publication ? room.localParticipant.unpublishTrack(publishedTrack, false) : Promise.resolve();
         return Promise.resolve(before).then(function () {
           return room.localParticipant.publishTrack(track, {
@@ -223,6 +226,10 @@
             degradationPreference: 'maintain-framerate',
           });
         }).then(function (pub) {
+          if (gen !== publishGen) {
+            if (room) room.localParticipant.unpublishTrack(track, false).catch(function () {});
+            return false;
+          }
           publication = pub;
           publishedTrack = track;
           return true;
@@ -242,6 +249,7 @@
         return sender.setParameters(params).then(function () { return true; });
       },
       unpublish: function () {
+        publishGen += 1;
         if (!room || !publication) return Promise.resolve();
         var track = publishedTrack;
         publication = null;
@@ -262,6 +270,7 @@
       leave: function () {
         leaving = true;
         joined = false;
+        publishGen += 1;
         publication = null;
         publishedTrack = null;
         remotePublication = null;

@@ -21,6 +21,8 @@
     var leaving = false;
     var publishing = false;
     var publishedTrack = null;
+    // 发布代数：每次发布 / 撤销 / 离房都加一；发布完成时代数已变说明期间被停过，立即撤销
+    var publishGen = 0;
     var subscribeWanted = false;
     var peerVid = opts.peerVid || null;
     var remoteVideoUser = null;
@@ -164,9 +166,15 @@
         // 同一条轨已在发布：重复的 media 快照不再触发 SDK 调用（尺寸变化走 updateProfile）
         if (publishing && publishedTrack === track) return Promise.resolve(true);
         var config = { publish: true, option: { videoTrack: track, profile: profile } };
+        var gen = ++publishGen;
         var p = publishing ? trtc.updateLocalVideo(config) : trtc.startLocalVideo(config);
         // 发布成功才记状态：失败（暂时性）时下一次 media{publish:true} 还要真的再发一次
         return p.then(function () {
+          if (gen !== publishGen) {
+            // 发布进行中收到了停止（media{publish:false} / 4409 / 离房）：不能在停止之后又发出去
+            if (trtc && joined) trtc.stopLocalVideo().catch(function () {});
+            return false;
+          }
           publishing = true;
           publishedTrack = track;
           return true;
@@ -180,6 +188,7 @@
         return trtc.updateLocalVideo({ option: { profile: profile } }).then(function () { return true; });
       },
       unpublish: function () {
+        publishGen += 1;
         if (!trtc || !publishing) return Promise.resolve();
         publishing = false;
         publishedTrack = null;
@@ -204,6 +213,7 @@
         leaving = true;
         joined = false;
         remoteStarted = false;
+        publishGen += 1;
         publishing = false;
         publishedTrack = null;
         if (!trtc) return Promise.resolve();

@@ -2,7 +2,7 @@
  * 串门父页桥接（设计稿 §3.3 / §3.4 / §4.4，PR-11）。只在 index.html（Pet 窗 / 网页单窗口）加载。
  *
  * - 懒建同源传输 iframe：visit_state_change{pending} 建、ended 移除，同一时刻最多一个。
- *   host 侧 iframe 就是访客图层：position:fixed; z-index:9（低于 z-index:10 的 #live2d-container）;
+ *   host 侧 iframe 就是访客图层：position:fixed; z-index:4（低于模型容器：Pet / 桌面 10、非 Pet 移动端 5）;
  *   pointer-events:none——命中测试永远落在本家画布上，Pet 窗穿透不变（T3 实测：只靠
  *   transparent-overlay 类会让直通模式整窗可点）。guest 侧 1×1 放在视口外，只当传输。
  * - 同任务取帧：Live2D 在 renderer 的 postrender 里、VRM / MMD 在 render 之后（各一行钩子）、
@@ -24,9 +24,9 @@
   var READY_TIMEOUT_MS = 15000;
   var PEER_AWAY_OPACITY = '0.6';
   var CROP_ASPECT = { upper: 320 / 448, full: 256 / 560 };   // 与传输页 CROP_GEOMETRY 同一构图
-  var HOST_FRAME_STYLE = 'position:fixed;z-index:9;border:0;background:transparent;pointer-events:none;' +
+  var HOST_FRAME_STYLE = 'position:fixed;z-index:4;border:0;background:transparent;pointer-events:none;' +
     'left:0;top:0;width:1px;height:1px;';
-  var GUEST_FRAME_STYLE = 'position:fixed;z-index:9;border:0;background:transparent;pointer-events:none;' +
+  var GUEST_FRAME_STYLE = 'position:fixed;z-index:4;border:0;background:transparent;pointer-events:none;' +
     'left:-10px;top:-10px;width:1px;height:1px;';
   var MODEL_CONTAINER_IDS = ['live2d-container', 'vrm-container', 'mmd-container', 'pngtuber-container'];
   var ACTIVE_PHASES = { active: 1, wrap_up: 1 };

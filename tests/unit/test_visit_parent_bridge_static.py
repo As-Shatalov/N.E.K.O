@@ -55,7 +55,14 @@ def test_host_frame_never_takes_pointer_events_and_sits_below_the_model():
     assert "pointer-events:none" in rule and int(re.search(r"z-index:(\d+)", rule).group(1)) < 10
     live2d_z = int(re.search(r"#live2d-container\s*\{[^}]*?z-index:\s*(\d+)", css).group(1))
     assert z < live2d_z
+    # 非 Pet 的移动端布局把模型层降到 5：访客图层同样要在它之下
+    mobile_z = min(int(v) for v in re.findall(
+        r"#live2d-container\s*\{[^}]*?z-index:\s*(\d+)", css))
+    assert z < mobile_z and int(re.search(r"z-index:(\d+)", rule).group(1)) < mobile_z
     assert "f.className = 'transparent-overlay'" in code
+    # 用户把模型最小化时由 .minimized 决定透明度
+    for cid in ("live2d-container", "vrm-container", "mmd-container", "pngtuber-container"):
+        assert f"#{cid}.visiting-away:not(.minimized)" in css
 
 
 def test_one_line_hooks_in_the_renderers():

@@ -82,7 +82,7 @@ def test_hb_corrected_peer_hidden_and_crop_reach_the_visitor_layer():
     assert out["opacity"] == "dim"
     assert out["badge"] == "Stepped away"
     assert out["badgeGone"] and out["afterVisible"] == ""
-    assert "pointer-events:none" in out["style"] and "z-index:9" in out["style"]
+    assert "pointer-events:none" in out["style"] and "z-index:4" in out["style"]
     assert out["cls"] == "transparent-overlay"
     assert out["src"] == "/visit/transport?v=9&side=host&visit_id=AbCdEfGhIjKlMnOpQrStUv"
     assert out["token"] == "tok"

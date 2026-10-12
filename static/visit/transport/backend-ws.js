@@ -29,7 +29,7 @@
   }
 
   /**
-   * hooks: onOpen() / onMessage(msg) / stopAllMedia() / leaveRoom(reason) / onTerminal(code)。
+   * hooks: onOpen() / onMessage(msg) / stopAllMedia() / leaveRoom(reason)（返回离房完成的 promise）/ onTerminal(code)。
    */
   function BackendLink(opts) {
     this.visitId = opts.visitId;
@@ -77,7 +77,7 @@
       var code = event && event.code;
       // 先同步停媒体、离房，再决定重连：都不依赖后端的任何计时器
       self.hooks.stopAllMedia();
-      if (code !== CLOSE_SUPERSEDED) self.hooks.leaveRoom('backend_socket_closed');
+      var leaving = code !== CLOSE_SUPERSEDED ? self.hooks.leaveRoom('backend_socket_closed') : null;
       if (self.stopped || code === CLOSE_SUPERSEDED || code === CLOSE_UNAUTHORIZED || code === CLOSE_UNKNOWN_VISIT) {
         self.terminal = true;
         self.hooks.onTerminal(code);
@@ -90,10 +90,21 @@
         self.hooks.onTerminal(code);
         return;
       }
-      self.reconnectTimer = setTimeout(function () {
-        self.reconnectTimer = null;
-        self.connect();
-      }, RECONNECT_DELAY_MS);
+      // 重连至少隔 1 s，并且等上一次离房真正结束：同一个 vendor 实例在 exitRoom 未完成时再
+      // enterRoom，迟到的退出可能拆掉新房间。离房最多等到 20 s 重连窗口结束
+      var delayDone = new Promise(function (resolve) {
+        self.reconnectTimer = setTimeout(function () {
+          self.reconnectTimer = null;
+          resolve();
+        }, RECONNECT_DELAY_MS);
+      });
+      var leftOrGaveUp = Promise.race([
+        Promise.resolve(leaving).then(null, function () {}),
+        new Promise(function (resolve) { setTimeout(resolve, Math.max(0, RECONNECT_WINDOW_MS - (now - self.lostAt))); }),
+      ]);
+      Promise.all([delayDone, leftOrGaveUp]).then(function () {
+        if (!self.terminal && !self.ws) self.connect();
+      });
     };
     ws.onerror = function () {
       // 关闭由 onclose 统一处理

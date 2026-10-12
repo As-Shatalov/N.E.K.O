@@ -81,7 +81,9 @@ def test_backend_close_stops_media_and_leaves_before_any_reconnect():
     leave = onclose.index("leaveRoom(")
     assert stop < onclose.index("setTimeout(") and leave < onclose.index("setTimeout(")
     # 4409 只停媒体、不离房、不重连
-    assert "if (code !== CLOSE_SUPERSEDED) self.hooks.leaveRoom(" in onclose
+    assert "code !== CLOSE_SUPERSEDED ? self.hooks.leaveRoom('backend_socket_closed') : null" in onclose
+    # 重连等上一次离房结束
+    assert "Promise.all([delayDone, leftOrGaveUp])" in onclose
 
 
 def test_frame_sink_object_is_built_once_with_three_entry_points():
@@ -581,3 +583,40 @@ def test_stalled_stream_reports_zero_rx_fps_in_fallback():
         """
     )
     assert out == {"stalled": 0, "flowing": 30}
+
+
+def test_reconnect_waits_for_a_slow_vendor_exit():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        let releaseExit;
+        h.trtc.exitRoom = () => { h.log.push(['exitRoom-slow']); return new Promise((r) => { releaseExit = r; }); };
+        const n = h.sockets.length;
+        h.ws.serverClose(1006);
+        await advance(3000);
+        const beforeExit = h.sockets.length - n;
+        releaseExit();
+        await settle();
+        const afterExit = h.sockets.length - n;
+        return { beforeExit, afterExit };
+        """
+    )
+    assert out == {"beforeExit": 0, "afterExit": 1}
+
+
+def test_publish_finishing_after_stop_is_withdrawn():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        let finish;
+        h.trtc.startLocalVideo = (c) => { h.log.push(['startLocalVideo-pending']); return new Promise((r) => { finish = r; }); };
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        h.ws.serverSend({ type: 'media', publish: false });
+        await settle();
+        finish();
+        await settle();
+        return kinds(h.log).filter((k) => k.indexOf('LocalVideo') !== -1);
+        """
+    )
+    assert out == ["startLocalVideo-pending", "stopLocalVideo"]
