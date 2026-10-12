@@ -930,10 +930,11 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     visit_id = spool.visit_id
     current = state["debrief_choice"]
     if current == "preview:diary":
-        # 预览已落盘：只复用，不再生成。前面的 await 里改了名 / 换了账号就不回给这一页
-        if not await _caller_still_current(state, own_char):
-            return 404, {"error": "unknown_or_expired"}
-        return 200, {"ok": True, "applied": "preview", "preview": dict(state["debrief_pending"])}
+        # 预览已落盘：只复用，不再生成。与新生成同一出口：按住角色与账号核调用方、最后重读选择
+        try:
+            return await _answer_preview(spool, state, own_char, state["debrief_pending"])
+        except TimeoutError:
+            return 503, {"retry": True}
     if current not in _CHIP_CHOICES:
         return _already_chosen(state)
     # 条件转移：「清除这个人」的作废步骤不拿这把锁、会把未定的 debrief 直接改成 forget，不能盖掉它

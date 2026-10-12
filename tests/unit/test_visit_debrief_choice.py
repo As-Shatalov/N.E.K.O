@@ -1738,3 +1738,21 @@ async def test_no_preview_is_returned_while_an_account_change_is_in_progress(env
     monkeypatch.setattr(debrief, "_send", send_then_start_switch)
     assert await choose("diary") == (404, {"error": "unknown_or_expired"})
     assert (await state_of(env=env))["debrief_choice"] == "preview:diary"
+
+
+async def test_a_void_while_reusing_the_preview_returns_no_preview(env, monkeypatch):
+    # 复用已落盘预览时，作废落在核调用方的那段 await 里：同样不回正文
+    from main_logic.visit.debrief_writers import write_forget
+
+    await visit(env)
+    await preview(env)
+    real = debrief._caller_still_current
+
+    async def check_then_void(state, own_char):
+        result = await real(state, own_char)
+        await write_forget(VisitSpool(env.tmp, vid(1)))
+        return result
+
+    monkeypatch.setattr(debrief, "_caller_still_current", check_then_void)
+    status, body = await choose("diary")
+    assert status == 409 and body["choice"] == "forget" and "preview" not in body
