@@ -283,7 +283,7 @@ async def test_a_subscription_import_is_visible_before_it_becomes_a_job(tmp_path
             await asyncio.sleep(0.01)
         assert service.admitting_subscriptions() == []
         assert any(job["subscription"] for job in service.list_jobs())
-        await local
+        assert (await local)["ok"] is True
     finally:
         await service.stop()
 
