@@ -550,12 +550,12 @@
       // 只有当前模型是 Live2D 时才挂它的渲染钩子、打活跃标记：切到 VRM / MMD / PNG 后留着的
       // Live2D 管理器不能被拉回满速渲染
       var lm = modelType() === 'live2d' ? win.live2dManager : null;
-      flagLive2d(lm || null);
+      flagLive2d(lm);
       if (!lm) {
         unhookRenderer();
         return;
       }
-      var renderer = lm && lm.pixi_app && lm.pixi_app.renderer;
+      var renderer = lm.pixi_app && lm.pixi_app.renderer;
       if (renderer === state.hookedRenderer) return;
       unhookRenderer();
       if (renderer && typeof renderer.on === 'function') {

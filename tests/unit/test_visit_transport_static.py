@@ -1941,3 +1941,25 @@ def test_hidden_avatar_pauses_the_congestion_ladder():
         """
     )
     assert out["hidden"] == 0 and out["shown"] >= 1 and out["clearedOnShow"] is None
+
+
+def test_consistently_slow_stats_are_still_emitted_in_order():
+    out = run_visit_js(
+        """
+        const h = await joinedController('host');
+        h.c.media.subscribe = true;
+        const releases = [];
+        h.c.adapter.receiverStats = () => new Promise((r) => releases.push(r));
+        h.c.collectStats();          // 第 1 拍
+        h.c.collectStats();          // 第 2 拍在第 1 拍回来之前发起
+        h.c.collectStats();          // 第 3 拍同样
+        releases[0]({ rx_kbps: 100 });
+        await settle();
+        releases[1]({ rx_kbps: 200 });
+        await settle();
+        releases[2]({ rx_kbps: 300 });
+        await settle();
+        return h.ws.sent.filter((m) => m.type === 'stats').map((m) => m.rx_kbps);
+        """
+    )
+    assert out == [100, 200, 300]

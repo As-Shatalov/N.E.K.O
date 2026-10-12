@@ -179,6 +179,7 @@
     this.statsMark = null;
     this.statsGen = 0;
     this.statsSeq = 0;
+    this.statsEmittedSeq = 0;
     this.codecOverride = null;
     this.publishRetries = 0;
     this.publishRetryTimer = null;
@@ -781,7 +782,10 @@
     }
     var finish = function (extra) {
       if (gen !== self.statsGen) return;   // 取样期间离开了在房状态：这拍作废
-      if (seq !== self.statsSeq) return;   // 比这拍更新的取样已经发出：慢回来的旧拍不再发、不喂阶梯
+      // 比这拍更新的取样已经发出：慢回来的旧拍不再发、不喂阶梯（比较的是已发出的最新序号，
+      // 不是已发起的——getStats 一直慢于 5 s 时每拍按顺序照样发出）
+      if (seq <= self.statsEmittedSeq) return;
+      self.statsEmittedSeq = seq;
       if (extra) {
         ['enc_fps', 'tx_kbps', 'tx_w', 'tx_h'].forEach(function (key) {
           if (typeof extra[key] === 'number' && isFinite(extra[key])) out[key] = extra[key];
