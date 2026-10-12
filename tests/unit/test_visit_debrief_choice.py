@@ -1804,3 +1804,57 @@ async def test_bind_replay_rereads_the_state_before_delivering(env, void_on_iden
     void_on_identity_check["on"] = True
     await display_socket._replay_one(socket, "A", vid(1), OWN_A, set(), "zh")
     assert [f for f in socket.sent if f.get("type") == "chat_blocks"] == []
+
+
+# ── 协调会话：写后复查（作废落在写帧之后） ───────────────────────────────
+
+
+async def test_startup_replay_greys_a_preview_voided_after_it_was_written(env):
+    from main_logic.visit.debrief_writers import write_forget
+
+    await visit(env)
+    await preview(env)
+    env.host.blocks.clear()
+    env.host.frames.clear()
+    order = []
+    render, send = env.host.render_chat_blocks, env.host.send_frame
+
+    async def render_then_void(blocks, **kw):
+        shown = await render(blocks, **kw)
+        order.append(("block", kw["request_id"]))
+        await write_forget(VisitSpool(env.tmp, vid(1)))  # 帧已写出，复查之前作废
+        return shown
+
+    async def record_frame(payload):
+        order.append(("frame", payload.get("phase"), payload.get("request_id"), payload.get("choice")))
+        return await send(payload)
+
+    env.host.render_chat_blocks = render_then_void
+    env.host.send_frame = record_frame
+    assert await debrief.show_owed(env.host, vid(1), own_char="A", lang="zh") is True
+    rid = debrief.preview_request_id(vid(1))
+    assert order == [("block", rid), ("frame", "chosen", rid, "forget")]
+
+
+async def test_bind_replay_greys_a_preview_voided_after_it_was_written(env):
+    from main_logic.visit.debrief_writers import write_forget
+
+    await visit(env)
+    await preview(env)
+
+    class Socket:
+        def __init__(self):
+            setattr(self, VISIT_SOCKET_BOUND_ATTR, True)
+            self.sent = []
+
+        async def send_text(self, payload):
+            frame = json.loads(payload)
+            self.sent.append(frame)
+            if frame.get("type") == "chat_blocks":
+                await write_forget(VisitSpool(env.tmp, vid(1)))  # 块已写出，复查之前作废
+
+    socket = Socket()
+    await display_socket._replay_one(socket, "A", vid(1), OWN_A, set(), "zh")
+    rid = debrief.preview_request_id(vid(1))
+    seen = [(f.get("type"), f.get("phase"), f.get("request_id"), f.get("choice")) for f in socket.sent]
+    assert seen == [("chat_blocks", None, rid, None), ("visit_debrief", "chosen", rid, "forget")]

@@ -206,7 +206,28 @@ async def _push_owed(host: Any, visit_id: str, state: Mapping[str, Any], lang: O
         return False
     if shown and frame is not None:
         await host.send_frame(frame)
+    if shown:
+        correction = await settled_after_delivery(state, request_id)
+        if correction is not None:
+            await host.send_frame(correction)
     return shown
+
+
+async def settled_after_delivery(state: Mapping[str, Any], request_id: str) -> Optional[dict]:
+    """The ``chosen`` frame that greys the block just delivered, when the visit settled meanwhile (else None).
+
+    Read after the frame was written: "forget this person" voids without the
+    visit lock, so it can land while the block is in flight. The two
+    interleave as "delivered, then voided"; this frame follows the block, so
+    the page always ends greyed (greying is idempotent).
+    """
+    fresh = await reread_for_delivery(state)
+    if fresh is None or owed_request_id(fresh) == request_id:
+        return None
+    choice = fresh["debrief_choice"]
+    if choice not in _FINAL_CHOICES:
+        return None
+    return _state_frame(state["visit_id"], "chosen", request_id, choice=choice)
 
 
 async def reread_for_delivery(state: Mapping[str, Any]) -> Optional[dict]:

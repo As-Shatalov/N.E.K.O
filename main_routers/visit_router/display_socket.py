@@ -288,6 +288,12 @@ async def _send_owed(websocket: Any, lanlan_name: str, state: dict, delivered: s
     if frame is not None:
         # 状态帧不按 request_id 去重：页上已有的同一块（重连时被前端去重跳过）靠它校正按钮
         await _send(websocket, frame)
+    from main_routers.visit_router.debrief import settled_after_delivery
+
+    # 写后复查：投递期间「清除这个人」已把这场作废时补一帧 chosen，页面最终一定是置灰
+    correction = await settled_after_delivery(state, request_id)
+    if correction is not None:
+        await _send(websocket, correction)
     return True
 
 
