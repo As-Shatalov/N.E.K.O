@@ -80,6 +80,16 @@
     if (!r || !metrics) return null;
     var ox = metrics.originX || 0;
     var oy = metrics.originY || 0;
+    if (metrics.mirrorX && metrics.cssWidth > 0) {
+      // 水平镜像显示：屏幕上的右边缘对应源图的左边缘，打包时再水平翻转回屏幕上的朝向
+      return {
+        x: Math.round((ox + metrics.cssWidth - r.x - r.width) * metrics.pixelRatioX),
+        y: Math.round((r.y - oy) * metrics.pixelRatioY),
+        w: Math.max(1, Math.round(r.width * metrics.pixelRatioX)),
+        h: Math.max(1, Math.round(r.height * metrics.pixelRatioY)),
+        flipX: true,
+      };
+    }
     return {
       x: Math.round((r.x - ox) * metrics.pixelRatioX),
       y: Math.round((r.y - oy) * metrics.pixelRatioY),

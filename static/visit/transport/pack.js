@@ -207,12 +207,26 @@
     // 遮罩也只在交集里填白——越界部分在两半里都保持「黑 / 透明」，不会编成不透明黑边
     var part = clipToSource(src, sx, sy, sw, sh, w, h);
     if (part) {
+      // flipX：源在屏幕上是水平镜像显示的（PNG mirror），两半都按镜像画，对端看到的朝向与本地一致
+      var flip = rectPx.flipX === true;
+      if (flip) {
+        pctx.save();
+        pctx.translate(w, 0);
+        pctx.scale(-1, 1);
+        sctx.save();
+        sctx.translate(w, 0);
+        sctx.scale(-1, 1);
+      }
       pctx.drawImage(src, part.sx, part.sy, part.sw, part.sh, part.dx, part.dy, part.dw, part.dh);
       sctx.fillStyle = '#fff';
       sctx.fillRect(part.dx, part.dy, part.dw, part.dh);
       sctx.globalCompositeOperation = 'destination-in';
       sctx.drawImage(src, part.sx, part.sy, part.sw, part.sh, part.dx, part.dy, part.dw, part.dh);
       sctx.globalCompositeOperation = 'source-over';
+      if (flip) {
+        sctx.restore();
+        pctx.restore();
+      }
     }
     pctx.drawImage(this.scratch, 0, h);
     this.frames += 1;

@@ -173,7 +173,10 @@
         var d = pngtuberDrawable();
         if (!d || typeof d.getBoundingClientRect !== 'function') return null;
         var r = d.getBoundingClientRect();
-        return r && r.width > 0 && r.height > 0 ? { x: r.left, y: r.top, width: r.width, height: r.height } : null;
+        if (!(r && r.width > 0 && r.height > 0)) return null;
+        // 与其它模型一样只用视口内可见部分构框：挂在屏幕边缘 / 完全移出时不把看不见的部分发出去
+        return geo.intersectRect({ x: r.left, y: r.top, width: r.width, height: r.height },
+          { x: 0, y: 0, width: win.innerWidth || 0, height: win.innerHeight || 0 });
       }
       var m = activeManager(type);
       if (!m || typeof m.getModelScreenBounds !== 'function') return null;
@@ -185,6 +188,16 @@
       }
     }
 
+    function horizontallyMirrored(el) {
+      try {
+        var t = typeof win.getComputedStyle === 'function' ? win.getComputedStyle(el).transform : '';
+        var m = /^matrix(?:3d)?\(\s*([-+0-9.eE]+)/.exec(t || '');
+        return !!m && parseFloat(m[1]) < 0;
+      } catch (_) {
+        return false;
+      }
+    }
+
     function sourceMetrics(source, type) {
       if (!source) return null;
       if (type === 'pngtuber') {
@@ -193,7 +206,9 @@
         var pw = source.naturalWidth || source.width;
         var ph = source.naturalHeight || source.height;
         if (!(rect.width > 0 && rect.height > 0 && pw > 0 && ph > 0)) return null;
-        return { originX: rect.left, originY: rect.top, pixelRatioX: pw / rect.width, pixelRatioY: ph / rect.height, srcW: pw, srcH: ph };
+        // mirror 选项用负的水平 CSS 缩放显示；drawImage 读的是未变换的原图，坐标要反过来换算并在打包时翻转
+        return { originX: rect.left, originY: rect.top, pixelRatioX: pw / rect.width, pixelRatioY: ph / rect.height, srcW: pw, srcH: ph,
+          mirrorX: horizontallyMirrored(source), cssWidth: rect.width };
       }
       var r = source.getBoundingClientRect();
       var cssW = r.width || source.clientWidth || source.width || 1;

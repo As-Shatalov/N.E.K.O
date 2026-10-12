@@ -198,3 +198,12 @@ def test_script_has_no_verification_bypass():
     assert "mint_ticket" in source
     for needle in ("skip_verify", "verify=False", "noverify"):
         assert needle not in source
+
+
+@pytest.mark.parametrize("role", ("guest", "host"))
+def test_ttl_above_the_role_lifetime_is_refused(mint_mod, role):
+    limit = idm.ticket_ttl_s(role)
+    claims = mint_mod.build_claims(role=role, visit_id=VISIT_ID, visit_uid=VISIT_UID, iat=NOW, ttl_s=limit)
+    assert claims["exp"] - claims["iat"] == limit
+    with pytest.raises(mint_mod.DevMintError):
+        mint_mod.build_claims(role=role, visit_id=VISIT_ID, visit_uid=VISIT_UID, iat=NOW, ttl_s=limit + 1)

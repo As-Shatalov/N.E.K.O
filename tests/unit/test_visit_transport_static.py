@@ -1217,3 +1217,43 @@ def test_livekit_republish_of_the_same_track_reapplies_the_profile():
         """
     )
     assert out == {"ok": True, "again": [["setParameters", 400000, 15]], "publishes": 1}
+
+
+def test_rejected_profile_update_is_retried_with_the_current_profile():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        let fail = 1;
+        const orig = h.trtc.updateLocalVideo;
+        h.trtc.updateLocalVideo = (c) => { if (fail > 0) { fail -= 1; h.log.push(['updateLocalVideo-fail']); return Promise.reject(new Error('busy')); } return orig(c); };
+        h.c.setGeometry('upper', 1);
+        await settle();
+        const before = kinds(h.log).filter((k) => k.startsWith('updateLocalVideo'));
+        await advance(2100); await settle();
+        const ups = h.log.filter((e) => e[0] === 'updateLocalVideo');
+        return { before, after: kinds(h.log).filter((k) => k.startsWith('updateLocalVideo')), bitrate: ups[ups.length - 1][1].bitrate };
+        """
+    )
+    assert out == {"before": ["updateLocalVideo-fail"], "after": ["updateLocalVideo-fail", "updateLocalVideo"], "bitrate": 400}
+
+
+def test_packer_flips_mirrored_sources():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const pk = new ctx.NekoVisitTransport.pack.Packer({ document: ctx.document, crop: 'upper' });
+        pk.active = true;
+        const src = ctx.document.createElement('canvas');
+        src.width = 1000; src.height = 2000;
+        const scaleCalls = () => pk.pctx.calls.filter((c) => c[0] === 'scale').length + pk.sctx.calls.filter((c) => c[0] === 'scale').length;
+        pk.onFrame(src, { x: 10, y: 10, w: 300, h: 420 });
+        const plain = scaleCalls();
+        pk.onFrame(src, { x: 10, y: 10, w: 300, h: 420, flipX: true });
+        return { plain, mirrored: scaleCalls() - plain,
+                 restored: pk.pctx.calls.filter((c) => c[0] === 'restore').length === pk.pctx.calls.filter((c) => c[0] === 'save').length };
+        """
+    )
+    assert out == {"plain": 0, "mirrored": 2, "restored": True}

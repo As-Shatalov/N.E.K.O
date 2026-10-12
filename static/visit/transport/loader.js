@@ -180,6 +180,8 @@
     this.codecOverride = null;
     this.publishRetries = 0;
     this.publishRetryTimer = null;
+    this.profileRetries = 0;
+    this.profileRetryTimer = null;
     this.rejoinUntil = 0;
     this.rejoinAttempts = 0;
     this.rejoinTimer = null;
@@ -412,7 +414,7 @@
         // 发布挂起期间构图 / 阶梯 / 取帧帧率变了（那时 updateProfile 因未发布而无效）：补一次
         var now = self.profile();
         if (now.width !== sent.width || now.height !== sent.height || now.frameRate !== sent.frameRate || now.bitrate !== sent.bitrate) {
-          self.adapter.updateProfile(now).then(null, function () {});
+          self.pushProfile();
         }
         self.announcePublish(true);
       }
@@ -437,6 +439,34 @@
       self.publishRetryTimer = null;
       if (!self.stopped && self.media.publish && self.adapter && self.packer) self.publishNow();
     }, delay);
+  };
+
+  /**
+   * 把当前期望的 profile（构图 / 阶梯 / 取帧帧率）设到发送端。SDK 拒绝时按退避重试：
+   * 几何已经记下，之后同一级别不会再触发设置，不重试就一直停在旧的码率 / 帧率上限。
+   */
+  P.pushProfile = function () {
+    if (!this.media.publish || !this.adapter || !this.packer || this.stopped) return;
+    var self = this;
+    var adapter = this.adapter;
+    adapter.updateProfile(this.profile()).then(function () {
+      self.profileRetries = 0;
+    }, function (err) {
+      self.log('warn', 'updateProfile failed', String(err && err.code));
+      if (self.adapter !== adapter || self.profileRetryTimer || self.stopped || !self.media.publish) return;
+      var delay = Math.min(PUBLISH_RETRY_MAX_MS, PUBLISH_RETRY_BASE_MS * Math.pow(2, self.profileRetries));
+      self.profileRetries += 1;
+      self.profileRetryTimer = setTimeout(function () {
+        self.profileRetryTimer = null;
+        self.pushProfile();
+      }, delay);
+    });
+  };
+
+  P.cancelProfileRetry = function () {
+    if (this.profileRetryTimer) clearTimeout(this.profileRetryTimer);
+    this.profileRetryTimer = null;
+    this.profileRetries = 0;
   };
 
   P.cancelPublishRetry = function () {
@@ -554,12 +584,7 @@
     saveLadder(this.win, this.visitId, this.media.crop, this.media.ladder);
     if (changed) {
       this.announceGeometry();
-      if (this.media.publish && this.adapter) {
-        var self = this;
-        this.adapter.updateProfile(this.profile()).catch(function (err) {
-          self.log('warn', 'updateProfile failed', String(err && err.code));
-        });
-      }
+      this.pushProfile();
     }
   };
 
@@ -582,6 +607,7 @@
       } else if (msg.publish === false) {
         this.media.publish = false;
         this.cancelPublishRetry();
+        this.cancelProfileRetry();
         this.announcePublish(false);
         this.packer.active = false;
         if (this.adapter) this.adapter.unpublish();
@@ -600,6 +626,7 @@
   P.stopAllMedia = function () {
     this.media.publish = false;
     this.cancelPublishRetry();
+    this.cancelProfileRetry();
     this.loss = null;
     this.peerRxFps = null;
     this.announcePublish(false);
@@ -646,6 +673,7 @@
 
   P.teardown = function () {
     this.cancelPublishRetry();
+    this.cancelProfileRetry();
     this.cancelRejoinRetry(false);
     if (this.statsTimer) clearInterval(this.statsTimer);
     this.statsTimer = null;
@@ -672,12 +700,7 @@
     if (!(fps === 15 || fps === 30) || fps === this.captureFps) return;
     this.captureFps = fps;
     if (this.ladder) this.ladder.targetFps = fps;
-    if (this.media.publish && this.adapter && this.packer) {
-      var self = this;
-      this.adapter.updateProfile(this.profile()).catch(function (err) {
-        self.log('warn', 'updateProfile failed', String(err && err.code));
-      });
-    }
+    this.pushProfile();
   };
 
   P.onParentHidden = function (on) {

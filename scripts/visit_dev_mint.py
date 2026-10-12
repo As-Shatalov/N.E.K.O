@@ -160,6 +160,10 @@ def build_claims(
     ttl = identity.ticket_ttl_s(role) if ttl_s is None else int(ttl_s)
     if ttl <= 0:
         raise DevMintError("ttl must be positive")
+    max_ttl = identity.ticket_ttl_s(role)
+    if ttl > max_ttl:
+        # verify_identity_ticket rejects exp - iat above the role lifetime; never print an unusable ticket
+        raise DevMintError(f"ttl must not exceed the {role} ticket lifetime ({max_ttl} s)")
     claims: dict[str, Any] = {
         "v": visit_settings.VISIT_TICKET_VERSION,
         "iss": visit_settings.VISIT_TICKET_ISS,

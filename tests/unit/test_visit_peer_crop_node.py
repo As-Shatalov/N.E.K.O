@@ -292,3 +292,67 @@ def test_minimized_model_stops_capture_and_reports_hidden():
         files=BRIDGE_FILES,
     )
     assert out == {"visible": True, "minimizedFrames": 0, "hidden": [True]}
+
+
+def test_mirrored_css_rect_maps_from_the_right_edge():
+    out = run_visit_js(
+        """
+        const ctx = makeContext({ pathname: '/' });
+        load(ctx, FILES);
+        const g = ctx.NekoVisitCropGeometry;
+        const m = { originX: 100, originY: 0, pixelRatioX: 2, pixelRatioY: 2, srcW: 800, srcH: 800, cssWidth: 400 };
+        const rect = { x: 120, y: 10, width: 100, height: 50 };
+        return { plain: g.cssRectToPixelRect(rect, m), mirrored: g.cssRectToPixelRect(rect, Object.assign({ mirrorX: true }, m)) };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out["plain"] == {"x": 40, "y": 20, "w": 200, "h": 100}
+    # 屏幕上 120..220（容器 100..500）镜像后对应源图 (500-220)*2 .. (500-120)*2
+    assert out["mirrored"] == {"x": 560, "y": 20, "w": 200, "h": 100, "flipX": True}
+
+
+_PNG_BRIDGE_JS = r"""
+function makePngBridge(opts) {
+  const ctx = makeContext({ pathname: '/' });
+  ctx.targetFrameRate = 60;
+  const img = ctx.document.createElement('img');
+  img.naturalWidth = 1000; img.naturalHeight = 2000;
+  img._rect = Object.assign({ left: 800, top: 100, width: 400, height: 800 }, opts.rect || {});
+  ctx.pngtuberManager = { image: img };
+  ctx.getComputedStyle = (el) => ({ visibility: 'visible', display: 'block', opacity: '1',
+    transform: el === img && opts.mirror ? 'matrix(-1, 0, 0, 1, 0, 0)' : 'none' });
+  ctx.nekoFramePacing = { requestPacedFrame: (cb) => { const id = setTimeoutF(() => cb(clock.now), 16); return () => clearTimerF(id); } };
+  ctx.avatarPortrait = { normalizeModelType: () => 'pngtuber', capture: () => Promise.resolve('img') };
+  load(ctx, FILES);
+  const bridge = ctx.NekoVisitParentBridge.createParentBridge({ window: ctx, document: ctx.document, getToken: () => Promise.resolve('tok'), assetVersion: '9' });
+  const child = { posted: [], onFrames: [] };
+  child.postMessage = (m) => child.posted.push(JSON.parse(JSON.stringify(m)));
+  child.__nekoVisitFrameSink = { onFrame: (src, rect) => { child.onFrames.push(rect); return true; }, suspend() {}, setAuthToken() {} };
+  return { ctx, bridge, child, img };
+}
+"""
+
+
+def test_png_capture_follows_mirror_and_viewport():
+    out = run_visit_js(
+        _BRIDGE_JS + _PNG_BRIDGE_JS + """
+        const runs = {};
+        for (const [name, opts] of [['mirrored', { mirror: true }], ['offscreen', { rect: { left: 2500 } }], ['edge', { rect: { left: 1700 } }]]) {
+          const h = makePngBridge(opts);
+          await open(h, 'guest');
+          change(h, 'started');
+          await advance(1600);
+          const last = h.child.onFrames[h.child.onFrames.length - 1] || null;
+          runs[name] = { frames: h.child.onFrames.length, last, hidden: h.child.posted.filter((m) => m.t === 'hidden').map((m) => m.on) };
+          change(h, 'ended');
+        }
+        return runs;
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out["mirrored"]["frames"] > 0 and out["mirrored"]["last"]["flipX"] is True
+    assert out["offscreen"]["frames"] == 0 and out["offscreen"]["hidden"] == [True]
+    # 一半挂在屏幕外（视口宽 1920）：取景框以可见的 1700..1920 为准，中心在 1810 附近（不裁剪会在 1900）
+    edge = out["edge"]["last"]
+    center_css = 1700 + (edge["x"] + edge["w"] / 2) / 2.5
+    assert out["edge"]["frames"] > 0 and abs(center_css - 1810) < 15
