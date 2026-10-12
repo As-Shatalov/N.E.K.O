@@ -980,3 +980,31 @@ async def test_a_terminal_facts_record_with_malformed_counters_recovers_from_the
     body = await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
     assert body["duplicate"] is True and body["written"] == 2
     assert len([r for r in _pool(env) if r.get("visit_id") == VISIT]) == 2
+
+
+# ── Codex 第 29 轮 ───────────────────────────────────────────────────────
+
+
+async def test_a_terminal_facts_record_missing_its_counters_recovers_and_is_repaired(env):
+    from app.memory_server import idempotency
+
+    await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
+    data = json.loads(Path(idempotency.keys_path(NAME)).read_text(encoding="utf-8"))
+    del data[f"visit-facts:{VISIT}"]["written"]
+    Path(idempotency.keys_path(NAME)).write_text(json.dumps(data), encoding="utf-8")
+    body = await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
+    assert body["duplicate"] is True and body["written"] == 2
+    # 恢复之后记录被补全：下一次直接走终态快路径
+    assert (await _key_record(f"visit-facts:{VISIT}"))["written"] == 2
+
+
+async def test_a_terminal_cache_record_without_its_hash_is_repaired_after_recovery(env):
+    # 修好之后，同一个键换了内容再来要回 422，而不是被当成 duplicate
+    from app.memory_server import idempotency, routes
+
+    await idempotency.update_key(NAME, KEY, idempotency.transition(idempotency.KEY_STATE_DONE, kind="cache"))
+    await _cache(env, _diary_request())
+    record = await _key_record()
+    assert record["content_hash"] == routes._canonical_history_hash(_diary_request().input_history)
+    status, _body = await _cache(env, _diary_request("改过的日记"))
+    assert status == 422

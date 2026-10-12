@@ -1354,14 +1354,47 @@ async def _cache_keyed(lanlan_name: str, raw_history: str, input_history: list, 
         # 两处存储已确认（本次写成或早已写过）：标 done 只为之后少做一次核对，记不上（云存档维护期、
         # 键文件一时写不了）也不影响如实回结果——存储里的证据就是「写过」，重试会判为 duplicate
         try:
-            await idempotency.update_key(lanlan_name, key, idempotency.transition(
-                idempotency.KEY_STATE_DONE, content_hash=content_hash, kind="cache"))
+            await idempotency.update_key(lanlan_name, key, _done_repairing(content_hash=content_hash, kind="cache"))
         except Exception as exc:  # noqa: BLE001
             logger.info(f"[MemoryServer] keyed cache {lanlan_name}: done not recorded: {exc!r}")
     if outcome != "written":
         return {"status": "cached", "duplicate": True, "count": 0}
     logger.info(f"[MemoryServer] cache: {lanlan_name} keyed +{len(input_history)} 条消息")
     return {"status": "cached", "count": len(input_history)}
+
+
+def _done_repairing(**fields: object):
+    """``update_key`` callback: move the record to ``done``, also repairing a malformed terminal one.
+
+    A terminal record that lacks a usable identity (``content_hash``) or
+    the counters this endpoint writes (``written`` / ``deduped``) was just
+    reconciled against the stores; it gets those fields back so the next
+    request compares against them. A well-formed terminal record and a
+    cancelled one are left untouched.
+    """
+    from . import idempotency
+
+    move = idempotency.transition(idempotency.KEY_STATE_DONE, **fields)
+
+    def _fn(old: dict | None) -> dict | None:
+        if old is None or old.get("state") not in idempotency.TERMINAL_KEY_STATES:
+            return move(old)
+        if old.get("state") != idempotency.KEY_STATE_DONE:
+            return None
+        stored = old.get("content_hash")
+        hash_ok = isinstance(stored, str) and bool(stored)
+        counters_ok = all(
+            isinstance(old.get(name), int) and not isinstance(old.get(name), bool) and old.get(name) >= 0
+            for name in ("written", "deduped") if name in fields
+        )
+        if hash_ok and counters_ok:
+            return None
+        record = dict(old)
+        record.update({name: value for name, value in fields.items() if value is not None})
+        record["updated_at"] = time.time()
+        return record
+
+    return _fn
 
 
 class VisitFactItem(BaseModel):
@@ -1418,8 +1451,7 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
             # 同一场只有一份事实（客户端重试用落盘的同一份）：内容变了是调用方的错，不能报成已写
             raise HTTPException(status_code=422, detail="visit_id reused with different facts")
         def _counter(value: object) -> int | None:
-            if value is None:
-                return 0
+            # 缺字段同样算畸形：我们写下的终态记录总带这两个计数，缺了就不凭它回「已写过」
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 return None
             return value
@@ -1478,8 +1510,7 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
             deduped = max(len(texts) - written, 0)
             await idempotency.update_key(
                 lanlan_name, key,
-                idempotency.transition(idempotency.KEY_STATE_DONE, written=written, deduped=deduped,
-                                       kind="visit_facts"),
+                _done_repairing(written=written, deduped=deduped, kind="visit_facts", content_hash=facts_hash),
             )
         except Exception as exc:  # noqa: BLE001 - 没确认：键留 pending，503 让调用方用同一 visit_id 重试
             logger.warning(f"[MemoryServer] visit_facts {lanlan_name}: not confirmed: {exc!r}")
