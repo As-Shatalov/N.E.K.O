@@ -1326,8 +1326,10 @@ async def _cache_keyed(lanlan_name: str, raw_history: str, input_history: list, 
             # 已 done 也一样，不能把没存进去的新内容报成已缓存
             return JSONResponse({"status": "error", "message": "idempotency_key reused with different content"},
                                 status_code=422)
-        if record is not None and record.get("state") in idempotency.TERMINAL_KEY_STATES:
+        if (record is not None and record.get("state") in idempotency.TERMINAL_KEY_STATES
+                and isinstance(stored_hash, str) and stored_hash):
             return {"status": "cached", "duplicate": True, "count": 0}
+        # 记录缺内容哈希（畸形）：不凭它回「已写过」，与没有记录一样按两处存储的证据判定
         try:
             async with runtime._get_settle_lock(lanlan_name):
                 # 先看存储里的证据：recent 里已有本键条目、或它已被移出（退役旁路），就是写过——

@@ -922,3 +922,19 @@ def test_a_huge_integer_stamp_does_not_block_recent_writes(tmp_path):
     recent_file.write_recent_payload(path, [])
     assert json.loads(Path(path).read_text(encoding="utf-8")) == []
     assert KEY in recent_file.read_retired_keys(path)
+
+
+# ── Codex 第 22 轮 ───────────────────────────────────────────────────────
+
+
+async def test_a_terminal_cache_record_without_its_hash_is_not_trusted(env):
+    # 键记录是合法 JSON，却缺 content_hash：不凭它回「已写过」，按两处存储的证据判定（这里都没有 → 照写）
+    from app.memory_server import idempotency
+
+    await idempotency.update_key(NAME, KEY, idempotency.transition(idempotency.KEY_STATE_DONE, kind="cache"))
+    status, body = await _cache(env, _diary_request())
+    assert (status, body) == (200, {"status": "cached", "count": 1})
+    assert len(_keyed(env)) == 1 and env.tsdb.stores == 1
+    # 再试一次：存储里已有本键条目，如实回 duplicate、不再写
+    status, body = await _cache(env, _diary_request())
+    assert body["duplicate"] is True and env.tsdb.stores == 1 and len(_keyed(env)) == 1

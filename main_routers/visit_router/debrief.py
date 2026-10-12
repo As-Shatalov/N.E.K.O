@@ -978,6 +978,15 @@ async def _choose_diary(spool: Any, state: Mapping[str, Any], own_char: str) -> 
     lang = _lang()
     await _render(state, preview_blocks(visit_id, pending, lang), preview_request_id(visit_id))
     await _send(state, _state_frame(visit_id, "preview", preview_request_id(visit_id)))
+    try:
+        now = await spool.read_state()
+    except Exception:  # noqa: BLE001 - 读不出：按刚写下的预览回，bind 重放会以 state.json 为准
+        now = None
+    if now is not None and now["debrief_choice"] != "preview:diary":
+        # 推送期间「清除这个人」（不拿这把锁）已把这场作废：把刚推上去的预览块置灰，不再回预览正文
+        await _send(now, _state_frame(visit_id, "chosen", preview_request_id(visit_id),
+                                      choice=now["debrief_choice"]))
+        return _already_chosen(now)
     if not await _caller_still_current(state, own_char):
         # 生成期间改了名（旧名字可能已归另一只猫）：预览已按 uid 推给它现在的页面，不再回给发起请求的旧页面
         return 404, {"error": "unknown_or_expired"}

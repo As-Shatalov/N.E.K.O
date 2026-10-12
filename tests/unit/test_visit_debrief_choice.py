@@ -1631,3 +1631,28 @@ async def test_an_account_change_with_a_short_timeout_still_outwaits_a_push(env,
     # 切号放行（改凭证）时，推送已经结束
     assert order == [("switched", True)]
     assert switched.is_set() and not runtime._account_bound_pushes
+
+
+# ── Codex 第 22 轮 ───────────────────────────────────────────────────────
+
+
+async def test_a_void_during_the_preview_push_greys_the_block_and_returns_no_preview(env, monkeypatch):
+    # 推预览的那段 await 里「清除这个人」（不拿 per-visit 锁）把这场作废成 forget
+    from main_logic.visit.debrief_writers import write_forget
+
+    await visit(env)
+    render = env.host.render_chat_blocks
+
+    async def render_then_void(blocks, **kw):
+        shown = await render(blocks, **kw)
+        if kw.get("request_id") == debrief.preview_request_id(vid(1)):
+            await write_forget(VisitSpool(env.tmp, vid(1)))
+        return shown
+
+    env.host.render_chat_blocks = render_then_void
+    status, body = await choose("diary")
+    assert status == 409 and body == {"error": "already_chosen", "choice": "forget", "completed": True}
+    chosen = [f for f in env.host.frames if f.get("phase") == "chosen"]
+    assert chosen and chosen[-1]["request_id"] == debrief.preview_request_id(vid(1))
+    assert chosen[-1]["choice"] == "forget"
+    assert (await state_of(env=env))["debrief_pending"] is None
