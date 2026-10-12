@@ -54,6 +54,7 @@
     var roomGen = 0;
     var opChain = Promise.resolve();
     var publishesInFlight = 0;
+    var profilesInFlight = 0;   // 排队 / 进行中的 setParameters：撤销排在它后面，不和它交错
     function serial(fn) {
       var p = opChain.then(fn);
       opChain = p.then(null, function () {});
@@ -333,10 +334,12 @@
        */
       updateProfile: function (profile) {
         var gen = roomGen;
+        profilesInFlight += 1;
+        var done = function (v) { profilesInFlight -= 1; return v; };
         return serial(function () {
           if (gen !== roomGen) return false;
           return applyProfile(profile);
-        });
+        }).then(done, function (err) { done(); throw err; });
       },
       unpublish: function () {
         var stop = function () {
@@ -347,7 +350,7 @@
           // stopOnUnpublish=false：画布轨留着复用
           return room.localParticipant.unpublishTrack(track, false).catch(function () {});
         };
-        if (publishesInFlight > 0) return serial(stop);
+        if (publishesInFlight > 0 || profilesInFlight > 0) return serial(stop);
         return afterChain(Promise.resolve(stop()));
       },
       idle: function () {

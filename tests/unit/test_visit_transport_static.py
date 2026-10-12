@@ -1728,3 +1728,39 @@ def test_livekit_reset_stats_drops_rx_and_tx_baselines():
         """
     )
     assert out == {"afterReset": None, "next": 560}
+
+
+def test_trtc_unpublish_waits_for_a_pending_profile_update():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        let finish;
+        h.trtc.updateLocalVideo = () => { h.log.push(['updateLocalVideo-pending']); return new Promise((r) => { finish = r; }); };
+        h.c.adapter.updateProfile({ width: 256, height: 704, frameRate: 30, bitrate: 400 });
+        await settle();
+        h.c.adapter.unpublish();
+        await settle();
+        const before = kinds(h.log).filter((k) => k === 'stopLocalVideo').length;
+        h.log.push(['update-finished']);
+        finish();
+        await settle();
+        const tail = kinds(h.log).filter((k) => k === 'update-finished' || k === 'stopLocalVideo');
+        return { before, tail };
+        """
+    )
+    assert out == {"before": 0, "tail": ["update-finished", "stopLocalVideo"]}
+
+
+def test_unpublish_without_pending_operations_still_stops_synchronously():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        h.c.adapter.unpublish();
+        return kinds(h.log).filter((k) => k === 'stopLocalVideo').length;
+        """
+    )
+    assert out == 1

@@ -29,6 +29,7 @@
     var roomGen = 0;
     var opChain = Promise.resolve();
     var publishesInFlight = 0;
+    var profilesInFlight = 0;   // 排队 / 进行中的 updateLocalVideo：它默认 publish:true，撤销要排在它后面
     function serial(fn) {
       var p = opChain.then(fn);
       opChain = p.then(null, function () {});
@@ -242,10 +243,12 @@
       /** 与发布 / 撤销共用一条队列：离房的完成等它，先后两次修改不会倒序生效。 */
       updateProfile: function (profile) {
         var gen = roomGen;
+        profilesInFlight += 1;
+        var done = function (v) { profilesInFlight -= 1; return v; };
         return serial(function () {
           if (!trtc || !publishing || gen !== roomGen) return false;
           return trtc.updateLocalVideo({ option: { profile: profile } }).then(function () { return true; });
-        });
+        }).then(done, function (err) { done(); throw err; });
       },
       unpublish: function () {
         var stop = function () {
@@ -254,7 +257,7 @@
           publishedTrack = null;
           return trtc.stopLocalVideo().catch(function () {});
         };
-        if (publishesInFlight > 0) return serial(stop);
+        if (publishesInFlight > 0 || profilesInFlight > 0) return serial(stop);
         return afterChain(Promise.resolve(stop()));
       },
       /** 队列里的发布 / 撤销都执行完（销毁前等它，免得排队的停止落在已销毁的实例上）。 */
