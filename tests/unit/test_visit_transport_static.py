@@ -333,8 +333,9 @@ def test_refresh_credentials_are_accepted_without_rejoining_and_used_by_a_manual
     assert out["entersAfterRefresh"] == 1
     assert out["enterCount"] == 2
     assert out["lastSig"] == "sig3"
-    assert out["states"][-2:] == ["joining", "joined"] or out["states"][-1] == "joined"
-    assert "reconnecting" in out["states"]
+    # 手动重新入房的完整顺序：先报重连中，再 joining，最后 joined
+    tail = out["states"][out["states"].index("reconnecting"):]
+    assert tail == ["reconnecting", "joining", "joined"]
 
 
 def test_peer_presence_reports_only_explicit_leaves():
@@ -440,3 +441,143 @@ def test_unknown_or_foreign_template_free_files():
         "transport.js", "pack.js", "unpack.js", "trtc-transport.js", "livekit-transport.js",
         "frame-sink.js", "backend-ws.js", "loader.js",
     ]
+
+
+_FAKE_LIVEKIT = """
+function makeFakeLK(log) {
+  const RoomEvent = {};
+  ['ParticipantConnected', 'ParticipantDisconnected', 'TrackPublished', 'TrackUnpublished', 'TrackSubscribed',
+   'TrackUnsubscribed', 'DataReceived', 'Reconnecting', 'Reconnected', 'Disconnected', 'ConnectionQualityChanged']
+    .forEach((n) => { RoomEvent[n] = n; });
+  const sender = {
+    params: { encodings: [{ maxBitrate: 560000, maxFramerate: 30 }] },
+    getParameters() { return JSON.parse(JSON.stringify(this.params)); },
+    setParameters(p) { this.params = p; log.push(['setParameters', p.encodings[0].maxBitrate, p.encodings[0].maxFramerate]); return Promise.resolve(); },
+  };
+  class Room {
+    constructor(opts) { this.opts = opts; this.handlers = {}; this.remoteParticipants = new Map();
+      this.localParticipant = {
+        publishTrack: (t, o) => { log.push(['publishTrack', o.videoCodec]); return Promise.resolve({ track: { sender } }); },
+        unpublishTrack: () => Promise.resolve(), publishData: () => Promise.resolve() };
+      Room.last = this; }
+    on(e, f) { this.handlers[e] = f; }
+    emit(e, ...a) { this.handlers[e] && this.handlers[e](...a); }
+    connect(url, token, o) { log.push(['connect', url, o.autoSubscribe]); return Promise.resolve(); }
+    disconnect() { return Promise.resolve(); }
+    removeAllListeners() {}
+  }
+  return { Room, RoomEvent, Track: { Source: { Camera: 'camera' } }, DisconnectReason: { 1: 'CLIENT_INITIATED' }, sender, isBrowserSupported: () => true };
+}
+"""
+
+
+def test_failed_trtc_publish_is_retried_by_the_next_snapshot():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        let fail = true;
+        const orig = h.trtc.startLocalVideo;
+        h.trtc.startLocalVideo = (c) => { if (fail) { fail = false; h.log.push(['startLocalVideo-fail']); return Promise.reject(new Error('transient')); } return orig(c); };
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        return kinds(h.log).filter((k) => k.startsWith('startLocalVideo') || k === 'updateLocalVideo');
+        """
+    )
+    assert out == ["startLocalVideo-fail", "startLocalVideo"]
+
+
+def test_livekit_ladder_codec_stats_and_loopback():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const log = [];
+        const LK = makeFakeLK(log);
+        const events = [];
+        const handlers = { onPiece() {}, onPeer() {}, onState(s) { events.push(s); }, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const creds = { vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp8', bitrate_kbps: 560, fps: 30 } };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join(creds);
+        await a.publish({ id: 'pack' });
+        const ok = await a.updateProfile({ width: 208, height: 896, frameRate: 15, bitrate: 400 });
+        // 接收统计
+        let bytes = 0, recv = 0, lost = 0;
+        const receiver = { getStats: () => Promise.resolve(new Map([
+          ['in', { type: 'inbound-rtp', kind: 'video', bytesReceived: bytes, packetsReceived: recv, packetsLost: lost }],
+          ['cp', { type: 'candidate-pair', nominated: true, currentRoundTripTime: 0.12 }]]) ) };
+        await a.setSubscribe(true);
+        LK.Room.last.emit('TrackSubscribed', { kind: 'video', mediaStreamTrack: {}, receiver }, {}, { identity: 'g_peer' });
+        const first = await a.receiverStats(0);
+        bytes = 350000; recv = 950; lost = 50;
+        const second = await a.receiverStats(5000);
+        // 编码能力门
+        const caps = (enc, dec) => { ctx.RTCRtpSender = { getCapabilities: () => ({ codecs: enc.map((n) => ({ mimeType: 'video/' + n })) }) };
+          ctx.RTCRtpReceiver = { getCapabilities: () => ({ codecs: dec.map((n) => ({ mimeType: 'video/' + n })) }) }; };
+        caps(['VP8'], ['VP8']);
+        const vp8Only = await LKV.capabilities(LK, { publish: { codec: 'vp9' } }, 'guest');
+        const hostVp8Only = await LKV.capabilities(LK, { publish: { codec: 'vp9' } }, 'host');
+        caps([], ['VP8', 'VP9']);
+        const noEnc = await LKV.capabilities(LK, { publish: { codec: 'vp9' } }, 'guest');
+        const hostBoth = await LKV.capabilities(LK, {}, 'host');
+        return {
+          ok, log, first, second, vp8Only, hostVp8Only: hostVp8Only.decode, noEnc: [noEnc.encode, noEnc.codec], hostBoth: hostBoth.decode,
+          hosts: [
+            LKV.hostAllowed('ws://127.0.0.1:7880', ['127.0.0.1']),
+            LKV.hostAllowed('ws://[::1]:7880', ['::1']),
+            LKV.hostAllowed('ws://localhost:7880', ['localhost']),
+            LKV.hostAllowed('ws://lk.example.com', ['lk.example.com']),
+            LKV.hostAllowed('wss://lk.example.com/x', ['lk.example.com']),
+            LKV.hostAllowed('wss://evil.example.com', ['lk.example.com']),
+          ],
+        };
+        """
+    )
+    assert out["ok"] is True
+    assert ["setParameters", 400000, 15] in out["log"]
+    assert ["connect", "wss://lk.example.com", False] in out["log"]
+    assert out["first"] == {"rtt_ms": 120}
+    assert out["second"]["rx_kbps"] == 560 and abs(out["second"]["loss_pct"] - 5) < 1e-9 and out["second"]["rtt_ms"] == 120
+    assert out["vp8Only"]["encode"] is True and out["vp8Only"]["codec"] == "vp8"
+    assert out["hostVp8Only"] is False
+    assert out["noEnc"] == [False, None]
+    assert out["hostBoth"] is True
+    assert out["hosts"] == [True, True, True, False, True, False]
+
+
+def test_codec_fallback_is_kept_across_credential_refresh():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.c.codecOverride = 'vp8';
+        h.c.applyCodecOverride(h.c.creds);
+        h.ws.serverSend(credsFor('guest', { refresh: true, publish: { codec: 'vp9', bitrate_kbps: 560, fps: 30 } }));
+        await settle();
+        return h.c.creds.publish.codec;
+        """
+    )
+    assert out == "vp8"
+
+
+def test_stalled_stream_reports_zero_rx_fps_in_fallback():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const doc = ctx.document;
+        const video = doc.createElement('video');
+        let decoded = 300;
+        video.getVideoPlaybackQuality = () => ({ totalVideoFrames: decoded, droppedVideoFrames: 0 });
+        const u = new ctx.NekoVisitTransport.unpack.Unpacker({ video, canvas: doc.createElement('canvas') });
+        u.draws = 0;
+        u.stats(0);
+        u.draws = 150;             // 回落定时器 5 s 里重画了 150 次，但没有新帧
+        const stalled = u.stats(5000).rx_fps;
+        decoded = 450;
+        const flowing = u.stats(10000).rx_fps;
+        return { stalled, flowing };
+        """
+    )
+    assert out == {"stalled": 0, "flowing": 30}

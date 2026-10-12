@@ -367,16 +367,47 @@
       else stopCapture();
     }
 
+    /**
+     * 只在 0 < 用户目标帧率 < 取帧帧率时临时拉到取帧帧率，结束时恢复。走既有的
+     * neko-frame-rate-changed 事件：Live2D / VRM / MMD 三种渲染器都按它重新应用帧率
+     * （只调 live2dManager.setTargetFPS 时，VRM / MMD 停在空闲定时器里不换周期）。
+     * 期间 window.nekoTargetFrameRateHold 记着用户自己的值，设置保存读它，
+     * 临时值不会被写进本地设置。
+     */
+    function applyFrameRate(fps) {
+      win.targetFrameRate = fps;
+      dispatch('neko-frame-rate-changed', { fps: fps, source: 'visit' });
+    }
+
+    function holdFrameRate() {
+      var target = win.targetFrameRate;
+      if (state.savedFps !== null || typeof target !== 'number' || !(target > 0) || target >= state.captureFps) return;
+      state.savedFps = target;
+      win.nekoTargetFrameRateHold = { userFps: target, heldFps: state.captureFps };
+      applyFrameRate(state.captureFps);
+    }
+
+    function releaseFrameRate() {
+      if (state.savedFps === null) return;
+      var saved = state.savedFps;
+      state.savedFps = null;
+      win.nekoTargetFrameRateHold = null;
+      applyFrameRate(saved);
+    }
+
+    /** 串门期间用户自己改了帧率：以新值为准（恢复时不再回到旧值），低于取帧帧率就重新拉高。 */
+    function onFrameRateChanged(event) {
+      var detail = event && event.detail;
+      if ((detail && detail.source === 'visit') || state.savedFps === null) return;
+      state.savedFps = null;
+      win.nekoTargetFrameRateHold = null;
+      if (captureWanted()) holdFrameRate();
+    }
+
     function startCapture() {
       var lm = win.live2dManager;
       if (lm) lm._visitCaptureActive = true;
-      // 只在 0 < 目标帧率 < 取帧帧率时临时拉到取帧帧率；结束时恢复
-      var target = win.targetFrameRate;
-      if (state.savedFps === null && typeof target === 'number' && target > 0 && target < state.captureFps &&
-          lm && typeof lm.setTargetFPS === 'function') {
-        state.savedFps = target;
-        lm.setTargetFPS(state.captureFps);
-      }
+      holdFrameRate();
       wrapPortrait();
       if (state.lastOkAt === null) {
         state.lastOkAt = now();
@@ -394,11 +425,7 @@
     function stopCapture() {
       var lm = win.live2dManager;
       if (lm) lm._visitCaptureActive = false;
-      if (state.savedFps !== null) {
-        var saved = state.savedFps;
-        state.savedFps = null;
-        if (lm && typeof lm.setTargetFPS === 'function') lm.setTargetFPS(saved);
-      }
+      releaseFrameRate();
       unhookRenderer();
       if (state.pngCancel) state.pngCancel();
       state.pngCancel = null;
@@ -767,6 +794,7 @@
     };
 
     win.addEventListener('message', onFrameMessage);
+    win.addEventListener('neko-frame-rate-changed', onFrameRateChanged);
     return bridge;
   }
 

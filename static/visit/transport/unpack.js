@@ -216,14 +216,33 @@
     }
   };
 
-  /** 5 s 统计：rx_fps 由 presentedFrames 差分（无 rVFC 时按绘制次数）。 */
-  Unpacker.prototype.stats = function (nowMs) {
-    var counter = this.presented || this.draws;
-    var out = { rx_w: this.video ? this.video.videoWidth || 0 : 0, rx_h: this.video ? this.video.videoHeight || 0 : 0 };
-    if (this.statsMark && nowMs > this.statsMark.at) {
-      out.rx_fps = Math.max(0, (counter - this.statsMark.count) * 1000 / (nowMs - this.statsMark.at));
+  /**
+   * 5 s 统计：rx_fps 用解码帧计数差分——rVFC 在跑时用 presentedFrames，否则用
+   * getVideoPlaybackQuality() 的已解码帧数。不能用回落定时器的重绘次数：流卡住后它照样
+   * 每 33 ms 重画同一帧，会把停住的流报成约 30 fps，拥塞阶梯就看不到卡顿。
+   */
+  Unpacker.prototype.frameCounter = function () {
+    var video = this.video;
+    if (this.lastRvfcAt && Date.now() - this.lastRvfcAt <= RVFC_WATCHDOG_MS && this.presented) {
+      return { kind: 'presented', count: this.presented };
     }
-    this.statsMark = { at: nowMs, count: counter };
+    if (video && typeof video.getVideoPlaybackQuality === 'function') {
+      var q = video.getVideoPlaybackQuality();
+      if (q && typeof q.totalVideoFrames === 'number') {
+        return { kind: 'decoded', count: q.totalVideoFrames - (q.droppedVideoFrames || 0) };
+      }
+    }
+    return null;
+  };
+
+  Unpacker.prototype.stats = function (nowMs) {
+    var out = { rx_w: this.video ? this.video.videoWidth || 0 : 0, rx_h: this.video ? this.video.videoHeight || 0 : 0 };
+    var c = this.frameCounter();
+    var prev = this.statsMark;
+    if (c && prev && prev.kind === c.kind && nowMs > prev.at) {
+      out.rx_fps = Math.max(0, (c.count - prev.count) * 1000 / (nowMs - prev.at));
+    }
+    this.statsMark = c ? { at: nowMs, kind: c.kind, count: c.count } : null;
     return out;
   };
 

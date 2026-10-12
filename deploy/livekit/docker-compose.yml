@@ -15,9 +15,10 @@ services:
     build:
       context: .
       dockerfile_inline: |
-        FROM caddy:2-builder AS builder
-        RUN xcaddy build --with github.com/mholt/caddy-l4
-        FROM caddy:2
+        # 版本钉死（可复现构建）：Caddy 2.11.7 + caddy-l4 主干提交 42db569（2026-07-15）；升级时两处与 README 同步改，并先 caddy validate
+        FROM caddy:2.11.7-builder AS builder
+        RUN xcaddy build --with github.com/mholt/caddy-l4@42db5690dea199f930a6f08005fe2e4aab10dcc9
+        FROM caddy:2.11.7
         COPY --from=builder /usr/bin/caddy /usr/bin/caddy
     image: neko-visit/caddy-l4:local
     network_mode: host

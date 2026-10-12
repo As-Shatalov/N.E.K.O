@@ -33,8 +33,12 @@ def test_postrender_guards_and_fps_save_restore():
     assert "renderer.on('postrender', onPostrender)" in code
     assert "renderer.lastObjectRendered !== app.stage" in code
     assert "renderer.renderTexture && renderer.renderTexture.current" in code
-    assert "state.savedFps = target;" in code and "lm.setTargetFPS(saved)" in code
+    assert "state.savedFps = target;" in code and "applyFrameRate(saved)" in code
+    assert "dispatch('neko-frame-rate-changed', { fps: fps, source: 'visit' })" in code
     assert "win.targetFrameRate" in code
+    settings = _read("static/app/app-settings.js")
+    assert "window.targetFrameRate === targetFrameRateHold.heldFps" in settings
+    assert "? targetFrameRateHold.userFps" in settings
     assert "requestPacedFrame(" in code
 
 

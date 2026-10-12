@@ -165,9 +165,15 @@
         if (publishing && publishedTrack === track) return Promise.resolve(true);
         var config = { publish: true, option: { videoTrack: track, profile: profile } };
         var p = publishing ? trtc.updateLocalVideo(config) : trtc.startLocalVideo(config);
-        publishing = true;
-        publishedTrack = track;
-        return p.then(function () { return true; });
+        // 发布成功才记状态：失败（暂时性）时下一次 media{publish:true} 还要真的再发一次
+        return p.then(function () {
+          publishing = true;
+          publishedTrack = track;
+          return true;
+        }, function (err) {
+          if (publishedTrack !== track) publishedTrack = null;
+          throw err;
+        });
       },
       updateProfile: function (profile) {
         if (!trtc || !publishing) return Promise.resolve(false);

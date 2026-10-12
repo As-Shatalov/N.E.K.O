@@ -1647,11 +1647,11 @@ iframe 是**无状态转发器**：后端经 4.3 的 `send{cmd, payload}` 给它
 | `aud` | `'neko-visit'` | 受众 | 相等 |
 | `kid` | str(≤16) | 公钥 id | 查 `VISIT_SERVERS_PUBKEYS`，miss → `GET /api/visit/pubkeys` 一次 → 仍 miss fail closed |
 | `sub` | str(24 hex) | `visit_uid` = `HMAC-SHA256(server_secret, community_uuid)` 十六进制前 24 字符（稳定、不透明、Servers 可反查；**不是**裸 uuid，C.1） | `∉ visit_blocklist.json`；记忆 / 名册 / 举报主键 |
-| `vid` | str(26) | vendor userId / identity = `role[0] + '_' + sha256(visit_uid + '|' + visit_id).hexdigest()[:24]`（C.3；落 TRTC userId 字符集） | **== vendor 盖的 `from_vid`** |
+| `vid` | str(26) | vendor userId / identity = `role[0] + '_' + sha256(visit_uid + '\|' + visit_id).hexdigest()[:24]`（C.3；落 TRTC userId 字符集） | **== vendor 盖的 `from_vid`** |
 | `visit_id` | str(22) | 房间 | == 本房 |
-| `role` | `'host'|'guest'` | 侧位 | == 对侧 |
-| `transport` | `'trtc'|'livekit'` | 一房一 transport | == 本侧 credentials.transport |
-| `char_tag` | str(32hex) | 对端自报角色标签（只在 `sub` 命名空间下有意义） | 派生 `peer_char_id = 'c_' + sha256(peer_uid + '|' + char_tag)[:24]` |
+| `role` | `'host'\|'guest'` | 侧位 | == 对侧 |
+| `transport` | `'trtc'\|'livekit'` | 一房一 transport | == 本侧 credentials.transport |
+| `char_tag` | str(32hex) | 对端自报角色标签（只在 `sub` 命名空间下有意义） | 派生 `peer_char_id = 'c_' + sha256(peer_uid + '\|' + char_tag)[:24]` |
 | `display_name` | str(≤64)? | 猫娘显示名 | 经 OD-23 清洗后才进 UI / 名册 |
 | `iat` | int | 签发时刻 | `iat - 300 ≤ now` |
 | `exp` | int | `= iat + 2400`（guest 40 min）或 `iat + 3000`（host 50 min，`VISIT_HOST_CREDENTIAL_TTL_S`） | `now ≤ exp + 300`（`VISIT_TICKET_CLOCK_TOLERANCE_S=300`） |

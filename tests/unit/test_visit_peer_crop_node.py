@@ -19,11 +19,12 @@ function makeBridge(opts) {
     on(e, f) { handlers[e] = f; }, off(e) { delete handlers[e]; },
   };
   const fpsCalls = [];
+  // 三种渲染器都监听这个事件（live2d-core / vrm-manager / mmd-core）；这里只记下派发的帧率
+  ctx.addEventListener('neko-frame-rate-changed', (e) => fpsCalls.push(e.detail.fps));
   ctx.live2dManager = {
     pixi_app: { renderer, stage },
     getModelScreenBounds: () => ({ left: 800, top: 100, right: 1200, bottom: 1000, width: 400, height: 900 }),
     getHeadDetectionGeometryInfo: () => ({ headRect: { left: 950, top: 150, width: 100, height: 120 } }),
-    setTargetFPS(f) { fpsCalls.push(f); ctx.targetFrameRate = f; },
   };
   ctx.avatarPortrait = { normalizeModelType: () => 'live2d', capture: () => Promise.resolve('img') };
   load(ctx, FILES);
@@ -114,9 +115,11 @@ def test_guest_capture_guards_rate_and_starvation():
         const hiddenAll = h.child.posted.filter((m) => m.t === 'hidden').map((m) => m.on);
         const away = h.ctx.document.getElementById('visit-away-badge');
         const fpsDuring = h.fpsCalls.slice();
+        const holdDuring = h.ctx.nekoTargetFrameRateHold && Object.assign({}, h.ctx.nekoTargetFrameRateHold);
+        const fpsValueDuring = h.ctx.targetFrameRate;
         const crop = h.child.posted.filter((m) => m.t === 'crop').pop();
         change(h, 'ended');
-        return { guarded, captured, rect, hiddenOn: hiddenOn.map((m) => [m.on, m.cause]), hiddenAll, fpsDuring, fpsAfter: h.fpsCalls,
+        return { holdDuring, fpsValueDuring, holdAfter: h.ctx.nekoTargetFrameRateHold, fpsValueAfter: h.ctx.targetFrameRate, guarded, captured, rect, hiddenOn: hiddenOn.map((m) => [m.on, m.cause]), hiddenAll, fpsDuring, fpsAfter: h.fpsCalls,
                  capturing: h.ctx.live2dManager._visitCaptureActive, away: away && away.textContent, crop,
                  frameGone: !h.ctx.document.getElementById('visit-frame'), badgeGone: !h.ctx.document.getElementById('visit-away-badge'),
                  unhooked: !h.handlers.postrender };
@@ -130,6 +133,8 @@ def test_guest_capture_guards_rate_and_starvation():
     assert out["hiddenAll"] == [True, False]
     assert out["fpsDuring"] == [30]
     assert out["fpsAfter"] == [30, 20]
+    assert out["holdDuring"] == {"userFps": 20, "heldFps": 30} and out["fpsValueDuring"] == 30
+    assert out["holdAfter"] is None and out["fpsValueAfter"] == 20
     assert out["capturing"] is False
     assert out["away"] == "Out visiting"
     assert out["crop"]["fps"] == 30 and out["crop"]["mode"] == "upper"
@@ -204,3 +209,24 @@ def test_offscreen_half_of_the_model_is_not_framed():
     # 只按视口内可见的 420×480 构框：框的底边不会落到屏幕下方几百像素
     assert out["y"] + out["height"] <= 1080 + 400
     assert abs(out["x"] + out["width"] / 2 - (1500 + 210)) < 1e-6
+
+
+def test_user_frame_rate_change_during_a_visit_wins():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge({ targetFrameRate: 20 });
+        await open(h, 'guest');
+        change(h, 'started');
+        await advance(700);
+        // 用户在串门中把帧率改成 45（设置弹窗：先写 targetFrameRate，再派发事件）
+        h.ctx.targetFrameRate = 45;
+        h.ctx.dispatchEvent(new h.ctx.CustomEvent('neko-frame-rate-changed', { detail: { fps: 45 } }));
+        const hold = h.ctx.nekoTargetFrameRateHold;
+        change(h, 'ended');
+        return { hold, after: h.ctx.targetFrameRate, calls: h.fpsCalls };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out["hold"] is None
+    assert out["after"] == 45
+    assert out["calls"] == [30, 45]

@@ -17,12 +17,18 @@
     return reason === undefined || reason === null ? '' : String(reason);
   }
 
+  // 明文 ws:// 只放行回环地址（本地开发环回 livekit-server --dev；与后端 credentials._is_loopback_name 同一规则）
+  function isLoopbackLiteral(host) {
+    return /^127(?:\.\d{1,3}){3}$/.test(host) || host === '::1' || host === 'localhost';
+  }
+
   function hostAllowed(url, allowedHosts) {
     var host;
     try {
       var parsed = new URL(url);
-      if (parsed.protocol !== 'wss:') return false;
-      host = parsed.hostname.toLowerCase();
+      // 与后端 urlsplit().hostname 对齐：IPv6 不带方括号
+      host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+      if (parsed.protocol !== 'wss:' && !(parsed.protocol === 'ws:' && isLoopbackLiteral(host))) return false;
     } catch (_) {
       return false;
     }
@@ -43,7 +49,8 @@
     var subscribeWanted = false;
     var peerVid = opts.peerVid || null;
     var remotePublication = null;
-    var lastQuality = null;
+    var remoteTrack = null;
+    var rxMark = null;
 
     function vendorOf(c) {
       return (c && c.vendor && c.vendor.livekit) || {};
@@ -106,10 +113,15 @@
       });
       room.on(E.TrackSubscribed, function (track, pub, participant) {
         if (!participant || !isPeer(participant.identity) || track.kind !== 'video' || !subscribeWanted) return;
+        remoteTrack = track;
+        rxMark = null;
         handlers.onRemoteTrack(track.mediaStreamTrack);
       });
       room.on(E.TrackUnsubscribed, function (track) {
-        if (track && track.kind === 'video') handlers.onRemoteTrack(null);
+        if (track && track.kind === 'video') {
+          if (track === remoteTrack) remoteTrack = null;
+          handlers.onRemoteTrack(null);
+        }
       });
       room.on(E.DataReceived, function (payload, participant, kind, topic) {
         if (!participant) return;
@@ -148,7 +160,6 @@
       });
       room.on(E.ConnectionQualityChanged, function (quality, participant) {
         if (participant && room && participant === room.localParticipant) {
-          lastQuality = quality;
           // poor / lost 视同上行丢包超阈值（拥塞阶梯用）
           var bad = quality === 'poor' || quality === 'lost';
           handlers.onNetwork({ lossPct: bad ? 100 : 0 });
@@ -217,9 +228,18 @@
           return true;
         });
       },
-      updateProfile: function () {
-        // 同一条轨就地改尺寸后 LiveKit 照常编码新尺寸（T14 验证；不接受时退 replaceTrack）
-        return Promise.resolve(true);
+      /**
+       * 构图 / 阶梯 / 取帧帧率变化：同一条轨就地改尺寸后 LiveKit 照常编码新尺寸
+       * （T14 验证；不接受时退 replaceTrack），码率上限与帧率上限改在发送端编码参数上。
+       */
+      updateProfile: function (profile) {
+        var sender = publication && publication.track && publication.track.sender;
+        if (!sender || typeof sender.getParameters !== 'function' || !profile) return Promise.resolve(false);
+        var params = sender.getParameters();
+        if (!params.encodings || !params.encodings.length) return Promise.resolve(false);
+        params.encodings[0].maxBitrate = profile.bitrate * 1000;
+        params.encodings[0].maxFramerate = profile.frameRate;
+        return sender.setParameters(params).then(function () { return true; });
       },
       unpublish: function () {
         if (!room || !publication) return Promise.resolve();
@@ -245,6 +265,8 @@
         publication = null;
         publishedTrack = null;
         remotePublication = null;
+        remoteTrack = null;
+        rxMark = null;
         if (!room) return Promise.resolve();
         return room.disconnect(false).catch(function () {});
       },
@@ -255,9 +277,33 @@
         return !!remotePublication;
       },
       stats: function () {
-        var out = {};
-        if (lastQuality) out.qlr_hint = String(lastQuality);
-        return out;
+        return {};
+      },
+      /** host 侧接收统计（rx_kbps / loss_pct / rtt_ms），取自订阅轨的 RTCRtpReceiver；后端要字段齐全才转给对端。 */
+      receiverStats: function (nowMs) {
+        var receiver = remoteTrack && remoteTrack.receiver;
+        if (!receiver || typeof receiver.getStats !== 'function') return Promise.resolve(null);
+        return receiver.getStats().then(function (report) {
+          var inbound = null;
+          var rttS = null;
+          report.forEach(function (r) {
+            if (r.type === 'inbound-rtp' && r.kind === 'video') inbound = r;
+            if (r.type === 'candidate-pair' && (r.nominated || r.state === 'succeeded') && typeof r.currentRoundTripTime === 'number') rttS = r.currentRoundTripTime;
+          });
+          if (!inbound) return null;
+          var mark = { at: nowMs, bytes: inbound.bytesReceived || 0, lost: inbound.packetsLost || 0, recv: inbound.packetsReceived || 0 };
+          var prev = rxMark;
+          rxMark = mark;
+          var out = {};
+          if (rttS !== null) out.rtt_ms = Math.round(rttS * 1000);
+          if (prev && mark.at > prev.at) {
+            out.rx_kbps = Math.max(0, Math.round((mark.bytes - prev.bytes) * 8 / (mark.at - prev.at)));
+            var lost = Math.max(0, mark.lost - prev.lost);
+            var got = Math.max(0, mark.recv - prev.recv);
+            out.loss_pct = lost + got > 0 ? lost * 100 / (lost + got) : 0;
+          }
+          return out;
+        }).catch(function () { return null; });
       },
       senderStats: function () {
         var track = publication && publication.track;
@@ -277,8 +323,12 @@
     };
   }
 
-  /** 能力门 ③：RTCRtpSender / Receiver 的编解码列表。 */
-  function livekitCapabilities(LK) {
+  /**
+   * 能力门 ③：RTCRtpSender / Receiver 的编解码列表。guest 必须能编码凭证选定的 codec
+   * （vp9 编不了而 vp8 能编时本侧退到 vp8，经 codec 字段回给控制器）；host 要能解 vp9 与 vp8
+   * （对端发哪种由对端的凭证与回退决定）。
+   */
+  function livekitCapabilities(LK, creds, side) {
     var send = [];
     var recv = [];
     try {
@@ -298,10 +348,13 @@
     var enc = names(send);
     var dec = names(recv);
     var supported = typeof LK.isBrowserSupported === 'function' ? LK.isBrowserSupported() : true;
+    var selected = creds && creds.publish && creds.publish.codec === 'vp8' ? 'vp8' : 'vp9';
+    var codec = enc.indexOf(selected) !== -1 ? selected : (enc.indexOf('vp8') !== -1 ? 'vp8' : null);
     return Promise.resolve({
       transportOk: !!supported && typeof root.RTCPeerConnection === 'function',
-      encode: enc.indexOf('vp9') !== -1 || enc.indexOf('vp8') !== -1,
-      decode: dec.indexOf('vp9') !== -1 || dec.indexOf('vp8') !== -1,
+      encode: side === 'host' || codec !== null,
+      decode: dec.indexOf('vp9') !== -1 && dec.indexOf('vp8') !== -1,
+      codec: side === 'guest' ? codec : null,
       codecs: enc.concat(dec.filter(function (n) { return enc.indexOf(n) === -1; })),
     });
   }

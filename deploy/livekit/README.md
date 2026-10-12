@@ -38,12 +38,12 @@
 
 官方 `caddy` 镜像不含 layer4 插件，普通 HTTP 反代转不了 TURN/TLS 的裸 TLS 流量，所以 `Caddyfile` 必须用带 [caddy-l4](https://github.com/mholt/caddy-l4) 的构建：
 
-- **默认（compose 内联构建）**：`docker compose build caddy`。`docker-compose.yml` 里的内联 Dockerfile 用官方 `caddy:2-builder` 镜像执行 `xcaddy build --with github.com/mholt/caddy-l4`，再把产物拷进 `caddy:2`。
+- **默认（compose 内联构建）**：`docker compose build caddy`。`docker-compose.yml` 里的内联 Dockerfile 用钉死版本的官方 `caddy:2.11.7-builder` 镜像执行 `xcaddy build --with github.com/mholt/caddy-l4@42db5690dea199f930a6f08005fe2e4aab10dcc9`，再把产物拷进 `caddy:2.11.7`。升级 Caddy 或插件时，compose 与本节两处一起改，并先 `caddy validate`。
 - **手工构建二进制**（不用 Docker 时）：
 
   ```bash
   go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-  xcaddy build --with github.com/mholt/caddy-l4
+  xcaddy build v2.11.7 --with github.com/mholt/caddy-l4@42db5690dea199f930a6f08005fe2e4aab10dcc9
   ./caddy validate --config Caddyfile --adapter caddyfile
   ```
 

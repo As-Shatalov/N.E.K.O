@@ -35,6 +35,9 @@ const out = await evaluate(`(async () => {
   const VID = 'ProbeVisit0000000000AB';
   window.__probeCheckEach = ${process.argv[4] === 'check' ? 'true' : 'false'};
   bridge.onStateChange({ type: 'visit_state_change', action: 'pending', side: 'guest', visit_id: VID });
+  let result;
+  // 任何一步失败都要收掉探针 iframe 与取帧状态，否则会留在 Pet 页上影响下一次测量
+  try {
   const frame = bridge._state.frame;
   await new Promise((r) => { frame.addEventListener('load', r, { once: true }); setTimeout(r, 8000); });
   const cw = frame.contentWindow;
@@ -74,10 +77,16 @@ const out = await evaluate(`(async () => {
     await sleep(1000);
   }
   const st = bridge._state;
-  const result = { diag, env, captureFps: st.captureFps, rect: st.rect, crop: st.cropMode, savedFps: st.savedFps,
+  result = { diag, env, captureFps: st.captureFps, rect: st.rect, crop: st.cropMode, savedFps: st.savedFps,
     hiddenSent: st.hiddenSent, trackState: track.readyState, samples, blank, checked,
     iframeStyle: frame.style.cssText, liveActive: window.live2dManager && window.live2dManager._visitCaptureActive };
-  bridge.onStateChange({ type: 'visit_state_change', action: 'ended', side: 'guest', visit_id: VID });
+  } finally {
+    try {
+      bridge.onStateChange({ type: 'visit_state_change', action: 'ended', side: 'guest', visit_id: VID });
+    } catch (err) {
+      console.error('[measure_bridge] cleanup failed, reload the Pet page before the next run', err);
+    }
+  }
   await sleep(200);
   result.afterEnd = { frameGone: !document.getElementById('visit-frame'), targetFrameRate: window.targetFrameRate,
     liveActive: window.live2dManager && window.live2dManager._visitCaptureActive };

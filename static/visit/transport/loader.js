@@ -139,6 +139,7 @@
     this.lossPct = null;
     this.softencSince = null;
     this.statsMark = null;
+    this.codecOverride = null;
     var self = this;
     this.core = new NVT.TransportCore({
       visitId: this.visitId,
@@ -206,11 +207,13 @@
     if (msg.refresh) {
       // 续期：只替换本地保存的凭证，不重新入房、不重跑能力门
       if (this.creds && msg.transport === this.creds.transport) {
+        this.applyCodecOverride(msg);
         this.creds = msg;
         if (this.adapter) this.adapter.updateCredentials(msg);
       }
       return;
     }
+    this.codecOverride = null;
     this.creds = msg;
     if (typeof msg.peer_vid === 'string' && msg.peer_vid) this.core.setPeerVid(msg.peer_vid);
     if (this.packer) {
@@ -230,13 +233,18 @@
     this.vendor = NVT.vendors[transport];
     this.loadSdk(transport).then(function (sdk) {
       self.sdk = sdk;
-      return self.vendor.capabilities(sdk);
+      return self.vendor.capabilities(sdk, self.creds, self.side);
     }, function (err) {
       self.log('warn', 'sdk load failed: ' + (err && err.message), 'sdk_load_failed');
       self.sendSdkCaps(gen, { transport_ok: false, video_ok: false, reason: 'sdk_load_failed', codecs: [] });
       return null;
     }).then(function (caps) {
       if (!caps || gen !== self.connGen || self.stopped) return;
+      if (caps.codec && self.creds.publish && caps.codec !== self.creds.publish.codec) {
+        // 本机编不了凭证选定的 codec（如 vp9）：本侧退到能编的那个（vp8），续期凭证同样改写
+        self.codecOverride = caps.codec;
+        self.applyCodecOverride(self.creds);
+      }
       var videoOk;
       if (self.side === 'guest') videoOk = caps.encode && guestVideoPrimitives(self.doc);
       else videoOk = caps.decode && NVT.unpack.webglUnpackSupported(self.doc);
@@ -249,6 +257,10 @@
       self.log('warn', 'capability gate failed: ' + (err && err.message), 'sdk_unsupported');
       self.sendSdkCaps(gen, { transport_ok: false, video_ok: false, reason: 'sdk_unsupported', codecs: [] });
     });
+  };
+
+  P.applyCodecOverride = function (creds) {
+    if (this.codecOverride && creds && creds.publish) creds.publish.codec = this.codecOverride;
   };
 
   P.sendSdkCaps = function (gen, fields) {
@@ -554,11 +566,20 @@
       self.sendBackend(out);
       self.post({ t: 'stats', fps: finiteOr(out.tx_fps, finiteOr(out.rx_fps, 0)), kbps: Math.round(finiteOr(out.tx_kbps, finiteOr(out.rx_kbps, 0))), rtt_ms: Math.round(finiteOr(out.rtt_ms, 0)), hidden: self.hidden });
     };
-    if (this.adapter && typeof this.adapter.senderStats === 'function' && this.media.publish) {
-      this.adapter.senderStats().then(finish, function () { finish(null); });
-    } else {
-      finish(null);
-    }
+    var adapter = this.adapter;
+    var sender = adapter && typeof adapter.senderStats === 'function' && this.media.publish
+      ? adapter.senderStats() : Promise.resolve(null);
+    var receiver = adapter && typeof adapter.receiverStats === 'function' && this.media.subscribe
+      ? adapter.receiverStats(now) : Promise.resolve(null);
+    Promise.all([sender, receiver]).then(function (res) {
+      var rx = res[1];
+      if (rx) {
+        ['rx_kbps', 'rtt_ms', 'loss_pct'].forEach(function (key) {
+          if (typeof rx[key] === 'number' && isFinite(rx[key])) out[key] = rx[key];
+        });
+      }
+      finish(res[0]);
+    }, function () { finish(null); });
   };
 
   /** VP9 软编跟不上：编码帧率持续 10 s 低于目标的 90 %（兼容模式按 15 fps 算）→ 下次串门用 vp8。 */

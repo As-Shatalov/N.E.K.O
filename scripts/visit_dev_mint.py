@@ -117,11 +117,11 @@ def generate_keyfile(path: str | os.PathLike[str], *, force: bool = False) -> Ed
         fd = os.open(target, flags, 0o600)
     except FileExistsError:
         raise DevMintError(f"{target} exists; pass --force to overwrite") from None
+    if os.name == "posix":
+        # O_TRUNC 打开已存在的文件不会改权限位：写入私钥之前先在 fd 上收紧，避免以旧权限落盘
+        os.fchmod(fd, 0o600)
     with os.fdopen(fd, "wb") as fh:
         fh.write(pem)
-    if os.name == "posix":
-        # O_TRUNC 打开已存在的文件不会改权限位：覆盖时补一次
-        os.chmod(target, 0o600)
     return key
 
 
