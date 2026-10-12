@@ -437,6 +437,90 @@ async def test_character_changed_during_admission_is_refused(env):
     assert rt is not None and rt.finalize_reason == "busy"
 
 
+# ── 云快照交给新角色的名字：原角色的改名迁完之前不串门 ─────────────────
+
+
+def _handed_over(env_side, name, *, owner_uid="e" * 32, new="Moved"):
+    """A cloudsave rename of another character that handed ``name`` over to this one, not yet migrated."""
+    marker = {"old": name, "new": new, "uid": owner_uid, "source": "cloudsave", "handed_over": [name]}
+    (env_side.config_dir / "visit_peers.json").write_text(
+        json.dumps({"pending_rename": marker}), encoding="utf-8")
+    return marker
+
+
+def _configured(monkeypatch, uid_of):
+    async def readable():
+        return None
+
+    async def load():
+        return dict(uid_of)
+
+    monkeypatch.setattr(local_chars, "ensure_characters_readable", readable)
+    monkeypatch.setattr(local_chars, "load_local_characters", load)
+
+
+async def test_a_handed_over_name_refuses_rooms_and_join_while_its_rename_cannot_settle(env, monkeypatch):
+    async def busy(*_a, **_k):
+        raise OSError("spool locked")
+
+    monkeypatch.setattr(VisitSpool, "rename_own_char", busy)
+    _configured(monkeypatch, {"Host": HOST_CHAR_UID, "Guest": GUEST_CHAR_UID, "Moved": "e" * 32})
+    host_marker = _handed_over(env.host, "Host")
+    # 原角色的条目还在 Host 名下没迁走：现在串门写下的条目与场次会随迁移归到原角色（变异：不查必红）
+    resp = await _rooms(env)
+    assert resp.status_code == 409 and resp.json()["reason"] == "handover_pending"
+    assert _no_slot() and env.host.creds_calls == []
+    peers = json.loads((env.host.config_dir / "visit_peers.json").read_text(encoding="utf-8"))
+    assert peers["pending_rename"] == {**host_marker, "migrated": True}
+    _handed_over(env.guest, "Guest")
+    join = await _join(env)
+    assert join.status_code == 409 and join.json()["reason"] == "handover_pending"
+    assert _no_slot("Guest") and env.guest.creds_calls == []
+
+
+async def test_a_handed_over_name_is_admitted_once_its_rename_settles(env, monkeypatch):
+    _configured(monkeypatch, {"Host": HOST_CHAR_UID, "Moved": "e" * 32})
+    _handed_over(env.host, "Host")
+    # 准入时先对一次账：迁完就照常建房（变异：不先对账、一律拒绝必红）
+    assert (await _rooms(env)).status_code == 202
+    peers = json.loads((env.host.config_dir / "visit_peers.json").read_text(encoding="utf-8"))
+    assert "pending_rename" not in peers
+
+
+async def test_a_name_handed_over_to_another_character_does_not_block(env, monkeypatch):
+    async def unread():
+        raise AssertionError("the character config is not read when nothing is handed over to this character")
+
+    monkeypatch.setattr(local_chars, "load_local_characters", unread)
+    _handed_over(env.host, "Other")
+    # 交出的是别的名字：照常建房，也不读角色配置、不拿配置锁
+    assert (await _rooms(env)).status_code == 202
+
+
+async def test_a_handed_over_name_with_an_unreadable_character_config_refuses(env, monkeypatch):
+    async def broken():
+        raise OSError("characters.json unreadable")
+
+    monkeypatch.setattr(local_chars, "ensure_characters_readable", broken)
+    _handed_over(env.host, "Host")
+    # 对账要读角色配置，读不出就对不完账：先不接（下一次再试），不能当成没有交接
+    resp = await _rooms(env)
+    assert resp.status_code == 409 and resp.json()["reason"] == "handover_pending" and _no_slot()
+
+
+async def test_a_failed_handover_check_refuses(env, monkeypatch):
+    from main_logic.visit import char_lifecycle
+
+    async def broken(*_a, **_k):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(char_lifecycle, "handover_blocks_visit", broken)
+    _handed_over(env.host, "Host")
+    # 检查本身出错：判不出就先不接，不能当成没有交接（变异：出错放行必红）
+    resp = await _rooms(env)
+    assert resp.status_code == 409 and resp.json()["reason"] == "handover_pending" and _no_slot()
+
+
 # ── 邀请预览与入房 ─────────────────────────────────────────────────────
 
 

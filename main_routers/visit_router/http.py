@@ -49,7 +49,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from config.visit_settings import VISIT_INVITE_PREVIEW_REUSE_S
-from main_logic.visit import local_chars, memory_bridge
+from main_logic.visit import char_lifecycle, local_chars, memory_bridge
 from main_logic.visit.limits import Blocklist
 from main_logic.visit.memory_commit import SIDE_RANK
 from main_logic.visit.recovery import pending_upload_owner, read_pending_upload_doc_sync
@@ -254,6 +254,35 @@ async def _resolve_uid(name: str) -> Optional[str]:
         raise _CharacterLookupFailed from exc
 
 
+async def _strict_local_names() -> tuple[set[str], dict[str, str] | None]:
+    """The configured names and uids, read the way startup recovery reads them (unreadable: raises)."""
+    await local_chars.ensure_characters_readable()
+    uid_of = await local_chars.load_local_characters()
+    return set(uid_of), uid_of
+
+
+async def _handover_pending(name: str, uid: str) -> bool:
+    """Whether a visit of this character must wait for the rename that handed its name over to settle.
+
+    A cloudsave import gave ``name`` to this character while another
+    character's rename still owns the entries under it: roster entries and
+    spools a visit writes now would migrate to that character. The
+    character-config lock (to reconcile first) is only taken when such a
+    rename is pending. A failed check refuses (retry later).
+    """
+    config_dir = _config_dir()
+    try:
+        if not await char_lifecycle.handover_pending(config_dir, name, uid):
+            return False
+        from utils import character_memory
+
+        async with character_memory.character_config_mutation_lock:
+            return await char_lifecycle.handover_blocks_visit(config_dir, name, uid, _strict_local_names)
+    except Exception as exc:  # noqa: BLE001 - 判不出就先不接这场串门，下一次再试
+        logger.warning("visit: handover check failed: %s", type(exc).__name__)
+        return True
+
+
 async def _admit(
     name: str, side: str, *, expect_account: Optional[str] = None, expect_epoch: Optional[int] = None,
     **kwargs: Any,
@@ -269,6 +298,10 @@ async def _admit(
         uid = await _resolve_uid(name)
     except _CharacterLookupFailed:
         return _refused(409, {"reason": "busy"})
+    if uid and await _handover_pending(name, uid):
+        # 云快照刚把这个名字交给这个角色，原角色的改名还没迁完：现在写下的名册条目与场次会随迁移
+        # 归到原角色。等启动对账迁完再串门（通常几秒）
+        return _refused(409, {"reason": "handover_pending"})
     # 没有这个角色（uid 为 None）：不取锁，交给人设闸回 VISIT_PERSONA_UNREVIEWED{state:'missing'}
     async with (char_admission_lock(uid) if uid else contextlib.nullcontext()):
         epoch = runtime.account_epoch()
