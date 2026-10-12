@@ -47,6 +47,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -68,6 +69,7 @@ with contextlib.redirect_stdout(sys.stderr):
 
 ROLES = ("guest", "host")
 TRANSPORTS = ("livekit", "trtc")
+VISIT_ID_RE = re.compile(r"[A-Za-z0-9_-]{22}")
 
 
 class DevMintError(Exception):
@@ -154,6 +156,9 @@ def build_claims(
         raise DevMintError(f"role must be one of {ROLES}")
     if transport not in TRANSPORTS:
         raise DevMintError(f"transport must be one of {TRANSPORTS}")
+    if visit_id and not VISIT_ID_RE.fullmatch(visit_id):
+        # The transport page and the backend session both require this format; never sign an unusable ticket
+        raise DevMintError("visit_id must be 22 characters of [A-Za-z0-9_-]")
     visit_id = visit_id or secrets.token_urlsafe(16)
     visit_uid = visit_uid or secrets.token_hex(12)
     iat = int(time.time()) if iat is None else int(iat)

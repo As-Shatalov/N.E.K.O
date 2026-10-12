@@ -171,8 +171,8 @@
       });
       room.on(E.TrackSubscribed, function (track, pub, participant) {
         if (!participant || !isPeer(participant.identity) || track.kind !== 'video' || !subscribeWanted) return;
-        // 迟到的旧发布订阅成功：当前已换成新发布，不能拿旧轨顶掉新轨
-        if (remotePublication && pub && pub !== remotePublication) return;
+        // 只认当前那份发布：迟到的旧发布（已被换掉或已撤销）订阅成功时不能把旧轨挂上去
+        if (!pub || pub !== remotePublication) return;
         subRetries = 0;
         clearSubRetry();
         remoteTrack = track;

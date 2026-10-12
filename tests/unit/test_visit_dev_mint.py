@@ -207,3 +207,10 @@ def test_ttl_above_the_role_lifetime_is_refused(mint_mod, role):
     assert claims["exp"] - claims["iat"] == limit
     with pytest.raises(mint_mod.DevMintError):
         mint_mod.build_claims(role=role, visit_id=VISIT_ID, visit_uid=VISIT_UID, iat=NOW, ttl_s=limit + 1)
+
+
+@pytest.mark.parametrize("bad", ("abc", "x" * 21, "x" * 23, "a" * 21 + "!"))
+def test_malformed_explicit_visit_id_is_refused(mint_mod, bad):
+    with pytest.raises(mint_mod.DevMintError):
+        mint_mod.build_claims(role="guest", visit_id=bad, visit_uid=VISIT_UID, iat=NOW)
+    assert mint_mod.build_claims(role="guest", visit_id=VISIT_ID, visit_uid=VISIT_UID, iat=NOW)["visit_id"] == VISIT_ID

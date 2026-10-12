@@ -21,6 +21,8 @@
   var CLOSE_UNKNOWN_VISIT = 4404;
   var CLOSE_SUPERSEDED = 4409;
   var DOWNLINK = { credentials: 1, media: 1, send: 1, stop: 1 };
+  // 连上后稳定这么久（或收到一条合法下行）才算后端会话恢复，断线时限才清零
+  var STABLE_OPEN_MS = 5000;
 
   function transportUrl(loc, visitId, side) {
     var scheme = loc.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -39,6 +41,7 @@
     this.token = null;
     this.ws = null;
     this.lostAt = null;
+    this.stableTimer = null;
     this.reconnectTimer = null;
     this.terminal = false;
     this.stopped = false;
@@ -57,7 +60,12 @@
     this.ws = ws;
     ws.onopen = function () {
       if (ws !== self.ws) return;
-      self.lostAt = null;
+      // 只是握手成功不算恢复：鉴权前就被关掉的反复连 / 断不能一直把断线时限往后推
+      self.clearStable();
+      self.stableTimer = setTimeout(function () {
+        self.stableTimer = null;
+        if (ws === self.ws) self.lostAt = null;
+      }, STABLE_OPEN_MS);
       ws.send(JSON.stringify({ type: 'auth', csrf_token: self.token }));
       self.hooks.onOpen();
     };
@@ -69,11 +77,15 @@
       } catch (_) {
         return;
       }
-      if (msg && typeof msg === 'object' && DOWNLINK[msg.type]) self.hooks.onMessage(msg);
+      if (msg && typeof msg === 'object' && DOWNLINK[msg.type]) {
+        self.lostAt = null;
+        self.hooks.onMessage(msg);
+      }
     };
     ws.onclose = function (event) {
       if (ws !== self.ws) return;
       self.ws = null;
+      self.clearStable();
       var code = event && event.code;
       // 先同步停媒体、离房，再决定重连：都不依赖后端的任何计时器
       self.hooks.stopAllMedia();
@@ -132,9 +144,15 @@
   };
 
   /** 后端 stop 之后本侧主动收线：终态，不再重连。 */
+  BackendLink.prototype.clearStable = function () {
+    if (this.stableTimer !== null) clearTimeout(this.stableTimer);
+    this.stableTimer = null;
+  };
+
   BackendLink.prototype.close = function () {
     this.stopped = true;
     this.terminal = true;
+    this.clearStable();
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     if (this.ws) {

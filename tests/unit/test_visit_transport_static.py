@@ -511,7 +511,9 @@ def test_livekit_ladder_codec_stats_and_loopback():
           ['in', { type: 'inbound-rtp', kind: 'video', bytesReceived: bytes, packetsReceived: recv, packetsLost: lost }],
           ['cp', { type: 'candidate-pair', nominated: true, currentRoundTripTime: 0.12 }]]) ) };
         await a.setSubscribe(true);
-        LK.Room.last.emit('TrackSubscribed', { kind: 'video', mediaStreamTrack: {}, receiver }, {}, { identity: 'g_peer' });
+        const remotePub = { kind: 'video', setSubscribed() {} };
+        LK.Room.last.emit('TrackPublished', remotePub, { identity: 'g_peer' });
+        LK.Room.last.emit('TrackSubscribed', { kind: 'video', mediaStreamTrack: {}, receiver }, remotePub, { identity: 'g_peer' });
         const first = await a.receiverStats(0);
         bytes = 350000; recv = 950; lost = 50;
         const second = await a.receiverStats(5000);
@@ -1184,8 +1186,10 @@ def test_livekit_late_unsubscribe_of_an_old_track_keeps_the_new_one():
         const room = LK.Room.last;
         const oldT = { kind: 'video', mediaStreamTrack: { id: 'old' } };
         const newT = { kind: 'video', mediaStreamTrack: { id: 'new' } };
-        room.emit('TrackSubscribed', oldT, {}, { identity: 'g_peer' });
-        room.emit('TrackSubscribed', newT, {}, { identity: 'g_peer' });
+        const remotePub = { kind: 'video', setSubscribed() {} };
+        room.emit('TrackPublished', remotePub, { identity: 'g_peer' });
+        room.emit('TrackSubscribed', oldT, remotePub, { identity: 'g_peer' });
+        room.emit('TrackSubscribed', newT, remotePub, { identity: 'g_peer' });
         room.emit('TrackUnsubscribed', oldT);
         const afterOld = tracks.slice();
         room.emit('TrackUnsubscribed', newT);
@@ -1593,3 +1597,82 @@ def test_softenc_window_restarts_after_leaving_the_room_state():
         """
     )
     assert out == {"afterState": None, "flagged": False, "afterStop": None}
+
+
+def test_first_join_failure_is_retried_within_the_window():
+    out = run_visit_js(
+        """
+        const h = makeController('guest');
+        let fails = 1;
+        const origCreate = h.TRTC.create;
+        h.TRTC.create = () => {
+          const inst = origCreate();
+          const orig = inst.enterRoom;
+          inst.enterRoom = (p) => { if (fails > 0) { fails -= 1; h.log.push(['enterRoom-fail']); return Promise.reject(new Error('transient')); } return orig(p); };
+          return inst;
+        };
+        h.c.onAuthToken('tok');
+        const ws = sockets[sockets.length - 1];
+        ws.serverOpen();
+        ws.serverSend(credsFor('guest'));
+        await settle();
+        await advance(1100); await settle();
+        return { calls: kinds(h.log).filter((k) => k.startsWith('enterRoom')),
+                 errors: ws.sent.filter((m) => m.type === 'state' && m.state === 'error').length };
+        """
+    )
+    assert out == {"calls": ["enterRoom-fail", "enterRoom"], "errors": 0}
+
+
+def test_flapping_socket_cannot_extend_the_reconnect_window():
+    out = run_visit_js(
+        """
+        const runs = {};
+        for (const [name, openMs] of [['flapping', 300], ['stable', 6000]]) {
+          const h = makeController('guest');
+          h.c.onAuthToken('tok');
+          let closed = null;
+          const origTerminal = h.c.onTerminal.bind(h.c);
+          h.c.onTerminal = (code) => { closed = clock.now; origTerminal(code); };
+          const start = clock.now;
+          let cycles = 0;
+          while (closed === null && cycles < 40) {
+            const ws = sockets[sockets.length - 1];
+            ws.serverOpen();
+            await advance(openMs);
+            ws.serverClose(1006);
+            await settle();
+            await advance(1100);
+            cycles += 1;
+          }
+          runs[name] = { terminal: closed !== null, elapsed: closed === null ? null : closed - start, cycles };
+        }
+        return runs;
+        """
+    )
+    assert out["flapping"]["terminal"] is True and out["flapping"]["elapsed"] <= 25000
+    assert out["stable"]["terminal"] is False
+
+
+def test_livekit_ignores_subscription_after_the_publication_was_withdrawn():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        const tracks = [];
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack(t) { tracks.push(t ? t.id : null); }, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9' } });
+        await a.setSubscribe(true);
+        const room = LK.Room.last;
+        const peer = { identity: 'g_peer' };
+        const pub = { kind: 'video', trackSid: 'TR_1', setSubscribed() {} };
+        room.emit('TrackPublished', pub, peer);
+        room.emit('TrackUnpublished', pub, peer);
+        room.emit('TrackSubscribed', { kind: 'video', mediaStreamTrack: { id: 'late' } }, pub, peer);
+        return tracks;
+        """
+    )
+    assert out == [None]

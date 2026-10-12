@@ -303,7 +303,12 @@
       if (!caps.transportOk) report.reason = 'sdk_unsupported';
       else if (!videoOk) report.reason = 'no_encoder';
       self.sendSdkCaps(gen, report);
-      if (caps.transportOk) self.join();
+      if (caps.transportOk) {
+        // 首次入房同样在窗口内按退避重试：后端给首次入房留了 25 s，一次暂时性失败不该直接结束整场
+        self.rejoinUntil = self.now() + REJOIN_RETRY_WINDOW_MS;
+        self.rejoinAttempts = 0;
+        self.join();
+      }
     }).catch(function (err) {
       self.log('warn', 'capability gate failed: ' + (err && err.message), 'sdk_unsupported');
       self.sendSdkCaps(gen, { transport_ok: false, video_ok: false, reason: 'sdk_unsupported', codecs: [] });
