@@ -161,25 +161,22 @@ async def _show_owed_locked(host: Any, visit_id: str, *, own_char: str, lang: Op
     except Exception as exc:  # noqa: BLE001 - 读不出：等 bind 重放
         logger.debug("visit %s: state unreadable: %s", visit_id[:6], type(exc).__name__)
         return False
-    owed = owed_block(state, lang) if state is not None else None
-    if owed is None:
+    if state is None or owed_request_id(state) is None:
         return False
-    request_id, blocks, frame = owed
     try:
         async with contextlib.AsyncExitStack() as stack:
             # 核名字、核账号到推送都按住这只猫的生命周期与登录账号：中途改名（旧名字归了另一只猫）、切号都进不来
             if not await _pin_push(stack, state):
                 return False
-            return await _push_owed(host, visit_id, state, request_id, blocks, frame,
-                                    own_char=own_char, interrupted=interrupted)
+            return await _push_owed(host, visit_id, state, lang, own_char=own_char, interrupted=interrupted)
     except TimeoutError:
         # 按住账号的推送超过了时限（_ACCOUNT_BOUND_PUSH_MAX_S）：这次截断，标记留在 state.json，等 bind 重放
         logger.info("visit %s: debrief push took longer than the account hold limit; cut off", visit_id[:6])
         return False
 
 
-async def _push_owed(host: Any, visit_id: str, state: Mapping[str, Any], request_id: str, blocks: list[dict],
-                     frame: Optional[dict], *, own_char: str, interrupted: bool) -> bool:
+async def _push_owed(host: Any, visit_id: str, state: Mapping[str, Any], lang: Optional[str], *,
+                     own_char: str, interrupted: bool) -> bool:
     from main_routers.visit_router.accounts import own_visit_uid
 
     if await _own_char(state) != own_char:
@@ -188,6 +185,11 @@ async def _push_owed(host: Any, visit_id: str, state: Mapping[str, Any], request
     if await own_visit_uid() != state.get("own_uid"):
         # 账号放在最后核（解析名字有 await）：换了账号就不把这一场的预览正文推给现在登录的账号
         return False
+    state = await reread_for_delivery(state)
+    owed = owed_block(state, lang) if state is not None else None
+    if owed is None:
+        return False
+    request_id, blocks, frame = owed
     if interrupted and state["debrief_choice"] in _CHIP_CHOICES:
         # 「意外中断」与它所跟的块按同一份锁内状态决定：只跟芯片一起出（与 bind 重放同一口径）。
         # 与芯片同一出口：校验 bind 与写入用同一个连接对象（send_status 会重读 mgr.websocket）
@@ -205,6 +207,25 @@ async def _push_owed(host: Any, visit_id: str, state: Mapping[str, Any], request
     if shown and frame is not None:
         await host.send_frame(frame)
     return shown
+
+
+async def reread_for_delivery(state: Mapping[str, Any]) -> Optional[dict]:
+    """Re-read ``state.json`` right before delivering its owed block (None: deliver nothing).
+
+    Called with the push pinned, after the identity checks: "forget this
+    person" voids without the visit lock, so a block derived from a state
+    read before those awaits could show a diary that was just cleared. None
+    when unreadable or no longer the same visit owner / character.
+    """
+    try:
+        fresh = await _spool(state["visit_id"]).read_state()
+    except Exception as exc:  # noqa: BLE001 - 读不出：这次不推，等下次 bind 重放
+        logger.debug("visit %s: state unreadable before delivery: %s", state["visit_id"][:6], type(exc).__name__)
+        return None
+    if (fresh is None or fresh.get("own_uid") != state.get("own_uid")
+            or fresh.get("own_char_uid") != state.get("own_char_uid")):
+        return None
+    return fresh
 
 
 async def _visit_owner(visit_id: str) -> Optional[str]:

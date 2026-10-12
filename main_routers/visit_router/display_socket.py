@@ -252,7 +252,11 @@ async def _replay_one(websocket: Any, lanlan_name: str, visit_id: str, owner: st
                 if await own_visit_uid() != owner:
                     # 等锁期间（另一页正在生成 / 提交）登出或换了账号：这一页不再收上一个账号的块（账号最后核）
                     return False
-                return await _send_owed(websocket, lanlan_name, state, delivered, lang, own_visit_uid)
+                # 核完身份再重读：「清除这个人」不拿这把锁，落在上面几次 await 里也不会推出刚被清掉的预览
+                fresh = await debrief.reread_for_delivery(state)
+                if fresh is None or not fresh.get("debrief_chip_pending"):
+                    return True
+                return await _send_owed(websocket, lanlan_name, fresh, delivered, lang, own_visit_uid)
         except TimeoutError:
             # 这一场按住账号的推送超过了时限：这场截断、下次 bind 再重放；接着试下一场
             # （真在切号的话，下一场的 _pin_push 会直接给 False，开销很小）

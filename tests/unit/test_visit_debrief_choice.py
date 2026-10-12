@@ -1756,3 +1756,51 @@ async def test_a_void_while_reusing_the_preview_returns_no_preview(env, monkeypa
     monkeypatch.setattr(debrief, "_caller_still_current", check_then_void)
     status, body = await choose("diary")
     assert status == 409 and body["choice"] == "forget" and "preview" not in body
+
+
+# ── Codex 第 27 轮 ───────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def void_on_identity_check(env, monkeypatch):
+    """「清除这个人」落在推送前核身份的那段 await 里（重放路径已读过 state 之后）。"""
+    from main_logic.visit import local_chars
+    from main_logic.visit.debrief_writers import write_forget
+
+    armed = {"on": False}
+
+    async def resolve_then_void(uid):
+        if armed["on"]:
+            armed["on"] = False
+            await write_forget(VisitSpool(env.tmp, vid(1)))
+        return {CHAR_UID_A: "A"}.get(uid)
+
+    monkeypatch.setattr(local_chars, "resolve_char_name", resolve_then_void)
+    return armed
+
+
+async def test_startup_replay_rereads_the_state_before_delivering(env, void_on_identity_check):
+    await visit(env)
+    await preview(env)
+    env.host.blocks.clear()
+    void_on_identity_check["on"] = True
+    assert await debrief.show_owed(env.host, vid(1), own_char="A", lang="zh") is False
+    assert env.host.blocks == []
+
+
+async def test_bind_replay_rereads_the_state_before_delivering(env, void_on_identity_check):
+    await visit(env)
+    await preview(env)
+
+    class Socket:
+        def __init__(self):
+            setattr(self, VISIT_SOCKET_BOUND_ATTR, True)
+            self.sent = []
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+    socket = Socket()
+    void_on_identity_check["on"] = True
+    await display_socket._replay_one(socket, "A", vid(1), OWN_A, set(), "zh")
+    assert [f for f in socket.sent if f.get("type") == "chat_blocks"] == []
