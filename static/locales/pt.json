@@ -6514,5 +6514,9 @@
             "chat": "Cápsula de chat",
             "floating": "Botões do personagem"
         }
+    },
+    "visitFrame": {
+        "peerAway": "Saiu por um instante",
+        "visitingAway": "Visitando"
     }
 }

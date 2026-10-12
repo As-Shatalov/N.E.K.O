@@ -6514,5 +6514,9 @@
             "chat": "カプセルチャット",
             "floating": "キャラクター横のボタン"
         }
+    },
+    "visitFrame": {
+        "peerAway": "ちょっと席を外しています",
+        "visitingAway": "おでかけ中"
     }
 }

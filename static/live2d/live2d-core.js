@@ -1039,6 +1039,7 @@ class Live2DManager {
             (performance.now() - this._lastPointerMoveAt) < LIVE2D_INTERACTIVE_FPS_HOLD_MS) return true;
         const appState = window.appState;
         if (appState && appState.lipSyncActive) return true;
+        if (this._visitCaptureActive) return true;
         return false;
     }
 

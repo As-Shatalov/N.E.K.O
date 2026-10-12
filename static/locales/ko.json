@@ -6514,5 +6514,9 @@
             "chat": "캡슐 채팅창",
             "floating": "캐릭터 옆 버튼"
         }
+    },
+    "visitFrame": {
+        "peerAway": "잠깐 자리를 비웠어요",
+        "visitingAway": "놀러 가는 중"
     }
 }

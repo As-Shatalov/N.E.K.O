@@ -1,0 +1,636 @@
+/*
+ * 串门传输页：能力门与控制器（设计稿 §3.3.4 / §4.3 / §4.4）。
+ *
+ * 能力门拆两段：
+ *   预检（每条传输 WS 连上、auth 之后就跑，与 transport 无关）：① isSecureContext；
+ *   ② 原生 WebSocket 且 RTCPeerConnection 在场——只查数据通道必需的能力。
+ *   SDK 段（收到 credentials 之后）：按 credentials.transport 动态插一份随包分发的 SDK
+ *   （SRI 校验固定版本）→ ③ TRTC.isSupported() / RTCRtpSender.getCapabilities；视频原语
+ *   按侧位在这里查（guest：2D 抓帧画布 + captureStream；host：WebGL 解包画布），缺了只
+ *   video_ok:false，串门照常（文字 + 字幕）。
+ * 预检段不引用任何 vendor 全局；vendor SDK 只在这里、只在 iframe 内、按需加载。
+ */
+(function (root) {
+  'use strict';
+
+  var NVT = root.NekoVisitTransport = root.NekoVisitTransport || {};
+
+  // 随包分发的固定版本（static/libs/THIRD_PARTY_NOTICES.md 登记版本与 sha256；静态测试钉住）
+  var SDK_INTEGRITY = {
+    trtc: 'sha256-mnm38g4liu1FedNS1ZrCSC1Yk35TRBemiy5h6Y9KbCU=',
+    livekit: 'sha256-f6F+N69emW2KJfFaY33MBiAhW8AbOU5dIJ9yav59wE0=',
+  };
+  var PAGE_QUERY_KEYS = ['v', 'side', 'visit_id'];
+  // TRTC SDK 的调试插件会按 URL 参数 / sessionStorage 从外部 CDN 拉脚本：载入前清掉这两个开关
+  var TRTC_DEBUG_STORAGE_KEYS = ['TRTC_ENABLE_DEBUG_PLUGIN', 'TRTC_DEBUG_DIALOG_PATH'];
+  var STATS_INTERVAL_MS = 5000;
+  var HIDDEN_REPORT_MIN_MS = 1000;
+  var PEER_STATS_FRESH_MS = 12000;
+  var SOFTENC_WINDOW_MS = 10000;      // VISIT_VP9_CPU_FALLBACK 的秒数
+  var SOFTENC_FPS_RATIO = 0.9;        // 27 / 30：编码帧率低于目标帧率的 90 % 算软编跟不上
+  var VISIT_ID_RE = /^[A-Za-z0-9_-]{22}$/;
+  var IN_ROOM = { joined: 1, connected: 1 };
+
+  function isNativeFunction(fn) {
+    try {
+      return typeof fn === 'function' && /\{\s*\[native code\]\s*\}\s*$/.test(Function.prototype.toString.call(fn));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /** 预检段（①②）：只看本 frame 的原生能力，不碰 vendor SDK。 */
+  function runPreflight(win) {
+    if (!win.isSecureContext) return { ok: false, reason: 'insecure_context' };
+    var WS = win.WebSocket;
+    var wsNative = !!WS && WS.name === 'WebSocket' && isNativeFunction(WS) &&
+      isNativeFunction(WS.prototype && WS.prototype.send) &&
+      Object.getPrototypeOf(WS.prototype) === win.EventTarget.prototype;
+    if (!wsNative) return { ok: false, reason: 'foreign_websocket' };
+    if (typeof win.RTCPeerConnection !== 'function') return { ok: false, reason: 'no_webrtc' };
+    return { ok: true };
+  }
+
+  /** guest 视频原语：2D 抓帧画布 + captureStream。 */
+  function guestVideoPrimitives(doc) {
+    try {
+      var c = doc.createElement('canvas');
+      return !!c.getContext('2d', { alpha: false }) && typeof c.captureStream === 'function';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /** 页面查询串只允许本页自己的三个参数（vendor SDK 会读 location.search 里的调试开关）。 */
+  function queryIsClean(search) {
+    var params = new URLSearchParams(search);
+    var ok = true;
+    params.forEach(function (_value, key) {
+      if (PAGE_QUERY_KEYS.indexOf(key) === -1) ok = false;
+    });
+    return ok;
+  }
+
+  function scrubVendorDebugSwitches(win) {
+    try {
+      TRTC_DEBUG_STORAGE_KEYS.forEach(function (k) { win.sessionStorage.removeItem(k); });
+    } catch (_) {
+      // 存储不可用时 SDK 同样读不到
+    }
+  }
+
+  function loadScriptOnce(win, transport, version) {
+    var vendor = NVT.vendors && NVT.vendors[transport];
+    if (!vendor || !SDK_INTEGRITY[transport]) return Promise.reject(new Error('unknown transport'));
+    if (win[vendor.globalName]) return Promise.resolve(win[vendor.globalName]);
+    if (!queryIsClean(win.location.search)) return Promise.reject(new Error('unexpected page query'));
+    scrubVendorDebugSwitches(win);
+    return new Promise(function (resolve, reject) {
+      var s = win.document.createElement('script');
+      s.src = vendor.script + (version ? '?v=' + encodeURIComponent(version) : '');
+      s.integrity = SDK_INTEGRITY[transport];
+      s.crossOrigin = 'anonymous';
+      s.async = true;
+      s.onload = function () {
+        if (win[vendor.globalName]) resolve(win[vendor.globalName]);
+        else reject(new Error('sdk global missing'));
+      };
+      s.onerror = function () { reject(new Error('sdk load failed')); };
+      win.document.head.appendChild(s);
+    });
+  }
+
+  function finiteOr(value, fallback) {
+    return typeof value === 'number' && isFinite(value) && value >= 0 ? value : fallback;
+  }
+
+  /**
+   * 控制器：把父页、传输 WS、vendor 适配器与打包 / 解包串起来。
+   * env 注入 window / document / 计时器，测试用假实现。
+   */
+  function VisitTransportController(env) {
+    this.win = env.window;
+    this.doc = env.document;
+    this.side = env.side;
+    this.visitId = env.visitId;
+    this.assetVersion = env.assetVersion || '';
+    this.post = env.post;
+    this.log = env.log || function () {};
+    this.loadSdk = env.loadSdk || function (transport) { return loadScriptOnce(env.window, transport, env.assetVersion); };
+    this.now = env.now || function () { return Date.now(); };
+    this.creds = null;
+    this.vendor = null;
+    this.sdk = null;
+    this.adapter = null;
+    this.connGen = 0;
+    this.sdkCapsGen = -1;
+    this.preflight = null;
+    this.vendorState = null;
+    this.peerPresent = false;
+    this.remoteVideo = false;
+    this.hidden = false;
+    this.hiddenReportedAt = 0;
+    this.hiddenTimer = null;
+    this.stopped = false;
+    this.rejoining = false;
+    this.captureFps = 30;
+    this.media = { publish: false, subscribe: false, crop: 'upper', ladder: 0, peerCrop: null };
+    this.peerRxFps = null;
+    this.lossPct = null;
+    this.softencSince = null;
+    this.statsMark = null;
+    var self = this;
+    this.core = new NVT.TransportCore({
+      visitId: this.visitId,
+      onRecv: function (m) { self.onRecv(m); },
+      onBackpressure: function (b) { self.sendBackend({ type: 'tx_backpressure', on: b.on, queue: b.queue, dropped: b.dropped }); },
+    });
+    this.packer = null;
+    this.unpacker = null;
+    this.ladder = null;
+    if (this.side === 'guest') {
+      this.packer = new NVT.pack.Packer({ document: this.doc, crop: 'upper' });
+      this.ladder = new NVT.pack.LadderController({ crop: 'upper', targetFps: this.captureFps });
+      NVT.packer = this.packer;
+    } else if (env.video && env.canvas) {
+      this.unpacker = new NVT.unpack.Unpacker({ video: env.video, canvas: env.canvas, post: this.post });
+    }
+    this.link = new NVT.backend.BackendLink({
+      visitId: this.visitId,
+      side: this.side,
+      hooks: {
+        onOpen: function () { self.onSocketOpen(); },
+        onMessage: function (msg) { self.onDownlink(msg); },
+        stopAllMedia: function () { self.stopAllMedia(); },
+        leaveRoom: function (reason) { self.leaveRoom(reason); },
+        onTerminal: function (code) { self.onTerminal(code); },
+      },
+    });
+  }
+
+  var P = VisitTransportController.prototype;
+
+  P.sendBackend = function (msg) {
+    return this.link.send(msg);
+  };
+
+  P.onAuthToken = function (token) {
+    if (this.stopped) return;
+    this.link.start(token);
+  };
+
+  // ── 传输 WS ──────────────────────────────────────────────────────────
+
+  P.onSocketOpen = function () {
+    this.connGen += 1;
+    if (!this.preflight) this.preflight = runPreflight(this.win);
+    var caps = {
+      type: 'caps', stage: 'preflight', visit_id: this.visitId, side: this.side,
+      preflight_ok: this.preflight.ok, is_secure_context: !!this.win.isSecureContext,
+      ua: String((this.win.navigator && this.win.navigator.userAgent) || '').slice(0, 200),
+    };
+    if (this.preflight.reason) caps.reason = this.preflight.reason;
+    this.sendBackend(caps);
+  };
+
+  P.onDownlink = function (msg) {
+    if (this.stopped) return;
+    if (msg.type === 'credentials') this.onCredentials(msg);
+    else if (msg.type === 'media') this.applyMedia(msg);
+    else if (msg.type === 'send') this.core.send(msg.cmd, msg.payload);
+    else if (msg.type === 'stop') this.onStop(msg);
+  };
+
+  P.onCredentials = function (msg) {
+    if (msg.visit_id !== this.visitId || msg.side !== this.side) return;
+    if (msg.refresh) {
+      // 续期：只替换本地保存的凭证，不重新入房、不重跑能力门
+      if (this.creds && msg.transport === this.creds.transport) {
+        this.creds = msg;
+        if (this.adapter) this.adapter.updateCredentials(msg);
+      }
+      return;
+    }
+    this.creds = msg;
+    if (typeof msg.peer_vid === 'string' && msg.peer_vid) this.core.setPeerVid(msg.peer_vid);
+    if (this.packer) {
+      this.media.crop = msg.crop === 'full' ? 'full' : 'upper';
+      this.media.ladder = 0;
+      this.ladder.reset(this.media.crop, 0);
+      this.packer.setGeometry(this.media.crop, 0);
+      this.announceGeometry();
+    }
+    var gen = this.connGen;
+    var self = this;
+    var transport = msg.transport;
+    if (!NVT.vendors || !NVT.vendors[transport]) {
+      this.sendSdkCaps(gen, { transport_ok: false, video_ok: false, reason: 'sdk_unsupported', codecs: [] });
+      return;
+    }
+    this.vendor = NVT.vendors[transport];
+    this.loadSdk(transport).then(function (sdk) {
+      self.sdk = sdk;
+      return self.vendor.capabilities(sdk);
+    }, function (err) {
+      self.log('warn', 'sdk load failed: ' + (err && err.message), 'sdk_load_failed');
+      self.sendSdkCaps(gen, { transport_ok: false, video_ok: false, reason: 'sdk_load_failed', codecs: [] });
+      return null;
+    }).then(function (caps) {
+      if (!caps || gen !== self.connGen || self.stopped) return;
+      var videoOk;
+      if (self.side === 'guest') videoOk = caps.encode && guestVideoPrimitives(self.doc);
+      else videoOk = caps.decode && NVT.unpack.webglUnpackSupported(self.doc);
+      var report = { transport_ok: !!caps.transportOk, video_ok: !!(caps.transportOk && videoOk), codecs: caps.codecs || [] };
+      if (!caps.transportOk) report.reason = 'sdk_unsupported';
+      else if (!videoOk) report.reason = 'no_encoder';
+      self.sendSdkCaps(gen, report);
+      if (caps.transportOk) self.join();
+    }).catch(function (err) {
+      self.log('warn', 'capability gate failed: ' + (err && err.message), 'sdk_unsupported');
+      self.sendSdkCaps(gen, { transport_ok: false, video_ok: false, reason: 'sdk_unsupported', codecs: [] });
+    });
+  };
+
+  P.sendSdkCaps = function (gen, fields) {
+    if (gen !== this.connGen || this.sdkCapsGen === gen) return;
+    this.sdkCapsGen = gen;
+    var msg = { type: 'caps', stage: 'sdk', visit_id: this.visitId, side: this.side };
+    for (var k in fields) msg[k] = fields[k];
+    this.sendBackend(msg);
+  };
+
+  P.ensureAdapter = function () {
+    if (this.adapter) return this.adapter;
+    var self = this;
+    this.adapter = this.vendor.createAdapter({
+      sdk: this.sdk,
+      peerVid: this.core.peerVid,
+      handlers: {
+        onPiece: function (fromVid, cmd, bytes) { self.core.onPiece(fromVid, cmd, bytes); },
+        onPeer: function (kind, vid, reason, explicit) { self.onPeer(kind, vid, reason, explicit); },
+        onState: function (state, extra) { self.onVendorState(state, extra); },
+        onRemoteTrack: function (track) { self.onRemoteTrack(track); },
+        onNetwork: function (info) { if (info && typeof info.lossPct === 'number') self.lossPct = info.lossPct; },
+        onNeedRejoin: function () { self.rejoin(); },
+        onLog: function (level, msg, code) { self.log(level, msg, code); },
+      },
+    });
+    this.core.attach(this.adapter);
+    return this.adapter;
+  };
+
+  P.join = function () {
+    if (this.stopped || !this.creds) return;
+    var adapter = this.ensureAdapter();
+    var self = this;
+    adapter.join(this.creds).then(function () {
+      self.core.flush();
+    }, function (err) {
+      var code = (err && err.errorCode) || 'join_failed';
+      self.log('warn', 'vendor join failed', code);
+      self.onVendorState('error', { error_code: code });
+    });
+  };
+
+  /** SDK 自动重连失败（旧凭证鉴权失败）：用最新凭证、同一个 vid 手动重新入房。 */
+  P.rejoin = function () {
+    if (this.stopped || this.rejoining || !this.adapter || !this.creds) return;
+    this.rejoining = true;
+    var self = this;
+    this.stopAllMedia();
+    this.adapter.leave().then(function () {
+      self.rejoining = false;
+      if (!self.stopped && self.link.ws) self.join();
+    });
+  };
+
+  // ── vendor 事件 ───────────────────────────────────────────────────────
+
+  P.onVendorState = function (state, extra) {
+    this.vendorState = state;
+    if (state === 'kicked') {
+      // 被踢 / 被同 vid 顶号：停掉自己的媒体；是否结束整场由后端按 vendor_reason 判
+      this.stopAllMedia();
+    }
+    this.reportState(extra || {});
+    if (IN_ROOM[state]) this.core.flush();
+  };
+
+  P.onPeer = function (kind, vid, reason, explicit) {
+    if (kind === 'enter') {
+      if (this.peerPresent) return;
+      this.peerPresent = true;
+      this.reportState({});
+      return;
+    }
+    // 超时类离开不上报（交给心跳）；只有显式离开报 peer_present:false（后端按暂定离开起 35 s 宽限）
+    if (!explicit || !this.peerPresent) return;
+    this.peerPresent = false;
+    this.reportState({ vendor_reason: reason });
+  };
+
+  P.onRemoteTrack = function (track) {
+    if (!this.unpacker) return;
+    if (track && this.media.subscribe) {
+      this.unpacker.attach(track);
+      this.remoteVideo = true;
+    } else {
+      this.unpacker.detach();
+      this.remoteVideo = false;
+    }
+    this.reportState({});
+  };
+
+  P.reportState = function (extra) {
+    if (!this.vendorState) return;
+    var msg = { type: 'state', state: this.vendorState, peer_present: this.peerPresent, remote_video: this.remoteVideo, hidden: this.hidden };
+    if (extra && extra.vendor_reason) msg.vendor_reason = String(extra.vendor_reason).slice(0, 64);
+    if (extra && extra.error_code) msg.error_code = String(extra.error_code).slice(0, 64);
+    this.hiddenReportedAt = this.now();
+    this.sendBackend(msg);
+  };
+
+  P.onRecv = function (m) {
+    // guest 的拥塞阶梯要对端的接收帧率：只看 cmd 3 的 stats，其余语义一概不读
+    if (this.side === 'guest' && m.cmd === 3 && m.payload && m.payload.t === 'stats' && typeof m.payload.rx_fps === 'number') {
+      this.peerRxFps = { value: m.payload.rx_fps, at: this.now() };
+    }
+    this.sendBackend({ type: 'recv', from_vid: m.from_vid, cmd: m.cmd, payload: m.payload });
+  };
+
+  // ── media ─────────────────────────────────────────────────────────────
+
+  P.profile = function () {
+    return NVT.pack.profileFor(this.packer.dims, this.captureFps);
+  };
+
+  P.announceGeometry = function () {
+    if (!this.packer) return;
+    var d = this.packer.dims;
+    this.post({ t: 'geometry', crop: d.crop, level: d.level, cropW: d.cropW, cropH: d.cropH });
+  };
+
+  P.setGeometry = function (crop, level) {
+    var changed = this.packer.setGeometry(crop, level);
+    this.media.crop = this.packer.dims.crop;
+    this.media.ladder = this.packer.dims.level;
+    if (changed) {
+      this.announceGeometry();
+      if (this.media.publish && this.adapter) {
+        var self = this;
+        this.adapter.updateProfile(this.profile()).catch(function (err) {
+          self.log('warn', 'updateProfile failed', String(err && err.code));
+        });
+      }
+    }
+  };
+
+  P.applyMedia = function (msg) {
+    var self = this;
+    if (typeof msg.peer_vid === 'string' && msg.peer_vid) {
+      this.core.setPeerVid(msg.peer_vid);
+      if (this.adapter) this.adapter.setPeerVid(msg.peer_vid);
+    }
+    if (msg.peer_crop === 'upper' || msg.peer_crop === 'full') this.media.peerCrop = msg.peer_crop;
+    if (this.side === 'guest') {
+      var crop = msg.crop === 'full' || msg.crop === 'upper' ? msg.crop : this.media.crop;
+      var level = Number.isInteger(msg.ladder) ? msg.ladder : this.media.ladder;
+      if (crop !== this.media.crop || level !== this.media.ladder) this.ladder.reset(crop, level);
+      this.setGeometry(crop, level);
+      if (msg.publish === true) {
+        this.media.publish = true;
+        this.packer.active = true;
+        if (this.adapter) {
+          // 轨已被结束（SDK 或浏览器）就从同一块画布建新轨，接回父页的同任务取帧再发布
+          var track = this.packer.ensureTrack();
+          this.adapter.publish(track, this.profile()).catch(function (err) {
+            self.log('warn', 'publish failed', String(err && err.code));
+          });
+        }
+      } else if (msg.publish === false) {
+        this.media.publish = false;
+        this.packer.active = false;
+        if (this.adapter) this.adapter.unpublish();
+      }
+    } else if (typeof msg.subscribe === 'boolean') {
+      this.media.subscribe = msg.subscribe;
+      if (this.adapter) this.adapter.setSubscribe(msg.subscribe);
+      if (!msg.subscribe && this.unpacker) {
+        this.unpacker.detach();
+        this.remoteVideo = false;
+      }
+    }
+  };
+
+  /** 停掉全部媒体（不离房、不 stop 画布轨）：guest 取消发布，host 取消订阅。同步执行。 */
+  P.stopAllMedia = function () {
+    this.media.publish = false;
+    this.media.subscribe = false;
+    if (this.packer) this.packer.active = false;
+    if (this.adapter) {
+      if (this.side === 'guest') this.adapter.unpublish();
+      else this.adapter.setSubscribe(false);
+    }
+    if (this.unpacker) this.unpacker.detach();
+    this.remoteVideo = false;
+    this.core.reset();
+  };
+
+  /** 离开 vendor 房间（同 vid 之后可再入房）。 */
+  P.leaveRoom = function () {
+    this.peerPresent = false;
+    this.vendorState = 'left';
+    if (this.adapter) this.adapter.leave();
+  };
+
+  P.onStop = function () {
+    var self = this;
+    this.stopped = true;
+    this.stopAllMedia();
+    var leaving = this.adapter ? this.adapter.leave() : Promise.resolve();
+    leaving.then(function () {
+      self.vendorState = 'left';
+      self.peerPresent = false;
+      self.reportState({});
+      self.link.close();
+      self.teardown();
+    });
+  };
+
+  P.onTerminal = function (code) {
+    this.stopped = true;
+    this.teardown();
+    this.post({ t: 'closed', code: typeof code === 'number' ? code : 0 });
+  };
+
+  P.teardown = function () {
+    if (this.statsTimer) clearInterval(this.statsTimer);
+    this.statsTimer = null;
+    if (this.hiddenTimer) clearTimeout(this.hiddenTimer);
+    this.hiddenTimer = null;
+    if (this.packer && this.packer.track) {
+      try {
+        this.packer.track.stop();
+      } catch (_) {
+        // 已结束
+      }
+    }
+    if (this.adapter) this.adapter.destroy();
+  };
+
+  // ── 父页消息 ──────────────────────────────────────────────────────────
+
+  P.onParentCrop = function (data) {
+    var fps = data && data.fps;
+    if (!(fps === 15 || fps === 30) || fps === this.captureFps) return;
+    this.captureFps = fps;
+    if (this.ladder) this.ladder.targetFps = fps;
+    if (this.media.publish && this.adapter && this.packer) {
+      var self = this;
+      this.adapter.updateProfile(this.profile()).catch(function (err) {
+        self.log('warn', 'updateProfile failed', String(err && err.code));
+      });
+    }
+  };
+
+  P.onParentHidden = function (on) {
+    var next = !!on;
+    if (next === this.hidden) return;
+    this.hidden = next;
+    this.scheduleHiddenReport();
+  };
+
+  /** 可见性变化经 state{hidden} 上报（≤1 Hz）；只在房里时报，不在房里时随下一次状态带上。 */
+  P.scheduleHiddenReport = function () {
+    if (this.hiddenTimer) return;
+    var self = this;
+    var wait = Math.max(0, HIDDEN_REPORT_MIN_MS - (this.now() - this.hiddenReportedAt));
+    this.hiddenTimer = setTimeout(function () {
+      self.hiddenTimer = null;
+      if (!self.stopped && IN_ROOM[self.vendorState]) self.reportState({});
+    }, wait);
+  };
+
+  P.onParentPlace = function (data) {
+    if (this.unpacker && data.width > 0 && data.height > 0) this.unpacker.setCssSize(data.width, data.height);
+  };
+
+  P.onParentVisitState = function (phase) {
+    if (phase !== 'ended' || this.stopped) return;
+    // 保险：正常由后端 stop 驱动
+    this.onStop({ reason: 'ended' });
+  };
+
+  // ── 5 s 统计 ──────────────────────────────────────────────────────────
+
+  P.collectStats = function () {
+    var now = this.now();
+    var self = this;
+    var base = this.adapter ? this.adapter.stats() : {};
+    var out = { type: 'stats', dc_queue: this.core.queueLength() };
+    ['enc_fps', 'tx_kbps', 'tx_w', 'tx_h', 'rx_kbps', 'rtt_ms', 'loss_pct'].forEach(function (k) {
+      if (typeof base[k] === 'number' && isFinite(base[k])) out[k] = base[k];
+    });
+    if (this.packer) {
+      var frames = this.packer.requestFrames;
+      if (this.statsMark && now > this.statsMark.at) out.tx_fps = (frames - this.statsMark.frames) * 1000 / (now - this.statsMark.at);
+      this.statsMark = { at: now, frames: frames };
+      if (typeof out.enc_fps !== 'number' && typeof out.tx_fps === 'number') out.enc_fps = out.tx_fps;
+      if (this.creds && this.creds.publish && this.creds.publish.codec) out.enc = this.creds.publish.codec;
+    }
+    if (this.unpacker) {
+      var rx = this.unpacker.stats(now);
+      for (var k in rx) out[k] = rx[k];
+    }
+    var finish = function (extra) {
+      if (extra) {
+        ['enc_fps', 'tx_w', 'tx_h'].forEach(function (key) {
+          if (typeof extra[key] === 'number' && isFinite(extra[key])) out[key] = extra[key];
+        });
+        if (typeof extra.qlr === 'string') out.qlr = extra.qlr;
+      }
+      self.checkSoftenc(out, now);
+      self.stepLadder(now);
+      self.sendBackend(out);
+      self.post({ t: 'stats', fps: finiteOr(out.tx_fps, finiteOr(out.rx_fps, 0)), kbps: Math.round(finiteOr(out.tx_kbps, finiteOr(out.rx_kbps, 0))), rtt_ms: Math.round(finiteOr(out.rtt_ms, 0)), hidden: self.hidden });
+    };
+    if (this.adapter && typeof this.adapter.senderStats === 'function' && this.media.publish) {
+      this.adapter.senderStats().then(finish, function () { finish(null); });
+    } else {
+      finish(null);
+    }
+  };
+
+  /** VP9 软编跟不上：编码帧率持续 10 s 低于目标的 90 %（兼容模式按 15 fps 算）→ 下次串门用 vp8。 */
+  P.checkSoftenc = function (out, now) {
+    var codec = this.creds && this.creds.publish && this.creds.publish.codec;
+    if (!this.media.publish || codec !== 'vp9' || typeof out.enc_fps !== 'number') {
+      this.softencSince = null;
+      return;
+    }
+    if (out.enc_fps < this.captureFps * SOFTENC_FPS_RATIO) {
+      if (this.softencSince === null) this.softencSince = now;
+      if (now - this.softencSince >= SOFTENC_WINDOW_MS) out.softenc_overloaded = true;
+    } else {
+      this.softencSince = null;
+    }
+  };
+
+  P.stepLadder = function (now) {
+    if (!this.ladder || !this.media.publish) return;
+    var rxFps = this.peerRxFps && now - this.peerRxFps.at <= PEER_STATS_FRESH_MS ? this.peerRxFps.value : undefined;
+    var level = this.ladder.feed({ nowMs: now, rxFps: rxFps, lossPct: this.lossPct === null ? undefined : this.lossPct });
+    if (level !== null) this.setGeometry(this.media.crop, level);
+  };
+
+  P.startStats = function () {
+    var self = this;
+    this.statsTimer = setInterval(function () {
+      if (!self.stopped && IN_ROOM[self.vendorState]) self.collectStats();
+    }, STATS_INTERVAL_MS);
+  };
+
+  // ── 页面启动 ──────────────────────────────────────────────────────────
+
+  function boot(win) {
+    var params = new URLSearchParams(win.location.search);
+    var side = params.get('side');
+    var visitId = params.get('visit_id');
+    var sink = NVT.frameSink;
+    if ((side !== 'host' && side !== 'guest') || !VISIT_ID_RE.test(visitId || '')) {
+      sink.log('error', 'bad transport page query', 'bad_query');
+      return null;
+    }
+    var controller = new VisitTransportController({
+      window: win,
+      document: win.document,
+      side: side,
+      visitId: visitId,
+      assetVersion: params.get('v') || '',
+      post: sink.postToParent,
+      log: sink.log,
+      video: win.document.getElementById('visit-video'),
+      canvas: win.document.getElementById('visit-canvas'),
+    });
+    NVT.controller = controller;
+    sink.onParentMessage('crop', function (d) { controller.onParentCrop(d); });
+    sink.onParentMessage('place', function (d) { controller.onParentPlace(d); });
+    sink.onParentMessage('hidden', function (d) { controller.onParentHidden(d.on); });
+    sink.onParentMessage('visit_state', function (d) { controller.onParentVisitState(d.phase); });
+    controller.startStats();
+    sink.postToParent({ t: 'ready', v: 1, side: side, visit_id: visitId });
+    return controller;
+  }
+
+  NVT.loader = {
+    runPreflight: runPreflight,
+    queryIsClean: queryIsClean,
+    SDK_INTEGRITY: SDK_INTEGRITY,
+    VisitTransportController: VisitTransportController,
+    boot: boot,
+  };
+
+  if (root.document && root.document.getElementById && root.document.getElementById('visit-transport-root')) {
+    boot(root);
+  }
+})(typeof window !== 'undefined' ? window : globalThis);

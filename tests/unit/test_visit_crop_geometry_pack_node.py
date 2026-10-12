@@ -1,0 +1,82 @@
+"""Packing geometry of the transport page follows the framing, never hard-coded sizes."""
+
+from __future__ import annotations
+
+from config.visit_settings import VISIT_CONGESTION_LADDER, VISIT_TIERS
+from tests.visit_js_harness import run_visit_js
+
+
+def test_dims_and_profile_for_both_framings():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const P = ctx.NekoVisitTransport.pack;
+        const upper = P.packDims('upper', 0), full = P.packDims('full', 0);
+        return { upper, full, pu: P.profileFor(upper, 30), pf: P.profileFor(full, 15),
+                 geo: P.CROP_GEOMETRY, ladder: P.CONGESTION_LADDER,
+                 un1: P.unpackGeometry(320, 896), un2: P.unpackGeometry(256, 1120), un3: P.unpackGeometry(240, 672) };
+        """
+    )
+    assert (out["upper"]["cropW"], out["upper"]["cropH"], out["upper"]["packW"], out["upper"]["packH"]) == (320, 448, 320, 896)
+    assert (out["full"]["cropW"], out["full"]["cropH"], out["full"]["packW"], out["full"]["packH"]) == (256, 560, 256, 1120)
+    assert out["pu"] == {"width": 320, "height": 896, "frameRate": 30, "bitrate": 560}
+    assert out["pf"] == {"width": 256, "height": 1120, "frameRate": 15, "bitrate": 560}
+    sd = VISIT_TIERS["sd600"]
+    assert (out["geo"]["upper"]["w"], out["geo"]["upper"]["h"]) == sd["crop_upper"]
+    assert (out["geo"]["full"]["w"], out["geo"]["full"]["h"]) == sd["crop_full"]
+    assert {k: [tuple(s) for s in v] for k, v in out["ladder"].items()} == {k: list(v) for k, v in VISIT_CONGESTION_LADDER.items()}
+    assert out["un1"]["splitY"] == 448 and abs(out["un1"]["aspect"] - 320 / 448) < 1e-9
+    assert out["un2"]["splitY"] == 560 and abs(out["un2"]["aspect"] - 256 / 560) < 1e-9
+    # libwebrtc 自行降分辨率后照样按 videoHeight/2 推导
+    assert out["un3"]["splitY"] == 336
+
+
+def test_switching_framing_resizes_the_same_canvas_and_keeps_the_track():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        const pack = h.c.packer.pack, track = h.c.packer.track;
+        const src = h.ctx.document.createElement('canvas');
+        const frames = [];
+        const feed = () => { h.c.packer.onFrame(src, { x: 0, y: 0, w: 100, h: 100 }); frames.push(track.frames); };
+        feed();
+        const sizes = [[pack.width, pack.height]];
+        for (const crop of ['full', 'upper']) {
+          h.ws.serverSend({ type: 'media', publish: true, crop, ladder: 0 });
+          await settle();
+          feed();
+          sizes.push([pack.width, pack.height]);
+        }
+        return { sameCanvas: h.c.packer.pack === pack, sameTrack: h.c.packer.track === track, streams: pack.streams,
+                 sizes, frames, updates: h.log.filter((e) => e[0] === 'updateLocalVideo').map((e) => e[1]),
+                 starts: h.log.filter((e) => e[0] === 'startLocalVideo').length,
+                 geometry: h.posted.filter((m) => m.t === 'geometry').map((m) => m.crop) };
+        """
+    )
+    assert out["sameCanvas"] and out["sameTrack"] and out["streams"] == 1
+    assert out["sizes"] == [[320, 896], [256, 1120], [320, 896]]
+    assert out["frames"] == [1, 2, 3]
+    assert [(u["width"], u["height"]) for u in out["updates"]] == [(256, 1120), (320, 896)]
+    assert out["starts"] == 1
+    assert out["geometry"][-2:] == ["full", "upper"]
+
+
+def test_packer_only_draws_while_publishing():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        const src = h.ctx.document.createElement('canvas');
+        const before = h.c.packer.onFrame(src, { x: 0, y: 0, w: 10, h: 10 });
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        const after = h.c.packer.onFrame(src, { x: 0, y: 0, w: 10, h: 10 });
+        const ops = h.c.packer.sctx.calls.map((c) => c[0]);
+        return { before, after, ops, mode: h.c.packer.sctx.globalCompositeOperation };
+        """
+    )
+    assert out["before"] is False and out["after"] is True
+    assert out["ops"] == ["clearRect", "fillRect", "drawImage"]
+    assert out["mode"] == "source-over"

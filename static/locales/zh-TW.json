@@ -6514,5 +6514,9 @@
             "chat": "膠囊聊天框",
             "floating": "角色旁邊的按鈕"
         }
+    },
+    "visitFrame": {
+        "peerAway": "離開了一下",
+        "visitingAway": "串門中"
     }
 }

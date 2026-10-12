@@ -1,0 +1,797 @@
+/*
+ * 串门父页桥接（设计稿 §3.3 / §3.4 / §4.4，PR-11）。只在 index.html（Pet 窗 / 网页单窗口）加载。
+ *
+ * - 懒建同源传输 iframe：visit_state_change{pending} 建、ended 移除，同一时刻最多一个。
+ *   host 侧 iframe 就是访客图层：position:fixed; z-index:9（低于 z-index:10 的 #live2d-container）;
+ *   pointer-events:none——命中测试永远落在本家画布上，Pet 窗穿透不变（T3 实测：只靠
+ *   transparent-overlay 类会让直通模式整窗可点）。guest 侧 1×1 放在视口外，只当传输。
+ * - 同任务取帧：Live2D 在 renderer 的 postrender 里、VRM / MMD 在 render 之后（各一行钩子）、
+ *   PNGTuber 用 nekoFramePacing.requestPacedFrame 30 Hz 采样，同步调 iframe 的
+ *   __nekoVisitFrameSink.onFrame——不能走 postMessage（异步任务里后备缓冲已被合成清空）。
+ * - 分数累加器把任意源帧率抽成目标帧率：直通 30 fps、兼容模式（--disable-gpu-compositing，
+ *   WebGL 源快照回读每帧约 8 ms）15 fps。
+ * - 可见性 = 帧饥饿检测：>1 s 没有成功的 onFrame 就告诉 iframe hidden，不看页面可见性事件。
+ * 本文件没有每帧循环、不自起动画帧、不建 WebSocket。
+ */
+(function (root) {
+  'use strict';
+
+  var CAPTURE_FPS_DIRECT = 30;          // VISIT_CAPTURE_FPS
+  var CAPTURE_FPS_COMPAT = 15;          // 兼容模式取帧帧率（owner 拍板）
+  var TICK_MS = 300;                    // 摆位 / 裁剪刷新节拍
+  var CROP_REFRESH_MS = 600;            // VISIT_CROP_REFRESH_MS 区间内
+  var STARVATION_MS = 1000;             // VISIT_FRAME_STARVATION_S
+  var READY_TIMEOUT_MS = 15000;
+  var PEER_AWAY_OPACITY = '0.6';
+  var CROP_ASPECT = { upper: 320 / 448, full: 256 / 560 };   // 与传输页 CROP_GEOMETRY 同一构图
+  var HOST_FRAME_STYLE = 'position:fixed;z-index:9;border:0;background:transparent;pointer-events:none;' +
+    'left:0;top:0;width:1px;height:1px;';
+  var GUEST_FRAME_STYLE = 'position:fixed;z-index:9;border:0;background:transparent;pointer-events:none;' +
+    'left:-10px;top:-10px;width:1px;height:1px;';
+  var MODEL_CONTAINER_IDS = ['live2d-container', 'vrm-container', 'mmd-container', 'pngtuber-container'];
+  var ACTIVE_PHASES = { active: 1, wrap_up: 1 };
+  var VISIT_ID_RE = /^[A-Za-z0-9_-]{22}$/;
+
+  /**
+   * 分数累加器（纯函数）：acc += target / renderFps；acc ≥ 1 时抓一帧并减 1；
+   * 减完仍 ≥ 1（源帧率低于目标）就把多余额度清零，免得帧率恢复时突发连抓。
+   * renderFps 取相邻两次渲染的时间跨度；第一帧用显示器刷新率作初值（冷启动第一秒不多抓）。
+   */
+  function createSampler(opts) {
+    var target = (opts && opts.targetFps) || CAPTURE_FPS_DIRECT;
+    var initialHz = (opts && opts.initialHz) || 60;
+    var acc = 0;
+    var last = null;
+    return {
+      onRender: function (nowMs) {
+        var fps;
+        if (last === null || !(nowMs > last)) fps = initialHz;
+        else fps = 1000 / (nowMs - last);
+        last = nowMs;
+        if (!(fps > 0) || !isFinite(fps)) return false;
+        acc += target / fps;
+        if (acc >= 1) {
+          acc -= 1;
+          if (acc >= 1) acc = 0;
+          return true;
+        }
+        return false;
+      },
+      setTarget: function (fps) {
+        target = fps;
+      },
+      setInitialHz: function (hz) {
+        if (hz > 0) initialHz = hz;
+      },
+      reset: function () {
+        acc = 0;
+        last = null;
+      },
+      target: function () {
+        return target;
+      },
+    };
+  }
+
+  function createParentBridge(env) {
+    var win = env.window;
+    var doc = env.document || win.document;
+    var now = env.now || function () { return win.performance.now(); };
+    var setIntervalFn = env.setInterval || function (fn, ms) { return win.setInterval(fn, ms); };
+    var clearIntervalFn = env.clearInterval || function (h) { win.clearInterval(h); };
+    var setTimeoutFn = env.setTimeout || function (fn, ms) { return win.setTimeout(fn, ms); };
+    var clearTimeoutFn = env.clearTimeout || function (h) { win.clearTimeout(h); };
+    var geo = env.geometry || win.NekoVisitCropGeometry;
+    var assetVersion = env.assetVersion || '';
+
+    var state = {
+      frame: null,
+      side: null,
+      visitId: null,
+      phase: null,
+      sink: null,
+      ready: false,
+      readyTimer: null,
+      tickTimer: null,
+      lastCropAt: -Infinity,
+      cropMode: 'upper',
+      cropAspect: CROP_ASPECT.upper,
+      peerCrop: 'upper',
+      peerHidden: false,
+      rect: null,               // 当前裁剪框（CSS 视口坐标）
+      rectFrom: null,
+      rectAt: 0,
+      lastOkAt: null,
+      hiddenSent: false,
+      suspended: false,
+      savedFps: null,
+      captureFps: CAPTURE_FPS_DIRECT,
+      sampler: createSampler({ targetFps: CAPTURE_FPS_DIRECT }),
+      hookedRenderer: null,
+      pngCancel: null,
+      place: null,
+      awayBadge: null,
+      peerBadge: null,
+      firstFrame: null,
+      stats: null,
+      portraitWrapped: false,
+    };
+
+    function isCompatMode() {
+      var rt = win.__NEKO_DESKTOP_RUNTIME__;
+      return !!(rt && rt.compatibilityMode === true);
+    }
+
+    function t(key, fallback) {
+      try {
+        if (typeof win.t === 'function') {
+          var s = win.t(key);
+          if (typeof s === 'string' && s && s !== key) return s;
+        }
+      } catch (_) {
+        // i18n 未就绪
+      }
+      return fallback;
+    }
+
+    function modelType() {
+      var portrait = win.avatarPortrait;
+      if (portrait && typeof portrait.normalizeModelType === 'function') return portrait.normalizeModelType();
+      return 'live2d';
+    }
+
+    function activeManager(type) {
+      if (type === 'vrm') return win.vrmManager || null;
+      if (type === 'mmd') return win.mmdManager || null;
+      if (type === 'pngtuber') return win.pngtuberManager || null;
+      return win.live2dManager || null;
+    }
+
+    function pngtuberDrawable() {
+      var m = win.pngtuberManager;
+      if (m && m.image && (m.image.naturalWidth || m.image.width)) return m.image;
+      var c = doc.getElementById('pngtuber-container');
+      return c ? c.querySelector('canvas.pngtuber-layered-canvas, img.pngtuber-image') : null;
+    }
+
+    /** 当前模型的取帧源（只能是四个模型容器里的画布 / 图片）。 */
+    function captureSource(type) {
+      if (type === 'live2d') {
+        var lm = win.live2dManager;
+        return lm && lm.pixi_app && lm.pixi_app.renderer ? lm.pixi_app.renderer.view : null;
+      }
+      if (type === 'vrm' || type === 'mmd') {
+        var m = activeManager(type);
+        return m && m.renderer ? m.renderer.domElement : null;
+      }
+      return pngtuberDrawable();
+    }
+
+    function modelBounds(type) {
+      if (type === 'pngtuber') {
+        var d = pngtuberDrawable();
+        if (!d || typeof d.getBoundingClientRect !== 'function') return null;
+        var r = d.getBoundingClientRect();
+        return r && r.width > 0 && r.height > 0 ? { x: r.left, y: r.top, width: r.width, height: r.height } : null;
+      }
+      var m = activeManager(type);
+      if (!m || typeof m.getModelScreenBounds !== 'function') return null;
+      try {
+        // 包围盒可能一半挂在屏幕外（T1~T5 实测）：只用视口内可见部分构框
+        return geo.intersectRect(m.getModelScreenBounds(), { x: 0, y: 0, width: win.innerWidth || 0, height: win.innerHeight || 0 });
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function sourceMetrics(source, type) {
+      if (!source) return null;
+      if (type === 'pngtuber') {
+        // 图片源：裁剪坐标换算到图片自身像素
+        var rect = source.getBoundingClientRect();
+        var pw = source.naturalWidth || source.width;
+        var ph = source.naturalHeight || source.height;
+        if (!(rect.width > 0 && rect.height > 0 && pw > 0 && ph > 0)) return null;
+        return { originX: rect.left, originY: rect.top, pixelRatioX: pw / rect.width, pixelRatioY: ph / rect.height, srcW: pw, srcH: ph };
+      }
+      var r = source.getBoundingClientRect();
+      var cssW = r.width || source.clientWidth || source.width || 1;
+      var cssH = r.height || source.clientHeight || source.height || 1;
+      return {
+        originX: r.left || 0,
+        originY: r.top || 0,
+        pixelRatioX: (source.width || cssW) / cssW,
+        pixelRatioY: (source.height || cssH) / cssH,
+        srcW: source.width,
+        srcH: source.height,
+      };
+    }
+
+    function containerHidden(type) {
+      var id = type === 'pngtuber' ? 'pngtuber-container' : type === 'vrm' ? 'vrm-container' : type === 'mmd' ? 'mmd-container' : 'live2d-container';
+      var el = doc.getElementById(id);
+      if (!el || typeof win.getComputedStyle !== 'function') return false;
+      var cs = win.getComputedStyle(el);
+      if (cs.visibility === 'hidden' || cs.display === 'none') return true;
+      var canvas = type === 'live2d' ? doc.getElementById('live2d-canvas') : null;
+      return !!(canvas && win.getComputedStyle(canvas).visibility === 'hidden');
+    }
+
+    // ── iframe ─────────────────────────────────────────────────────────
+
+    function post(msg) {
+      var f = state.frame;
+      if (!f || !f.contentWindow) return;
+      try {
+        f.contentWindow.postMessage(msg, win.location.origin);
+      } catch (_) {
+        // iframe 正在卸载
+      }
+    }
+
+    function ensureFrame(side, visitId) {
+      if (side !== 'host' && side !== 'guest') return;
+      if (!VISIT_ID_RE.test(visitId || '')) return;
+      if (state.frame && state.visitId === visitId && state.side === side) return;
+      removeFrame();
+      var f = doc.createElement('iframe');
+      f.id = 'visit-frame';
+      f.className = 'transparent-overlay';
+      f.setAttribute('aria-hidden', 'true');
+      f.setAttribute('tabindex', '-1');
+      f.setAttribute('allowtransparency', 'true');
+      f.style.cssText = side === 'host' ? HOST_FRAME_STYLE : GUEST_FRAME_STYLE;
+      f.src = '/visit/transport?v=' + encodeURIComponent(assetVersion) + '&side=' + side + '&visit_id=' + encodeURIComponent(visitId);
+      state.frame = f;
+      state.side = side;
+      state.visitId = visitId;
+      state.ready = false;
+      state.sink = null;
+      state.place = null;
+      state.firstFrame = null;
+      state.captureFps = isCompatMode() ? CAPTURE_FPS_COMPAT : CAPTURE_FPS_DIRECT;
+      state.sampler.setTarget(state.captureFps);
+      state.sampler.reset();
+      doc.body.appendChild(f);
+      state.readyTimer = setTimeoutFn(function () {
+        state.readyTimer = null;
+        if (state.frame === f && !state.ready) logFrame('warn', 'transport iframe never became ready');
+      }, READY_TIMEOUT_MS);
+      startTick();
+    }
+
+    function removeFrame() {
+      stopCapture();
+      stopTick();
+      if (state.readyTimer !== null) clearTimeoutFn(state.readyTimer);
+      state.readyTimer = null;
+      if (state.frame) {
+        try {
+          state.frame.remove();
+        } catch (_) {
+          // 已移除
+        }
+      }
+      state.frame = null;
+      state.sink = null;
+      state.ready = false;
+      state.side = null;
+      state.visitId = null;
+      state.rect = null;
+      state.rectFrom = null;
+      state.hiddenSent = false;
+      state.lastOkAt = null;
+      setPeerHidden(false);
+      removePeerBadge();
+      setAway(false);
+    }
+
+    function logFrame(level, msg) {
+      var c = win.console;
+      if (!c) return;
+      var fn = level === 'error' ? c.error : level === 'warn' ? c.warn : c.log;
+      try {
+        fn.call(c, '[visit-frame] ' + msg);
+      } catch (_) {
+        // console 不可用
+      }
+    }
+
+    function getToken() {
+      if (typeof env.getToken === 'function') return env.getToken();
+      var sec = win.nekoLocalMutationSecurity;
+      if (!sec || typeof sec.getMutationHeaders !== 'function') return Promise.resolve('');
+      return sec.getMutationHeaders().then(function (h) { return (h && h['X-CSRF-Token']) || ''; });
+    }
+
+    function onFrameMessage(event) {
+      var f = state.frame;
+      if (!f || event.source !== f.contentWindow || event.origin !== win.location.origin) return;
+      var data = event.data;
+      if (!data || typeof data !== 'object' || typeof data.t !== 'string') return;
+      if (data.t === 'ready') {
+        if (data.visit_id !== state.visitId || data.side !== state.side) return;
+        var sink = f.contentWindow && f.contentWindow.__nekoVisitFrameSink;
+        if (!sink || typeof sink.setAuthToken !== 'function') return;
+        getToken().then(function (token) {
+          if (state.frame !== f || !token) return;
+          // 先同步交 token，iframe 拿到 token 才连传输 WS（首帧 auth）
+          sink.setAuthToken(token);
+          state.sink = sink;
+          state.ready = true;
+          // 就绪前发出的 place / crop 落在 iframe 的监听器装好之前、已经丢了：清缓存让下一拍重发
+          state.place = null;
+          state.rect = null;
+          state.rectFrom = null;
+          state.lastCropAt = -Infinity;
+          if (state.phase) post({ t: 'visit_state', phase: state.phase });
+          syncCapture();
+          tick(true);
+        });
+      } else if (data.t === 'geometry') {
+        if (data.crop === 'upper' || data.crop === 'full') state.cropMode = data.crop;
+        if (data.cropW > 0 && data.cropH > 0) state.cropAspect = data.cropW / data.cropH;
+        state.rect = null;
+        state.lastCropAt = -Infinity;
+      } else if (data.t === 'first_frame') {
+        if (typeof data.dataURL === 'string' && data.dataURL.indexOf('data:image/png;base64,') === 0) {
+          state.firstFrame = data.dataURL;
+          dispatch('neko-visit-first-frame', { visitId: state.visitId, dataURL: data.dataURL });
+        }
+      } else if (data.t === 'stats') {
+        state.stats = { fps: data.fps, kbps: data.kbps, rtt_ms: data.rtt_ms, hidden: data.hidden };
+      } else if (data.t === 'log') {
+        logFrame(data.level, String(data.msg || '').slice(0, 500) + (data.code ? ' (' + data.code + ')' : ''));
+      } else if (data.t === 'closed') {
+        // 传输页进入终态（4403 / 4404 / 4409 / 重连超时）：它已离房，移除
+        removeFrame();
+      }
+    }
+
+    function dispatch(name, detail) {
+      try {
+        win.dispatchEvent(new win.CustomEvent(name, { detail: detail }));
+      } catch (_) {
+        // 老环境没有 CustomEvent
+      }
+    }
+
+    // ── 取帧 ───────────────────────────────────────────────────────────
+
+    function captureWanted() {
+      return state.side === 'guest' && state.ready && !!state.sink && !!ACTIVE_PHASES[state.phase];
+    }
+
+    function syncCapture() {
+      if (captureWanted()) startCapture();
+      else stopCapture();
+    }
+
+    function startCapture() {
+      var lm = win.live2dManager;
+      if (lm) lm._visitCaptureActive = true;
+      // 只在 0 < 目标帧率 < 取帧帧率时临时拉到取帧帧率；结束时恢复
+      var target = win.targetFrameRate;
+      if (state.savedFps === null && typeof target === 'number' && target > 0 && target < state.captureFps &&
+          lm && typeof lm.setTargetFPS === 'function') {
+        state.savedFps = target;
+        lm.setTargetFPS(state.captureFps);
+      }
+      wrapPortrait();
+      if (state.lastOkAt === null) {
+        state.lastOkAt = now();
+        // 冷启动初值：定时器驱动时取定时器帧率，否则取显示器刷新率
+        var pacing = win.nekoFramePacing;
+        var hz = pacing && ((typeof pacing.activeTimerTickFps === 'function' && pacing.activeTimerTickFps()) ||
+          (typeof pacing.getDisplayRefreshHz === 'function' && pacing.getDisplayRefreshHz()));
+        state.sampler.reset();
+        if (hz > 0) state.sampler.setInitialHz(hz);
+      }
+      hookRenderer();
+      ensurePngLoop();
+    }
+
+    function stopCapture() {
+      var lm = win.live2dManager;
+      if (lm) lm._visitCaptureActive = false;
+      if (state.savedFps !== null) {
+        var saved = state.savedFps;
+        state.savedFps = null;
+        if (lm && typeof lm.setTargetFPS === 'function') lm.setTargetFPS(saved);
+      }
+      unhookRenderer();
+      if (state.pngCancel) state.pngCancel();
+      state.pngCancel = null;
+      state.lastOkAt = null;
+      if (state.hiddenSent) {
+        state.hiddenSent = false;
+        post({ t: 'hidden', on: false, cause: 'frame_starvation' });
+      }
+    }
+
+    function onPostrender() {
+      var lm = win.live2dManager;
+      var app = lm && lm.pixi_app;
+      var renderer = app && app.renderer;
+      if (!renderer) return;
+      // avatar-portrait 的临时舞台与 generateTexture 也会触发 postrender：两道守卫
+      if (renderer.renderTexture && renderer.renderTexture.current) return;
+      if (renderer.lastObjectRendered !== app.stage) return;
+      if (modelType() !== 'live2d') return;
+      captureFrom('live2d');
+    }
+
+    function hookRenderer() {
+      var lm = win.live2dManager;
+      var renderer = lm && lm.pixi_app && lm.pixi_app.renderer;
+      if (renderer === state.hookedRenderer) return;
+      unhookRenderer();
+      if (renderer && typeof renderer.on === 'function') {
+        renderer.on('postrender', onPostrender);
+        state.hookedRenderer = renderer;
+      }
+    }
+
+    function unhookRenderer() {
+      var r = state.hookedRenderer;
+      state.hookedRenderer = null;
+      if (r && typeof r.off === 'function') r.off('postrender', onPostrender);
+    }
+
+    function ensurePngLoop() {
+      if (state.pngCancel || modelType() !== 'pngtuber') return;
+      var pacing = win.nekoFramePacing;
+      if (!pacing || typeof pacing.requestPacedFrame !== 'function') return;
+      var loop = function () {
+        state.pngCancel = null;
+        if (!captureWanted() || modelType() !== 'pngtuber') return;
+        captureFrom('pngtuber');
+        state.pngCancel = pacing.requestPacedFrame(loop);
+      };
+      state.pngCancel = pacing.requestPacedFrame(loop);
+    }
+
+    /** 包住头像导出：导出期间暂停取帧（守卫之外的第二道保险；avatar-portrait.js 不改）。 */
+    function wrapPortrait() {
+      if (state.portraitWrapped) return;
+      var api = win.avatarPortrait;
+      if (!api) return;
+      ['capture', 'captureToBlob', 'captureToDataURL'].forEach(function (name) {
+        var original = api[name];
+        if (typeof original !== 'function') return;
+        api[name] = function () {
+          bridge.suspendCapture(true);
+          var result;
+          try {
+            result = original.apply(this, arguments);
+          } catch (err) {
+            bridge.suspendCapture(false);
+            throw err;
+          }
+          return Promise.resolve(result).then(function (v) {
+            bridge.suspendCapture(false);
+            return v;
+          }, function (err) {
+            bridge.suspendCapture(false);
+            throw err;
+          });
+        };
+      });
+      state.portraitWrapped = true;
+    }
+
+    function currentRect(nowMs) {
+      if (!state.rect) return null;
+      if (!state.rectFrom) return state.rect;
+      var k = (nowMs - state.rectAt) / geo.HYSTERESIS.transitionMs;
+      if (k >= 1) {
+        state.rectFrom = null;
+        return state.rect;
+      }
+      return geo.lerpRect(state.rectFrom, state.rect, k);
+    }
+
+    function captureFrom(type) {
+      if (!captureWanted() || state.suspended) return false;
+      var nowMs = now();
+      if (!state.sampler.onRender(nowMs)) return false;
+      var source = captureSource(type);
+      var rectCss = currentRect(nowMs);
+      if (!source || !rectCss) return false;
+      var metrics = sourceMetrics(source, type);
+      var rectPx = metrics && geo.cssRectToPixelRect(rectCss, metrics);
+      if (!rectPx) return false;
+      var ok = false;
+      try {
+        ok = state.sink.onFrame(source, rectPx, nowMs) === true;
+      } catch (_) {
+        ok = false;
+      }
+      if (ok) {
+        state.lastOkAt = nowMs;
+        if (state.hiddenSent) {
+          state.hiddenSent = false;
+          post({ t: 'hidden', on: false, cause: 'frame_starvation' });
+        }
+      }
+      return ok;
+    }
+
+    // ── 节拍：裁剪框、摆位、帧饥饿 ─────────────────────────────────────
+
+    function refreshCrop(nowMs) {
+      var type = modelType();
+      var bounds = modelBounds(type);
+      if (!bounds || containerHidden(type)) {
+        // 包围盒为 null（edge-peek 收起 / 模型管理器覆盖）：视同 hidden，不再取帧
+        state.rect = null;
+        state.rectFrom = null;
+        return;
+      }
+      var aspect = state.cropAspect;
+      var next;
+      if (state.cropMode === 'full') {
+        next = geo.fullBodyRect(bounds, aspect);
+      } else {
+        var head = null;
+        var m = activeManager(type);
+        if (m && typeof m.getHeadDetectionGeometryInfo === 'function') {
+          try {
+            var info = m.getHeadDetectionGeometryInfo();
+            head = info && info.headRect;
+          } catch (_) {
+            head = null;
+          }
+        }
+        next = geo.upperBodyRect(geo.upperBodySubject(bounds, head), aspect, 0.32);
+      }
+      if (!next) return;
+      if (!geo.shouldMove(state.rect, next)) return;
+      state.rectFrom = state.rect ? currentRect(nowMs) : null;
+      state.rect = next;
+      state.rectAt = nowMs;
+      var source = captureSource(type);
+      var metrics = sourceMetrics(source, type);
+      var rectPx = metrics && geo.cssRectToPixelRect(next, metrics);
+      if (rectPx) post({ t: 'crop', rectPx: rectPx, srcW: metrics.srcW, srcH: metrics.srcH, mode: state.cropMode, fps: state.captureFps });
+    }
+
+    function placeHostFrame() {
+      var f = state.frame;
+      if (!f) return;
+      var type = modelType();
+      var b = modelBounds(type);
+      if (!b) return;
+      var vw = win.innerWidth || 0;
+      var vh = win.innerHeight || 0;
+      var h = Math.max(200, Math.min(900, b.height * 0.9));
+      var w = h * (CROP_ASPECT[state.peerCrop] || CROP_ASPECT.upper);
+      var spaceLeft = b.x;
+      var spaceRight = vw - (b.x + b.width);
+      var left = spaceRight >= spaceLeft
+        ? Math.min(vw - w, b.x + b.width)
+        : Math.max(0, b.x - w);
+      var top = Math.max(0, Math.min(vh - h, b.y + b.height - h));
+      var p = { left: Math.round(left), top: Math.round(top), width: Math.round(w), height: Math.round(h) };
+      var old = state.place;
+      if (old && old.left === p.left && old.top === p.top && old.width === p.width && old.height === p.height) return;
+      state.place = p;
+      f.style.left = p.left + 'px';
+      f.style.top = p.top + 'px';
+      f.style.width = p.width + 'px';
+      f.style.height = p.height + 'px';
+      if (state.peerBadge) positionBadge(state.peerBadge, p.left + p.width / 2, p.top);
+      post({ t: 'place', left: p.left, top: p.top, width: p.width, height: p.height });
+    }
+
+    function checkStarvation(nowMs) {
+      if (!captureWanted()) return;
+      var hidden = state.suspended || state.rect === null || state.lastOkAt === null || nowMs - state.lastOkAt > STARVATION_MS;
+      if (hidden && !state.hiddenSent) {
+        state.hiddenSent = true;
+        post({ t: 'hidden', on: true, cause: state.suspended ? 'forced' : 'frame_starvation' });
+      }
+    }
+
+    function tick(force) {
+      if (!state.frame) return;
+      var nowMs = now();
+      if (state.side === 'host') {
+        placeHostFrame();
+        return;
+      }
+      if (captureWanted()) {
+        hookRenderer();
+        ensurePngLoop();
+      }
+      if (force || nowMs - state.lastCropAt >= CROP_REFRESH_MS) {
+        state.lastCropAt = nowMs;
+        refreshCrop(nowMs);
+      }
+      checkStarvation(nowMs);
+      if (state.awayBadge) positionAwayBadge();
+    }
+
+    function startTick() {
+      if (state.tickTimer !== null) return;
+      state.tickTimer = setIntervalFn(function () { tick(false); }, TICK_MS);
+    }
+
+    function stopTick() {
+      if (state.tickTimer !== null) clearIntervalFn(state.tickTimer);
+      state.tickTimer = null;
+    }
+
+    // ── 徽标 ───────────────────────────────────────────────────────────
+
+    function makeBadge(id, text) {
+      var el = doc.getElementById(id);
+      if (!el) {
+        el = doc.createElement('div');
+        el.id = id;
+        el.className = 'visit-badge';
+        el.setAttribute('aria-live', 'polite');
+        doc.body.appendChild(el);
+      }
+      el.textContent = text;
+      return el;
+    }
+
+    function positionBadge(el, centerX, topY) {
+      el.style.left = Math.round(centerX) + 'px';
+      el.style.top = Math.max(0, Math.round(topY - 28)) + 'px';
+    }
+
+    function removePeerBadge() {
+      if (state.peerBadge) state.peerBadge.remove();
+      state.peerBadge = null;
+    }
+
+    function setPeerHidden(on) {
+      state.peerHidden = !!on;
+      if (state.frame && state.side === 'host') state.frame.style.opacity = on ? PEER_AWAY_OPACITY : '';
+      if (on && state.side === 'host' && state.frame) {
+        state.peerBadge = makeBadge('visit-peer-away-badge', t('visitFrame.peerAway', 'Stepped away'));
+        if (state.place) positionBadge(state.peerBadge, state.place.left + state.place.width / 2, state.place.top);
+      } else {
+        removePeerBadge();
+      }
+    }
+
+    function positionAwayBadge() {
+      var b = modelBounds(modelType());
+      if (b && state.awayBadge) positionBadge(state.awayBadge, b.x + b.width / 2, b.y);
+    }
+
+    /** A 侧：她出门了——模型容器 .visiting-away（半透明）+ 徽标；不用 .minimized（会断水印坐标链）。 */
+    function setAway(on) {
+      MODEL_CONTAINER_IDS.forEach(function (id) {
+        var el = doc.getElementById(id);
+        if (el && el.classList) el.classList.toggle('visiting-away', !!on);
+      });
+      if (on) {
+        state.awayBadge = makeBadge('visit-away-badge', t('visitFrame.visitingAway', 'Out visiting'));
+        positionAwayBadge();
+      } else if (state.awayBadge) {
+        state.awayBadge.remove();
+        state.awayBadge = null;
+      }
+    }
+
+    // ── visit_state_change ─────────────────────────────────────────────
+
+    var PHASE_OF_ACTION = {
+      pending: 'pending',
+      invite_ready: 'invite_ready',
+      joining: 'joining',
+      awaiting_accept: 'awaiting_accept',
+      started: 'active',
+      wrap_up: 'wrap_up',
+      ending: 'ending',
+      ended: 'ended',
+    };
+
+    function onStateChange(msg) {
+      if (!msg || msg.type !== 'visit_state_change') return;
+      var action = msg.action;
+      if (msg.peer_crop === 'upper' || msg.peer_crop === 'full') state.peerCrop = msg.peer_crop;
+      if (action === 'pending') {
+        ensureFrame(msg.side, msg.visit_id);
+      } else if (state.visitId && msg.visit_id && msg.visit_id !== state.visitId) {
+        return;
+      } else if (!state.frame && action !== 'ended' && PHASE_OF_ACTION[action] && msg.side && msg.visit_id) {
+        // 页面重载后没收到 pending：按在飞场次补建
+        ensureFrame(msg.side, msg.visit_id);
+      }
+      var phase = PHASE_OF_ACTION[action];
+      if (phase) {
+        state.phase = phase;
+        post({ t: 'visit_state', phase: phase });
+      }
+      if (action === 'departed') setAway(true);
+      else if (action === 'peer_hidden') setPeerHidden(true);
+      else if (action === 'peer_visible') setPeerHidden(false);
+      else if (action === 'peer_crop') state.place = null;
+      if (action === 'ended') {
+        removeFrame();
+        state.phase = null;
+        return;
+      }
+      syncCapture();
+      tick(true);
+    }
+
+    /** 页面重载后：GET /api/visit/state 得知在飞场次就重建 iframe（20 s 页面重载宽限内重入房）。 */
+    function recoverAfterReload(lanlanName) {
+      if (!lanlanName || typeof win.fetch !== 'function') return Promise.resolve(false);
+      return getToken().then(function (token) {
+        var headers = token ? { 'X-CSRF-Token': token } : {};
+        return win.fetch('/api/visit/state?catgirl=' + encodeURIComponent(lanlanName), { headers: headers, cache: 'no-store', credentials: 'same-origin' });
+      }).then(function (res) {
+        return res && res.ok ? res.json() : null;
+      }).then(function (snap) {
+        if (!snap || !snap.active || !snap.visit_id || !snap.side || snap.phase === 'ended' || snap.phase === 'ending') return false;
+        if (state.frame) return false;
+        var actionByPhase = { pending: 'pending', invite_ready: 'invite_ready', joining: 'joining', awaiting_accept: 'awaiting_accept', active: 'started', wrap_up: 'wrap_up' };
+        var action = actionByPhase[snap.phase];
+        if (!action) return false;
+        ensureFrame(snap.side, snap.visit_id);
+        state.phase = snap.phase;
+        var room = snap.room || {};
+        if (room.peer_crop === 'upper' || room.peer_crop === 'full') state.peerCrop = room.peer_crop;
+        if (snap.side === 'guest' && ACTIVE_PHASES[snap.phase]) setAway(true);
+        if (snap.peer && snap.peer.hidden) setPeerHidden(true);
+        return true;
+      }).catch(function () {
+        return false;
+      });
+    }
+
+    var bridge = {
+      onStateChange: onStateChange,
+      /** VRM / MMD 在 render 之后调用（同一任务）。 */
+      onExternalRender: function () {
+        if (!captureWanted()) return;
+        var type = modelType();
+        if (type === 'vrm' || type === 'mmd') captureFrom(type);
+      },
+      suspendCapture: function (on) {
+        state.suspended = !!on;
+        if (state.sink && typeof state.sink.suspend === 'function') state.sink.suspend(state.suspended);
+      },
+      recoverAfterReload: recoverAfterReload,
+      firstFrameDataURL: function () { return state.firstFrame; },
+      _state: state,
+      _tick: tick,
+      _onFrameMessage: onFrameMessage,
+    };
+
+    win.addEventListener('message', onFrameMessage);
+    return bridge;
+  }
+
+  function assetVersionFromScript(doc) {
+    var s = doc && doc.currentScript;
+    var src = s && s.src;
+    if (!src) return '';
+    try {
+      return new URL(src).searchParams.get('v') || '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  root.NekoVisitParentBridge = { createSampler: createSampler, createParentBridge: createParentBridge };
+
+  if (root.document && root.addEventListener && !root.nekoVisitParentBridge) {
+    var bridge = createParentBridge({ window: root, document: root.document, assetVersion: assetVersionFromScript(root.document) });
+    root.nekoVisitParentBridge = bridge;
+    var ready = root.pageConfigReady;
+    var startRecover = function () {
+      var cfg = root.lanlan_config;
+      bridge.recoverAfterReload(cfg && cfg.lanlan_name);
+    };
+    if (ready && typeof ready.then === 'function') ready.then(startRecover, function () {});
+    else root.addEventListener('load', startRecover);
+  }
+})(typeof window !== 'undefined' ? window : globalThis);

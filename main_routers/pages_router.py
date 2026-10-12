@@ -499,6 +499,16 @@ async def get_chat_page(request: Request):
     })
 
 
+@router.get("/visit/transport", response_class=HTMLResponse)
+async def get_visit_transport_page(request: Request):
+    """Same-origin transport iframe of a visit (vendor SDK, frame packing, peer layer)."""
+    templates = get_templates()
+    return templates.TemplateResponse(request, "templates/visit_transport.html", {
+        "request": request,
+        **_static_assets_ctx(),
+    })
+
+
 @router.get("/chat_full", response_class=HTMLResponse)
 async def get_chat_full_page(request: Request):
     """Web-only full chat window page."""

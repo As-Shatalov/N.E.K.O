@@ -12,6 +12,8 @@
 | `results/{direct,compat}/results.json` | 2026-10-02 实测原始数据；截图及三联图仅保存在仓库外 |
 | `results/compat-2026-10-03/results.json` | 2026-10-03 兼容模式补测（T2 冷启动、T3 不透明像素命中，含屏幕取色） |
 | `results/compat-2026-10-03-blankcheck/*.json` | 2026-10-03 T2 黑帧诊断重测（25 轮约 7700 帧，0 黑帧） |
+| `measure_bridge.mjs` | 实现后的复验：经 CDP 在 Pet 窗里用真正的 `static/visit/parent-bridge.js` 与传输页量取帧帧率、每帧打包耗时、空帧（不连后端、不入房） |
+| `results/bridge-2026-10-12/*.json` | 2026-10-12 复验：兼容模式 5 轮、直通模式 3 轮 |
 
 ## 步骤
 
@@ -22,3 +24,7 @@
 5. 测完删除 `static/_visit_probe/`。
 
 注意：T1 的正对照会让 Pet 主连接被 `PetWebSocket` 劫持，脚本随后会自动重载 Pet 与 Chat 窗。
+
+## 实现后的复验（`measure_bridge.mjs`）
+
+后端照常启动；壳直接 `node_modules/electron/dist/electron.exe . --remote-debugging-port=<端口>` 启动（直通模式同样用临时 `NEKO_USER_DATA_DIR`）；然后 `node measure_bridge.mjs <端口> <标签> [check]`。不需要拷任何探针文件进 `static/`。

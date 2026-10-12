@@ -1,0 +1,206 @@
+"""Parent bridge behaviour: visitor layer follows hb corrections, guest capture and starvation."""
+
+from __future__ import annotations
+
+from tests.visit_js_harness import BRIDGE_FILES, run_visit_js
+
+_BRIDGE_JS = r"""
+function makeBridge(opts) {
+  opts = opts || {};
+  const ctx = makeContext({ pathname: '/' });
+  ctx.targetFrameRate = opts.targetFrameRate === undefined ? 60 : opts.targetFrameRate;
+  if (opts.compat) ctx.__NEKO_DESKTOP_RUNTIME__ = { compatibilityMode: true };
+  const view = ctx.document.createElement('canvas');
+  view.width = 3840; view.height = 2160; view._rect = { left: 0, top: 0, width: 1920, height: 1080 };
+  const handlers = {};
+  const stage = { name: 'stage' };
+  const renderer = {
+    view, lastObjectRendered: stage, renderTexture: { current: null },
+    on(e, f) { handlers[e] = f; }, off(e) { delete handlers[e]; },
+  };
+  const fpsCalls = [];
+  ctx.live2dManager = {
+    pixi_app: { renderer, stage },
+    getModelScreenBounds: () => ({ left: 800, top: 100, right: 1200, bottom: 1000, width: 400, height: 900 }),
+    getHeadDetectionGeometryInfo: () => ({ headRect: { left: 950, top: 150, width: 100, height: 120 } }),
+    setTargetFPS(f) { fpsCalls.push(f); ctx.targetFrameRate = f; },
+  };
+  ctx.avatarPortrait = { normalizeModelType: () => 'live2d', capture: () => Promise.resolve('img') };
+  load(ctx, FILES);
+  const bridge = ctx.NekoVisitParentBridge.createParentBridge({ window: ctx, document: ctx.document, getToken: () => Promise.resolve('tok'), assetVersion: '9' });
+  const child = { posted: [], onFrames: [], token: null, suspended: [] };
+  child.postMessage = (m) => child.posted.push(JSON.parse(JSON.stringify(m)));
+  child.__nekoVisitFrameSink = {
+    onFrame: (src, rect, ts) => { child.onFrames.push({ src: src === view, rect, ts }); return true; },
+    suspend: (on) => child.suspended.push(on),
+    setAuthToken: (t) => { child.token = t; },
+  };
+  return { ctx, bridge, child, renderer, handlers, stage, fpsCalls };
+}
+function change(h, action, extra) {
+  h.bridge.onStateChange(Object.assign({ type: 'visit_state_change', action, side: h.side, visit_id: VISIT_ID }, extra || {}));
+}
+async function open(h, side) {
+  h.side = side;
+  change(h, 'pending');
+  const frame = h.ctx.document.getElementById('visit-frame');
+  frame.contentWindow = h.child;
+  h.bridge._onFrameMessage({ source: h.child, origin: h.ctx.location.origin, data: { t: 'ready', v: 1, side, visit_id: VISIT_ID } });
+  await settle();
+  h.frame = frame;
+  return frame;
+}
+"""
+
+
+def test_hb_corrected_peer_hidden_and_crop_reach_the_visitor_layer():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge();
+        const frame = await open(h, 'host');
+        change(h, 'started', { peer_crop: 'upper' });
+        await advance(600);
+        const upper = frame.style.width.replace('px', '') / frame.style.height.replace('px', '');
+        // 只有 hb 纠正推导出的两条，没有先前的 state
+        change(h, 'peer_hidden');
+        const dimmed = frame.style.opacity;
+        const badge = h.ctx.document.getElementById('visit-peer-away-badge');
+        change(h, 'peer_crop', { peer_crop: 'full' });
+        await advance(5000);
+        const full = frame.style.width.replace('px', '') / frame.style.height.replace('px', '');
+        change(h, 'peer_visible');
+        return { upper, full, opacity: dimmed === '0.6' ? 'dim' : dimmed, badge: badge && badge.textContent,
+                 badgeGone: !h.ctx.document.getElementById('visit-peer-away-badge'), afterVisible: frame.style.opacity,
+                 style: frame.style.cssText, cls: frame.className, src: frame.src, token: h.child.token,
+                 places: h.child.posted.filter((m) => m.t === 'place').length };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert abs(out["upper"] - 320 / 448) < 0.01
+    assert abs(out["full"] - 256 / 560) < 0.01
+    assert out["opacity"] == "dim"
+    assert out["badge"] == "Stepped away"
+    assert out["badgeGone"] and out["afterVisible"] == ""
+    assert "pointer-events:none" in out["style"] and "z-index:9" in out["style"]
+    assert out["cls"] == "transparent-overlay"
+    assert out["src"] == "/visit/transport?v=9&side=host&visit_id=AbCdEfGhIjKlMnOpQrStUv"
+    assert out["token"] == "tok"
+    assert out["places"] >= 2
+
+
+def test_guest_capture_guards_rate_and_starvation():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge({ targetFrameRate: 20 });
+        await open(h, 'guest');
+        change(h, 'started');
+        change(h, 'departed');
+        await advance(700);
+        const post = h.handlers.postrender;
+        // 守卫：临时舞台 / RenderTexture 渲染不抓
+        h.renderer.lastObjectRendered = { name: 'temp' };
+        for (let k = 0; k < 10; k++) { clock.now += 1000 / 60; post(); }
+        h.renderer.lastObjectRendered = h.stage; h.renderer.renderTexture.current = {};
+        for (let k = 0; k < 10; k++) { clock.now += 1000 / 60; post(); }
+        h.renderer.renderTexture.current = null;
+        const guarded = h.child.onFrames.length;
+        // 60 Hz 渲染 2 s → 约 60 帧
+        for (let k = 0; k < 120; k++) { clock.now += 1000 / 60; post(); }
+        const captured = h.child.onFrames.length;
+        const rect = h.child.onFrames[captured - 1].rect;
+        await advance(1500);    // 没有渲染：帧饥饿
+        const hiddenOn = h.child.posted.filter((m) => m.t === 'hidden');
+        clock.now += 16; post(); clock.now += 17; post();
+        const hiddenAll = h.child.posted.filter((m) => m.t === 'hidden').map((m) => m.on);
+        const away = h.ctx.document.getElementById('visit-away-badge');
+        const fpsDuring = h.fpsCalls.slice();
+        const crop = h.child.posted.filter((m) => m.t === 'crop').pop();
+        change(h, 'ended');
+        return { guarded, captured, rect, hiddenOn: hiddenOn.map((m) => [m.on, m.cause]), hiddenAll, fpsDuring, fpsAfter: h.fpsCalls,
+                 capturing: h.ctx.live2dManager._visitCaptureActive, away: away && away.textContent, crop,
+                 frameGone: !h.ctx.document.getElementById('visit-frame'), badgeGone: !h.ctx.document.getElementById('visit-away-badge'),
+                 unhooked: !h.handlers.postrender };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out["guarded"] == 0
+    assert 58 <= out["captured"] <= 62
+    assert out["rect"]["w"] > 0 and out["rect"]["h"] > 0 and out["rect"]["x"] >= 0
+    assert out["hiddenOn"] == [[True, "frame_starvation"]]
+    assert out["hiddenAll"] == [True, False]
+    assert out["fpsDuring"] == [30]
+    assert out["fpsAfter"] == [30, 20]
+    assert out["capturing"] is False
+    assert out["away"] == "Out visiting"
+    assert out["crop"]["fps"] == 30 and out["crop"]["mode"] == "upper"
+    assert out["frameGone"] and out["badgeGone"] and out["unhooked"]
+
+
+def test_compat_mode_captures_at_fifteen():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge({ compat: true, targetFrameRate: 10 });
+        await open(h, 'guest');
+        change(h, 'started');
+        await advance(700);
+        for (let k = 0; k < 120; k++) { clock.now += 1000 / 60; h.handlers.postrender(); }
+        const crop = h.child.posted.filter((m) => m.t === 'crop').pop();
+        return { captured: h.child.onFrames.length, fps: crop.fps, fpsCalls: h.fpsCalls };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert 28 <= out["captured"] <= 32
+    assert out["fps"] == 15
+    assert out["fpsCalls"] == [15]
+
+
+def test_portrait_export_suspends_capture():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge();
+        await open(h, 'guest');
+        change(h, 'started');
+        await h.ctx.avatarPortrait.capture({});
+        return h.child.suspended;
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out == [True, False]
+
+
+def test_frame_messages_from_other_sources_are_ignored():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge();
+        h.side = 'host';
+        change(h, 'pending');
+        const frame = h.ctx.document.getElementById('visit-frame');
+        frame.contentWindow = h.child;
+        h.bridge._onFrameMessage({ source: {}, origin: h.ctx.location.origin, data: { t: 'ready', v: 1, side: 'host', visit_id: VISIT_ID } });
+        h.bridge._onFrameMessage({ source: h.child, origin: 'http://evil.test', data: { t: 'ready', v: 1, side: 'host', visit_id: VISIT_ID } });
+        await settle();
+        const before = h.child.token;
+        h.bridge._onFrameMessage({ source: h.child, origin: h.ctx.location.origin, data: { t: 'closed', code: 4404 } });
+        return { before, gone: !h.ctx.document.getElementById('visit-frame') };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out == {"before": None, "gone": True}
+
+
+def test_offscreen_half_of_the_model_is_not_framed():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge();
+        h.ctx.live2dManager.getModelScreenBounds = () => ({ left: 1500, top: 600, right: 2300, bottom: 1900, width: 800, height: 1300 });
+        h.ctx.live2dManager.getHeadDetectionGeometryInfo = () => null;
+        await open(h, 'guest');
+        change(h, 'started');
+        await advance(700);
+        return h.bridge._state.rect;
+        """,
+        files=BRIDGE_FILES,
+    )
+    # 只按视口内可见的 420×480 构框：框的底边不会落到屏幕下方几百像素
+    assert out["y"] + out["height"] <= 1080 + 400
+    assert abs(out["x"] + out["width"] / 2 - (1500 + 210)) < 1e-6
