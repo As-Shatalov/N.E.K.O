@@ -23,6 +23,8 @@
   var DOWNLINK = { credentials: 1, media: 1, send: 1, stop: 1 };
   // 连上后稳定这么久（或收到一条合法下行）才算后端会话恢复，断线时限才清零
   var STABLE_OPEN_MS = 5000;
+  // 一直停在 CONNECTING（黑洞网络 / 卡住的代理）也要有个头：首连最多等这么久，重连等到重连窗口用完
+  var CONNECT_TIMEOUT_MS = 10000;
 
   function transportUrl(loc, visitId, side) {
     var scheme = loc.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -42,6 +44,7 @@
     this.ws = null;
     this.lostAt = null;
     this.stableTimer = null;
+    this.connectTimer = null;
     this.reconnectTimer = null;
     this.terminal = false;
     this.stopped = false;
@@ -58,8 +61,22 @@
     var self = this;
     var ws = new WebSocket(transportUrl(root.location, this.visitId, this.side));
     this.ws = ws;
+    var wait = this.lostAt === null ? CONNECT_TIMEOUT_MS : Math.max(0, RECONNECT_WINDOW_MS - (this.now() - this.lostAt));
+    this.clearConnectTimer();
+    this.connectTimer = setTimeout(function () {
+      self.connectTimer = null;
+      if (ws !== self.ws || ws.readyState !== 0) return;
+      // 卡在连接中：主动关掉并按断开处理（浏览器的 close 事件可能迟到，之后会因 ws 已换代被忽略）
+      try {
+        ws.close();
+      } catch (_) {
+        // 已关闭
+      }
+      if (ws === self.ws && typeof ws.onclose === 'function') ws.onclose({ code: 1006 });
+    }, wait);
     ws.onopen = function () {
       if (ws !== self.ws) return;
+      self.clearConnectTimer();
       // 只是握手成功不算恢复：鉴权前就被关掉的反复连 / 断不能一直把断线时限往后推
       self.clearStable();
       self.stableTimer = setTimeout(function () {
@@ -86,6 +103,7 @@
       if (ws !== self.ws) return;
       self.ws = null;
       self.clearStable();
+      self.clearConnectTimer();
       var code = event && event.code;
       // 先同步停媒体、离房，再决定重连：都不依赖后端的任何计时器
       self.hooks.stopAllMedia();
@@ -144,6 +162,11 @@
   };
 
   /** 后端 stop 之后本侧主动收线：终态，不再重连。 */
+  BackendLink.prototype.clearConnectTimer = function () {
+    if (this.connectTimer !== null) clearTimeout(this.connectTimer);
+    this.connectTimer = null;
+  };
+
   BackendLink.prototype.clearStable = function () {
     if (this.stableTimer !== null) clearTimeout(this.stableTimer);
     this.stableTimer = null;
@@ -153,6 +176,7 @@
     this.stopped = true;
     this.terminal = true;
     this.clearStable();
+    this.clearConnectTimer();
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     if (this.ws) {

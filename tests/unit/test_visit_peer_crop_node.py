@@ -428,3 +428,26 @@ def test_overlapping_portrait_exports_resume_capture_after_the_last_one():
         files=BRIDGE_FILES,
     )
     assert out == {"afterFirst": [True], "afterBoth": [True, False]}
+
+
+def test_live2d_capture_flag_follows_a_replaced_manager():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge();
+        await open(h, 'guest');
+        change(h, 'started');
+        await advance(700);
+        const first = h.ctx.live2dManager;
+        const before = first._visitCaptureActive;
+        const renderer2 = Object.assign({}, h.renderer, { on() {}, off() {} });
+        const second = Object.assign({}, first, { pixi_app: { renderer: renderer2, stage: h.stage } });
+        delete second._visitCaptureActive;
+        h.ctx.live2dManager = second;
+        await advance(1500);
+        const after = { old: first._visitCaptureActive, current: second._visitCaptureActive };
+        change(h, 'ended');
+        return { before, after, ended: second._visitCaptureActive };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out == {"before": True, "after": {"old": False, "current": True}, "ended": False}

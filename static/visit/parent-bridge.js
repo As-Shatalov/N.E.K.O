@@ -115,6 +115,7 @@
       captureFps: CAPTURE_FPS_DIRECT,
       sampler: createSampler({ targetFps: CAPTURE_FPS_DIRECT }),
       hookedRenderer: null,
+      flaggedLive2d: null,
       pngCancel: null,
       place: null,
       awayBadge: null,
@@ -491,8 +492,6 @@
     }
 
     function startCapture() {
-      var lm = win.live2dManager;
-      if (lm) lm._visitCaptureActive = true;
       holdFrameRate();
       wrapPortrait();
       if (state.lastOkAt === null) {
@@ -509,6 +508,7 @@
     }
 
     function stopCapture() {
+      flagLive2d(null);
       var lm = win.live2dManager;
       if (lm) lm._visitCaptureActive = false;
       releaseFrameRate();
@@ -534,8 +534,21 @@
       captureFrom('live2d');
     }
 
+    /** 取帧期间让当前 Live2D 管理器保持活跃渲染（不进空闲降帧）；管理器被换掉时旧的清掉、新的补上。 */
+    function flagLive2d(lm) {
+      var prev = state.flaggedLive2d;
+      if (prev === lm) {
+        if (lm) lm._visitCaptureActive = true;
+        return;
+      }
+      if (prev) prev._visitCaptureActive = false;
+      if (lm) lm._visitCaptureActive = true;
+      state.flaggedLive2d = lm || null;
+    }
+
     function hookRenderer() {
       var lm = win.live2dManager;
+      flagLive2d(lm || null);
       var renderer = lm && lm.pixi_app && lm.pixi_app.renderer;
       if (renderer === state.hookedRenderer) return;
       unhookRenderer();

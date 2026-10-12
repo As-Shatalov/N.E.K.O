@@ -1826,3 +1826,38 @@ def test_superseded_trtc_subscription_failure_does_not_reset_the_new_attempt():
         """
     )
     assert out == {"starts": 2, "stops": 1}
+
+
+def test_stalled_connect_attempt_is_bounded():
+    out = run_visit_js(
+        """
+        const runs = {};
+        // 首连卡在 CONNECTING：10 s 后按断开处理并开始重连
+        {
+          const h = makeController('guest');
+          h.c.onAuthToken('tok');
+          const n = sockets.length;
+          // 黑洞网络：close() 之后浏览器的 close 事件迟迟不来
+          sockets[n - 1].close = function () { this.readyState = 3; };
+          await advance(11500);
+          runs.first = { closed: sockets[n - 1].readyState === 3, retried: sockets.length > n };
+        }
+        // 重连一直卡住：重连窗口用完就终止，不会无限挂着
+        {
+          const h = makeController('guest');
+          let terminal = null;
+          const orig = h.c.onTerminal.bind(h.c);
+          h.c.onTerminal = (code) => { terminal = clock.now; orig(code); };
+          h.c.onAuthToken('tok');
+          const ws = sockets[sockets.length - 1];
+          ws.serverOpen();
+          await advance(6000);
+          const start = clock.now;
+          ws.serverClose(1006);
+          for (let i = 0; i < 30 && terminal === null; i++) await advance(1000);
+          runs.reconnect = { terminal: terminal !== null, within: terminal !== null && terminal - start <= 21000 };
+        }
+        return runs;
+        """
+    )
+    assert out == {"first": {"closed": True, "retried": True}, "reconnect": {"terminal": True, "within": True}}
