@@ -390,6 +390,11 @@
       stats: function () {
         return {};
       },
+      /** 断线 / 重连：收发统计的差分基准作废。 */
+      resetStats: function () {
+        rxMark = null;
+        txMark = null;
+      },
       /** 当前连接质量换算的丢包样本（poor / lost 视同超阈值）；未知返回 undefined。 */
       currentLossPct: function () {
         if (!joined || !localQuality) return undefined;

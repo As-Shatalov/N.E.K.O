@@ -177,6 +177,7 @@
     this.loss = null;
     this.softencSince = null;
     this.statsMark = null;
+    this.statsGen = 0;
     this.codecOverride = null;
     this.publishRetries = 0;
     this.publishRetryTimer = null;
@@ -512,6 +513,12 @@
       this.peerRxFps = null;
       this.softencSince = null;   // 不在房里时不编码：软编过载窗口重新起算
       if (this.ladder) this.ladder.reset(this.ladder.crop, this.ladder.level);
+      // 收发统计的差分基准也作废：重连后第一拍若拿断线前的基准算，间隔里含断线期，帧率 / 码率偏低；
+      // 已经在路上的那一拍统计同样丢掉
+      this.statsGen += 1;
+      this.statsMark = null;
+      if (this.unpacker) this.unpacker.resetStats();
+      if (this.adapter && typeof this.adapter.resetStats === 'function') this.adapter.resetStats();
     }
     if (state === 'kicked') {
       // 被踢 / 被同 vid 顶号：停掉自己的媒体；是否结束整场由后端按 vendor_reason 判
@@ -751,6 +758,7 @@
   P.collectStats = function () {
     var now = this.now();
     var self = this;
+    var gen = this.statsGen;
     var base = this.adapter ? this.adapter.stats() : {};
     var out = { type: 'stats', dc_queue: this.core.queueLength() };
     ['enc_fps', 'tx_kbps', 'tx_w', 'tx_h', 'rx_kbps', 'rtt_ms', 'loss_pct'].forEach(function (k) {
@@ -768,6 +776,7 @@
       for (var k in rx) out[k] = rx[k];
     }
     var finish = function (extra) {
+      if (gen !== self.statsGen) return;   // 取样期间离开了在房状态：这拍作废
       if (extra) {
         ['enc_fps', 'tx_kbps', 'tx_w', 'tx_h'].forEach(function (key) {
           if (typeof extra[key] === 'number' && isFinite(extra[key])) out[key] = extra[key];

@@ -1676,3 +1676,55 @@ def test_livekit_ignores_subscription_after_the_publication_was_withdrawn():
         """
     )
     assert out == [None]
+
+
+def test_leaving_the_room_resets_stat_baselines_and_drops_the_pending_sample():
+    out = run_visit_js(
+        """
+        const h = await joinedController('host');
+        h.c.unpacker.statsMark = { at: 0, kind: 'presented', count: 10 };
+        h.c.statsMark = { at: 0, frames: 10 };
+        let resets = 0;
+        h.c.adapter.resetStats = () => { resets += 1; };
+        h.c.media.subscribe = true;
+        let release;
+        h.c.adapter.receiverStats = () => new Promise((r) => { release = r; });
+        h.c.collectStats();
+        // collectStats 同步取样会改写基准：取样之后再放一个旧基准，确认离房时被清掉
+        h.c.unpacker.statsMark = { at: 0, kind: 'presented', count: 10 };
+        h.c.onVendorState('reconnecting', {});
+        release({ rx_kbps: 10 });
+        await settle();
+        return { unpack: h.c.unpacker.statsMark, own: h.c.statsMark, resets,
+                 sent: h.ws.sent.filter((m) => m.type === 'stats').length };
+        """
+    )
+    assert out == {"unpack": None, "own": None, "resets": 1, "sent": 0}
+
+
+def test_livekit_reset_stats_drops_rx_and_tx_baselines():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9' } });
+        await a.setSubscribe(true);
+        let bytes = 0;
+        const receiver = { getStats: () => Promise.resolve(new Map([['in', { type: 'inbound-rtp', kind: 'video', bytesReceived: bytes, packetsReceived: 0, packetsLost: 0 }]])) };
+        const pub = { kind: 'video', setSubscribed() {} };
+        LK.Room.last.emit('TrackPublished', pub, { identity: 'g_peer' });
+        LK.Room.last.emit('TrackSubscribed', { kind: 'video', mediaStreamTrack: {}, receiver }, pub, { identity: 'g_peer' });
+        await a.receiverStats(0);
+        bytes = 350000;
+        a.resetStats();
+        const afterReset = await a.receiverStats(5000);
+        bytes = 700000;
+        const next = await a.receiverStats(10000);
+        return { afterReset: afterReset.rx_kbps ?? null, next: next.rx_kbps };
+        """
+    )
+    assert out == {"afterReset": None, "next": 560}

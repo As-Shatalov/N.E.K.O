@@ -310,6 +310,11 @@
       remoteVideoAvailable: function () {
         return !!remoteVideoUser;
       },
+      /** 断线 / 重连：丢掉断线前的统计快照，重连后等 SDK 的新统计。 */
+      resetStats: function () {
+        lastStats = null;
+        lastNetwork = null;
+      },
       stats: function () {
         var out = {};
         if (lastStats) {

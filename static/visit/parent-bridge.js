@@ -96,6 +96,7 @@
       sink: null,
       ready: false,
       readyTimer: null,
+      portraitExports: 0,
       authTimer: null,
       authGen: 0,
       tickTimer: null,
@@ -572,19 +573,28 @@
         var original = api[name];
         if (typeof original !== 'function') return;
         api[name] = function () {
-          bridge.suspendCapture(true);
+          // 几处调用方（聊天头像、卡面）可能同时导出：按计数暂停，最后一个结束才恢复取帧
+          state.portraitExports += 1;
+          if (state.portraitExports === 1) bridge.suspendCapture(true);
+          var settled = false;
+          var done = function () {
+            if (settled) return;
+            settled = true;
+            state.portraitExports = Math.max(0, state.portraitExports - 1);
+            if (state.portraitExports === 0) bridge.suspendCapture(false);
+          };
           var result;
           try {
             result = original.apply(this, arguments);
           } catch (err) {
-            bridge.suspendCapture(false);
+            done();
             throw err;
           }
           return Promise.resolve(result).then(function (v) {
-            bridge.suspendCapture(false);
+            done();
             return v;
           }, function (err) {
-            bridge.suspendCapture(false);
+            done();
             throw err;
           });
         };

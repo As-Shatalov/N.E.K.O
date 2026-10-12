@@ -404,3 +404,27 @@ def test_reload_recovery_waits_for_a_token_before_asking_the_backend():
     assert out["late"] == {"fetched": ["tok"], "result": False, "lookups": 3}
     assert out["never"]["fetched"] == [] and out["never"]["result"] is False
     assert 3 <= out["never"]["lookups"] <= 5
+
+
+def test_overlapping_portrait_exports_resume_capture_after_the_last_one():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge();
+        const releases = [];
+        h.ctx.avatarPortrait.capture = () => new Promise((r) => releases.push(r));
+        await open(h, 'guest');
+        change(h, 'started');
+        const p1 = h.ctx.avatarPortrait.capture({});
+        const p2 = h.ctx.avatarPortrait.capture({});
+        releases[0]('a');
+        await p1;
+        const afterFirst = h.child.suspended.slice();
+        releases[1]('b');
+        await p2;
+        const afterBoth = h.child.suspended.slice();
+        change(h, 'ended');
+        return { afterFirst, afterBoth };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out == {"afterFirst": [True], "afterBoth": [True, False]}

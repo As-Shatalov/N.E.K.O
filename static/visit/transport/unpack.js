@@ -265,6 +265,11 @@
     return out;
   };
 
+  /** 断线 / 重连：丢掉帧计数基准，下一拍重新取样（不拿含断线期的间隔算帧率）。 */
+  Unpacker.prototype.resetStats = function () {
+    this.statsMark = null;
+  };
+
   Unpacker.prototype.detach = function () {
     this.generation += 1;
     this._stopFallback();
