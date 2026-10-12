@@ -93,6 +93,25 @@
     this.watchdogTimer = null;
     this.cssSize = { width: 0, height: 0 };
     this.generation = 0;
+    var self = this;
+    var canvas = this.canvas;
+    if (canvas && typeof canvas.addEventListener === 'function') {
+      // GPU 重置 / 上下文被回收：旧的 program 与纹理都作废；恢复后按同一画布重建，访客图层接着画
+      canvas.addEventListener('webglcontextlost', function (e) {
+        if (e && typeof e.preventDefault === 'function') e.preventDefault();
+        self.gl = null;
+        self.glState = null;
+      }, false);
+      canvas.addEventListener('webglcontextrestored', function () {
+        if (!self.track) return;
+        try {
+          self._ensureGl();
+        } catch (_) {
+          self.gl = null;
+          self.glState = null;
+        }
+      }, false);
+    }
   }
 
   Unpacker.prototype._ensureGl = function () {

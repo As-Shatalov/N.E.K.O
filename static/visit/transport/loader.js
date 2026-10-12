@@ -452,10 +452,7 @@
     if (!this.media.publish || !this.adapter || !this.packer || this.stopped) return;
     var self = this;
     var adapter = this.adapter;
-    adapter.updateProfile(this.profile()).then(function () {
-      self.profileRetries = 0;
-    }, function (err) {
-      self.log('warn', 'updateProfile failed', String(err && err.code));
+    var retry = function () {
       if (self.adapter !== adapter || self.profileRetryTimer || self.stopped || !self.media.publish) return;
       var delay = Math.min(PUBLISH_RETRY_MAX_MS, PUBLISH_RETRY_BASE_MS * Math.pow(2, self.profileRetries));
       self.profileRetries += 1;
@@ -463,6 +460,14 @@
         self.profileRetryTimer = null;
         self.pushProfile();
       }, delay);
+    };
+    adapter.updateProfile(this.profile()).then(function (applied) {
+      // 解析成 false（发送端 / 编码参数还没就绪、轨还没发布上）也算没设上，同样按退避重试
+      if (applied === true) self.profileRetries = 0;
+      else retry();
+    }, function (err) {
+      self.log('warn', 'updateProfile failed', String(err && err.code));
+      retry();
     });
   };
 
@@ -786,7 +791,8 @@
   /** VP9 软编跟不上：编码帧率持续 10 s 低于目标的 90 %（兼容模式按 15 fps 算）→ 下次串门用 vp8。 */
   P.checkSoftenc = function (out, now) {
     var codec = this.creds && this.creds.publish && this.creds.publish.codec;
-    if (!this.media.publish || codec !== 'vp9' || typeof out.enc_fps !== 'number') {
+    // 模型被隐藏 / 最小化时本来就不出帧（编码帧率掉到 0），不能算软编跟不上
+    if (!this.media.publish || this.hidden || codec !== 'vp9' || typeof out.enc_fps !== 'number') {
       this.softencSince = null;
       return;
     }

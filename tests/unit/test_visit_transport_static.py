@@ -1381,3 +1381,74 @@ def test_livekit_publish_treats_an_unready_sender_as_profile_failed():
         """
     )
     assert out == ["profile_failed", "profile_failed", True]
+
+
+def test_profile_update_resolving_false_is_retried():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        const results = [false, false, true];
+        let calls = 0;
+        h.c.adapter.updateProfile = () => Promise.resolve(results[Math.min(calls++, results.length - 1)]);
+        h.c.pushProfile();
+        await settle();
+        await advance(2100); await settle();
+        await advance(4100); await settle();
+        const afterSuccess = calls;
+        await advance(60000); await settle();
+        return { calls: afterSuccess, later: calls, retries: h.c.profileRetries };
+        """
+    )
+    assert out == {"calls": 3, "later": 3, "retries": 0}
+
+
+def test_unpacker_rebuilds_gl_after_context_restore():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const doc = ctx.document;
+        const canvas = doc.createElement('canvas');
+        const listeners = {};
+        canvas.addEventListener = (type, fn) => { listeners[type] = fn; };
+        const u = new ctx.NekoVisitTransport.unpack.Unpacker({ video: doc.createElement('video'), canvas });
+        u.track = { id: 'remote' };
+        u._ensureGl();
+        let prevented = false;
+        listeners.webglcontextlost({ preventDefault: () => { prevented = true; } });
+        const lost = { gl: u.gl, state: u.glState, draw: u.draw() };
+        listeners.webglcontextrestored({});
+        const restored = { gl: !!u.gl, state: !!u.glState };
+        u.track = null;
+        listeners.webglcontextlost({ preventDefault() {} });
+        listeners.webglcontextrestored({});
+        return { prevented, lost, restored, idle: u.gl };
+        """
+    )
+    assert out == {"prevented": True, "lost": {"gl": None, "state": None, "draw": False},
+                   "restored": {"gl": True, "state": True}, "idle": None}
+
+
+def test_hidden_avatar_does_not_count_as_vp9_overload():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.c.creds.publish.codec = 'vp9';
+        h.c.media.publish = true;
+        const run = (hidden) => {
+          h.c.hidden = hidden;
+          h.c.softencSince = null;
+          const flags = [];
+          for (const t of [0, 5000, 10000, 15000]) {
+            const out = { enc_fps: 0 };
+            h.c.checkSoftenc(out, t);
+            flags.push(!!out.softenc_overloaded);
+          }
+          return flags;
+        };
+        return { hidden: run(true), shown: run(false) };
+        """
+    )
+    assert out == {"hidden": [False, False, False, False], "shown": [False, False, True, True]}
