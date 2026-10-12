@@ -1404,6 +1404,12 @@ iframe 是**无状态转发器**：后端经 4.3 的 `send{cmd, payload}` 给它
 - 字段: `{t:'geometry', crop:'upper'|'full', level:int(0..2), cropW:int, cropH:int}`（当前构图与拥塞阶梯级别下的裁剪尺寸）
 - 上限: 构图 / 阶梯变化时发；父页本身不知道本侧构图（它来自 `credentials.crop` / `media{crop}`），据此按 `cropW/cropH` 算上半身 / 全身取景框
 
+#### publish
+- 方向: iframe → 父页（guest 侧）
+- 面: postMessage
+- 字段: `{t:'publish', on:bool}`（传输页当前是否在发布视频：`media{publish}`、停媒体时变化）
+- 上限: 变化时发；父页只在 `on:true` 时取帧——纯文字串门（能力门 ③ 视频不可用、`media.publish` 恒 false）不拉帧率、不挂渲染钩子、不报 `hidden`
+
 #### closed
 - 方向: iframe → 父页
 - 面: postMessage

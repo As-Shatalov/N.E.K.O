@@ -153,6 +153,24 @@
     return dims;
   };
 
+  /** 源矩形与源图求交，并按比例换算出目标矩形；不相交返回 null。 */
+  function clipToSource(src, sx, sy, sw, sh, w, h) {
+    var srcW = src.naturalWidth || src.videoWidth || src.width || 0;
+    var srcH = src.naturalHeight || src.videoHeight || src.height || 0;
+    if (!(srcW > 0 && srcH > 0)) return null;
+    var x0 = Math.max(sx, 0);
+    var y0 = Math.max(sy, 0);
+    var x1 = Math.min(sx + sw, srcW);
+    var y1 = Math.min(sy + sh, srcH);
+    if (!(x1 > x0 && y1 > y0)) return null;
+    var kx = w / sw;
+    var ky = h / sh;
+    return {
+      sx: x0, sy: y0, sw: x1 - x0, sh: y1 - y0,
+      dx: (x0 - sx) * kx, dy: (y0 - sy) * ky, dw: (x1 - x0) * kx, dh: (y1 - y0) * ky,
+    };
+  }
+
   /** 当前可发布的轨：没有或已 ended 就从同一块 pack 画布 captureStream(0) 建新轨。 */
   Packer.prototype.ensureTrack = function () {
     if (this.track && this.track.readyState !== 'ended') return this.track;
@@ -183,14 +201,19 @@
     pctx.globalCompositeOperation = 'source-over';
     pctx.fillStyle = '#000';
     pctx.fillRect(0, 0, w, h * 2);
-    pctx.drawImage(src, sx, sy, sw, sh, 0, 0, w, h);
     sctx.globalCompositeOperation = 'source-over';
     sctx.clearRect(0, 0, w, h);
-    sctx.fillStyle = '#fff';
-    sctx.fillRect(0, 0, w, h);
-    sctx.globalCompositeOperation = 'destination-in';
-    sctx.drawImage(src, sx, sy, sw, sh, 0, 0, w, h);
-    sctx.globalCompositeOperation = 'source-over';
+    // 取景框可能越出源图（全身构图外扩 4%、模型挂在屏幕边缘）：只画与源图的交集，
+    // 遮罩也只在交集里填白——越界部分在两半里都保持「黑 / 透明」，不会编成不透明黑边
+    var part = clipToSource(src, sx, sy, sw, sh, w, h);
+    if (part) {
+      pctx.drawImage(src, part.sx, part.sy, part.sw, part.sh, part.dx, part.dy, part.dw, part.dh);
+      sctx.fillStyle = '#fff';
+      sctx.fillRect(part.dx, part.dy, part.dw, part.dh);
+      sctx.globalCompositeOperation = 'destination-in';
+      sctx.drawImage(src, part.sx, part.sy, part.sw, part.sh, part.dx, part.dy, part.dw, part.dh);
+      sctx.globalCompositeOperation = 'source-over';
+    }
     pctx.drawImage(this.scratch, 0, h);
     this.frames += 1;
     if (this.track && this.track.readyState !== 'ended') {
@@ -214,6 +237,7 @@
     packDims: packDims,
     profileFor: profileFor,
     unpackGeometry: unpackGeometry,
+    clipToSource: clipToSource,
     LadderController: LadderController,
     Packer: Packer,
   };

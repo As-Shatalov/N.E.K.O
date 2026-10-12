@@ -424,6 +424,15 @@
     return NVT.pack.profileFor(this.packer.dims, this.captureFps);
   };
 
+  /** 父页只在真的发布视频时取帧（纯文字串门不拉帧率、不挂钩子、不报 hidden）。 */
+  P.announcePublish = function () {
+    if (!this.packer) return;
+    var on = !!this.media.publish;
+    if (this.publishAnnounced === on) return;
+    this.publishAnnounced = on;
+    this.post({ t: 'publish', on: on });
+  };
+
   P.announceGeometry = function () {
     if (!this.packer) return;
     var d = this.packer.dims;
@@ -468,6 +477,7 @@
       this.setGeometry(crop, level);
       if (msg.publish === true) {
         this.media.publish = true;
+        this.announcePublish();
         this.packer.active = true;
         if (this.adapter) {
           // 轨已被结束（SDK 或浏览器）就从同一块画布建新轨，接回父页的同任务取帧再发布
@@ -478,6 +488,7 @@
         }
       } else if (msg.publish === false) {
         this.media.publish = false;
+        this.announcePublish();
         this.packer.active = false;
         if (this.adapter) this.adapter.unpublish();
       }
@@ -494,6 +505,7 @@
   /** 停掉全部媒体（不离房、不 stop 画布轨）：guest 取消发布，host 取消订阅。同步执行。 */
   P.stopAllMedia = function () {
     this.media.publish = false;
+    this.announcePublish();
     this.media.subscribe = false;
     if (this.packer) this.packer.active = false;
     if (this.adapter) {

@@ -80,3 +80,38 @@ def test_packer_only_draws_while_publishing():
     assert out["before"] is False and out["after"] is True
     assert out["ops"] == ["clearRect", "fillRect", "drawImage"]
     assert out["mode"] == "source-over"
+
+
+def test_out_of_source_crop_is_clipped_not_painted_white():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const P = ctx.NekoVisitTransport.pack;
+        const src = { width: 1000, height: 800 };
+        return {
+          inside: P.clipToSource(src, 100, 100, 320, 448, 320, 448),
+          right: P.clipToSource(src, 900, 0, 200, 400, 320, 640),
+          outside: P.clipToSource(src, 2000, 0, 100, 100, 320, 448),
+        };
+        """
+    )
+    assert out["inside"] == {"sx": 100, "sy": 100, "sw": 320, "sh": 448, "dx": 0, "dy": 0, "dw": 320, "dh": 448}
+    # 右半越界：只画左半，目标宽度同比例缩成一半
+    assert out["right"] == {"sx": 900, "sy": 0, "sw": 100, "sh": 400, "dx": 0, "dy": 0, "dw": 160, "dh": 640}
+    assert out["outside"] is None
+
+
+def test_guest_tells_the_parent_when_it_publishes():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        h.ws.serverSend({ type: 'media', publish: false });
+        await settle();
+        return h.posted.filter((m) => m.t === 'publish').map((m) => m.on);
+        """
+    )
+    assert out == [True, False]

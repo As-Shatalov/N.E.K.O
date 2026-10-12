@@ -113,6 +113,7 @@
       awayBadge: null,
       peerBadge: null,
       firstFrame: null,
+      publishing: false,
       stats: null,
       portraitWrapped: false,
     };
@@ -249,6 +250,7 @@
       state.sink = null;
       state.place = null;
       state.firstFrame = null;
+      state.publishing = false;
       state.captureFps = isCompatMode() ? CAPTURE_FPS_COMPAT : CAPTURE_FPS_DIRECT;
       state.sampler.setTarget(state.captureFps);
       state.sampler.reset();
@@ -328,6 +330,10 @@
           syncCapture();
           tick(true);
         });
+      } else if (data.t === 'publish') {
+        state.publishing = data.on === true;
+        syncCapture();
+        tick(true);
       } else if (data.t === 'geometry') {
         if (data.crop === 'upper' || data.crop === 'full') state.cropMode = data.crop;
         if (data.cropW > 0 && data.cropH > 0) state.cropAspect = data.cropW / data.cropH;
@@ -359,7 +365,7 @@
     // ── 取帧 ───────────────────────────────────────────────────────────
 
     function captureWanted() {
-      return state.side === 'guest' && state.ready && !!state.sink && !!ACTIVE_PHASES[state.phase];
+      return state.side === 'guest' && state.ready && !!state.sink && !!ACTIVE_PHASES[state.phase] && state.publishing;
     }
 
     function syncCapture() {

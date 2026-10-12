@@ -41,13 +41,16 @@ function makeBridge(opts) {
 function change(h, action, extra) {
   h.bridge.onStateChange(Object.assign({ type: 'visit_state_change', action, side: h.side, visit_id: VISIT_ID }, extra || {}));
 }
-async function open(h, side) {
+async function open(h, side, publishing) {
   h.side = side;
   change(h, 'pending');
   const frame = h.ctx.document.getElementById('visit-frame');
   frame.contentWindow = h.child;
   h.bridge._onFrameMessage({ source: h.child, origin: h.ctx.location.origin, data: { t: 'ready', v: 1, side, visit_id: VISIT_ID } });
   await settle();
+  if (side === 'guest' && publishing !== false) {
+    h.bridge._onFrameMessage({ source: h.child, origin: h.ctx.location.origin, data: { t: 'publish', on: true } });
+  }
   h.frame = frame;
   return frame;
 }
@@ -248,3 +251,19 @@ def test_visitor_layer_fits_a_narrow_viewport():
     assert out["left"] >= 0
     assert out["left"] + out["width"] <= 360 + 1
     assert abs(out["width"] / out["height"] - 320 / 448) < 0.01
+
+
+def test_text_only_visit_does_not_capture_or_report_hidden():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge({ targetFrameRate: 20 });
+        await open(h, 'guest', false);           // 传输页没在发布（视频不可用）
+        change(h, 'started');
+        await advance(3000);
+        const hooked = !!h.handlers.postrender;
+        return { hooked, fps: h.fpsCalls, hidden: h.child.posted.filter((m) => m.t === 'hidden').length,
+                 capturing: h.ctx.live2dManager._visitCaptureActive };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out == {"hooked": False, "fps": [], "hidden": 0, "capturing": False}
