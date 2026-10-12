@@ -267,3 +267,28 @@ def test_text_only_visit_does_not_capture_or_report_hidden():
         files=BRIDGE_FILES,
     )
     assert out == {"hooked": False, "fps": [], "hidden": 0, "capturing": False}
+
+
+def test_minimized_model_stops_capture_and_reports_hidden():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const h = makeBridge();
+        const box = h.ctx.document.createElement('div');
+        box.id = 'live2d-container';
+        h.ctx.document.body.appendChild(box);
+        await open(h, 'guest');
+        change(h, 'started');
+        await advance(700);
+        for (let k = 0; k < 30; k++) { clock.now += 1000 / 60; h.handlers.postrender(); }
+        const visible = h.child.onFrames.length;
+        box.classList.add('minimized');
+        await advance(700);
+        const mark = h.child.onFrames.length;
+        for (let k = 0; k < 120; k++) { clock.now += 1000 / 60; h.handlers.postrender(); }
+        await advance(1500);
+        const hidden = h.child.posted.filter((m) => m.t === 'hidden').map((m) => m.on);
+        return { visible: visible > 0, minimizedFrames: h.child.onFrames.length - mark, hidden };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out == {"visible": True, "minimizedFrames": 0, "hidden": [True]}

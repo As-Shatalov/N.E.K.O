@@ -212,8 +212,10 @@
       var id = type === 'pngtuber' ? 'pngtuber-container' : type === 'vrm' ? 'vrm-container' : type === 'mmd' ? 'mmd-container' : 'live2d-container';
       var el = doc.getElementById(id);
       if (!el || typeof win.getComputedStyle !== 'function') return false;
+      // 用户最小化模型：容器只是透明（PNG 自己的取帧循环不会因此停），同样算看不见
+      if (el.classList && el.classList.contains('minimized')) return true;
       var cs = win.getComputedStyle(el);
-      if (cs.visibility === 'hidden' || cs.display === 'none') return true;
+      if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') return true;
       var canvas = type === 'live2d' ? doc.getElementById('live2d-canvas') : null;
       return !!(canvas && win.getComputedStyle(canvas).visibility === 'hidden');
     }

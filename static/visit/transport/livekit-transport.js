@@ -66,6 +66,7 @@
     var remotePublication = null;
     var remoteTrack = null;
     var rxMark = null;
+    var txMark = null;
     var localQuality = null;
 
     function vendorOf(c) {
@@ -155,6 +156,8 @@
         handlers.onPiece(participant.identity, cmd, payload);
       });
       room.on(E.Reconnecting, function () {
+        // 重连前的连接质量不代表重连后的：等下一次质量回调
+        localQuality = null;
         if (!leaving) handlers.onState('reconnecting', {});
       });
       room.on(E.Reconnected, function () {
@@ -261,6 +264,7 @@
             }
             publication = pub;
             publishedTrack = track;
+            txMark = null;
             // 发布时就按传入的 profile 设码率 / 帧率上限（重连恢复的降档级别、兼容模式 15 fps）
             return applyProfile(profile).then(function () { return true; }, function () { return true; });
           });
@@ -307,6 +311,7 @@
         remotePublication = null;
         remoteTrack = null;
         rxMark = null;
+        txMark = null;
         localQuality = null;
         if (!room) return Promise.resolve();
         var disconnecting = room.disconnect(false).catch(function () {});
@@ -360,13 +365,22 @@
         return track.getSenderStats().then(function (list) {
           var s = Array.isArray(list) ? list[0] : list;
           if (!s) return null;
-          return {
+          var out = {
             enc_fps: s.framesPerSecond,
             tx_w: s.frameWidth,
             tx_h: s.frameHeight,
             qlr: s.qualityLimitationReason,
             enc: s.encoderImplementation,
           };
+          // 发送码率：两次取样之间的 bytesSent 差（timestamp 单位 ms）
+          if (typeof s.bytesSent === 'number' && typeof s.timestamp === 'number') {
+            var prev = txMark;
+            txMark = { at: s.timestamp, bytes: s.bytesSent };
+            if (prev && txMark.at > prev.at && txMark.bytes >= prev.bytes) {
+              out.tx_kbps = Math.round((txMark.bytes - prev.bytes) * 8 / (txMark.at - prev.at));
+            }
+          }
+          return out;
         }).catch(function () { return null; });
       },
     };

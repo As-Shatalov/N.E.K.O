@@ -919,3 +919,62 @@ def test_persistent_livekit_quality_keeps_driving_the_ladder():
         """
     )
     assert out == {"before": None, "poor": [100, 100], "good": 0, "afterLeave": None}
+
+
+def test_livekit_reconnect_drops_stale_quality_and_restarts_ladder_timers():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9' } });
+        const room = LK.Room.last;
+        room.emit('ConnectionQualityChanged', 'poor', room.localParticipant);
+        const before = a.currentLossPct();
+        room.emit('Reconnecting');
+        room.emit('Reconnected');
+        return { before, after: a.currentLossPct() ?? null };
+        """
+    )
+    assert out == {"before": 100, "after": None}
+
+
+def test_controller_drops_loss_and_ladder_timers_when_leaving_the_room_state():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.c.loss = { value: 100, at: clock.now };
+        h.c.ladder.badSince = 1;
+        h.c.ladder.cleanSince = 2;
+        const level = h.c.ladder.level;
+        h.c.onVendorState('reconnecting', {});
+        return { loss: h.c.loss, bad: h.c.ladder.badSince, clean: h.c.ladder.cleanSince, sameLevel: h.c.ladder.level === level };
+        """
+    )
+    assert out == {"loss": None, "bad": None, "clean": None, "sameLevel": True}
+
+
+def test_livekit_sender_stats_report_tx_kbps():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        let sample = { framesPerSecond: 30, frameWidth: 256, frameHeight: 704, bytesSent: 0, timestamp: 1000 };
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9' } });
+        const room = LK.Room.last;
+        room.localParticipant.publishTrack = () => Promise.resolve({ track: { sender: LK.sender, getSenderStats: () => Promise.resolve([sample]) } });
+        await a.publish({ id: 'pack' });
+        const first = await a.senderStats();
+        sample = Object.assign({}, sample, { bytesSent: 350000, timestamp: 6000 });
+        const second = await a.senderStats();
+        return { first: first.tx_kbps === undefined, second: second.tx_kbps };
+        """
+    )
+    assert out == {"first": True, "second": 560}

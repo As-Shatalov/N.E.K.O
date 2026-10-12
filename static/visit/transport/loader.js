@@ -397,6 +397,11 @@
 
   P.onVendorState = function (state, extra) {
     this.vendorState = state;
+    if (!IN_ROOM[state]) {
+      // 断线 / 重连期间的观测不代表恢复后的连接：丢掉旧丢包样本，阶梯两个计时器重新起算
+      this.loss = null;
+      if (this.ladder) this.ladder.reset(this.ladder.crop, this.ladder.level);
+    }
     if (state === 'kicked') {
       // 被踢 / 被同 vid 顶号：停掉自己的媒体；是否结束整场由后端按 vendor_reason 判
       this.stopAllMedia();
@@ -651,7 +656,7 @@
     }
     var finish = function (extra) {
       if (extra) {
-        ['enc_fps', 'tx_w', 'tx_h'].forEach(function (key) {
+        ['enc_fps', 'tx_kbps', 'tx_w', 'tx_h'].forEach(function (key) {
           if (typeof extra[key] === 'number' && isFinite(extra[key])) out[key] = extra[key];
         });
         if (typeof extra.qlr === 'string') out.qlr = extra.qlr;
