@@ -293,6 +293,10 @@ async def _main_call(
         raise _TaskError("main_server_unavailable", "Main Server 不可用", retryable=True) from exc
     if not isinstance(payload, dict):
         raise _TaskError("main_server_unavailable", "Main Server 返回了无效响应", retryable=True)
+    if response.status_code == 409 and payload.get("error_code") == "storage_startup_blocked":
+        # Main or the Memory Server is waiting on storage (startup, migration):
+        # the same as starting, so retried rather than taken as a refusal.
+        payload = {**payload, "ok": False, "reason": "knowledge_starting"}
     if response.status_code >= 400 and "reason" not in payload:
         # A refusal by Main itself (e.g. CSRF) rather than a knowledge answer.
         payload = {"ok": False, "reason": f"http_{response.status_code}"}
@@ -888,6 +892,7 @@ async def _cancel_package_imports(package_id: int, pack_id: str, deadline: float
     restarted, may still have staged one. Returns whether there was any.
     """
     cancelled: set[str] = set()
+    saw_admission = False
     while _remaining(deadline) > 0:
         try:
             payload = await _main_call("GET", "packs/jobs", timeout=max(_remaining(deadline), 0.5))
@@ -902,11 +907,22 @@ async def _cancel_package_imports(package_id: int, pack_id: str, deadline: float
                 and isinstance(job.get("subscription"), dict)
                 and job["subscription"].get("provider_package_id") == str(package_id)
             ]
-            if not active:
+            # Arrived but not a job yet (parsed or being staged): cannot be
+            # cancelled until it is one, and may still become one, so wait.
+            admitting = [
+                item
+                for item in payload.get("admitting", ())
+                if isinstance(item, dict) and item.get("provider_package_id") == str(package_id)
+            ]
+            if not active and not admitting:
                 # None left: the registry now says whether any of them landed.
-                return bool(cancelled)
-            if any(job["subscription"].get("pack_id") != pack_id for job in active):
+                return bool(cancelled) or saw_admission
+            if any(job["subscription"].get("pack_id") != pack_id for job in active) or any(
+                item.get("pack_id") != pack_id for item in admitting
+            ):
                 raise _unsubscribe_error("subscription_identity_mismatch")
+            # Whatever an admission becomes is this unsubscribe's to settle.
+            saw_admission = saw_admission or bool(admitting)
             for job in active:
                 job_id = str(job.get("job_id") or "")
                 if job_id and job_id not in cancelled:

@@ -382,6 +382,8 @@ async def test_a_definite_refusal_is_busy_at_once_not_an_unknown_outcome(env):
         (200, {"ok": False, "reason": "knowledge_unavailable"}, "knowledge_unavailable"),
         (503, {"ok": False, "reason": "knowledge_starting"}, "knowledge_starting"),
         (403, {"detail": "csrf"}, "http_403"),
+        # Storage-limited startup (Main's or the Memory Server's gate): retried as starting.
+        (409, {"ok": False, "error_code": "storage_startup_blocked"}, "knowledge_starting"),
     ],
 )
 async def test_main_hop_failures_are_told_apart_from_memory_server_answers(monkeypatch, status, body, reason):
@@ -523,6 +525,36 @@ async def test_unsubscribe_after_a_restart_still_cancels_a_staged_import(env):
     # A staged import of this package under another pack id is not this caller's to cancel.
     state["j9"] = "queued"
     assert (await _unsubscribe(env["http"], pack_id="another-pack")).status_code == 409
+
+
+async def test_unsubscribe_waits_for_an_import_that_is_not_a_job_yet(env):
+    """After a restart, an apply may still be in the Memory Server's admission."""
+    main = env["main"]
+    incoming = _installed()["subscription"]
+    replies = iter(
+        [
+            {"ok": True, "jobs": [], "admitting": [incoming]},
+            {"ok": True, "jobs": [], "admitting": [incoming]},
+            {"ok": True, "jobs": [_job("late", "queued")], "admitting": []},
+        ]
+    )
+    state = {"cancelled": False}
+
+    async def jobs():
+        if state["cancelled"]:
+            return {"ok": True, "jobs": [_job("late", "cancelled")], "admitting": []}
+        return next(replies, {"ok": True, "jobs": [_job("late", "queued")], "admitting": []})
+
+    async def cancel():
+        state["cancelled"] = True
+        return {"ok": True, "job_id": "late"}
+
+    main.on("GET", "packs/jobs", jobs)
+    main.on("POST", "packs/jobs/cancel", cancel)
+    main.on("GET", "packs", {"ok": True, "packs": []})
+    response = await _unsubscribe(env["http"])
+    assert response.status_code == 200 and response.json()["cancelled"] is True
+    assert state["cancelled"] is True
 
 
 async def test_unsubscribe_cancels_an_import_whose_install_answer_was_lost(env):

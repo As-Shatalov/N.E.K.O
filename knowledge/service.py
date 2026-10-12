@@ -316,6 +316,13 @@ class KnowledgeService:
         self._vector_task: asyncio.Task[Any] | None = None
         # operation id -> {"status": pending|committed|failed, "result": ...}
         self._removals: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        # Subscription imports between arrival and their job being known (or
+        # their refusal), by arrival number: an unsubscribe must be able to
+        # see an import that has not become a job yet.
+        self._incoming: dict[int, KnowledgeSubscription] = {}
+        # Arrival numbers whose admission runs on its own (shielded), which
+        # then owns removing the ``_incoming`` entry.
+        self._admission_owned: set[int] = set()
 
     # ── lifecycle ───────────────────────────────────────────────────
 
@@ -819,6 +826,8 @@ class KnowledgeService:
         self._parsing += 1
         parse_work: list[concurrent.futures.Future[Any]] = []
         deferred = False
+        if subscription is not None:
+            self._incoming[arrived_at] = subscription
         try:
             return await self._import_parsed(raw, arrived_at, parse_work, subscription)
         except asyncio.CancelledError:
@@ -835,6 +844,16 @@ class KnowledgeService:
         finally:
             if not deferred:
                 self._parsing -= 1
+            if arrived_at not in self._admission_owned:
+                self._incoming.pop(arrived_at, None)
+
+    def admitting_subscriptions(self) -> list[dict[str, Any]]:
+        """Subscription imports that arrived but are not (yet) a job or a refusal."""
+        return [subscription.to_json() for subscription in self._incoming.values()]
+
+    def _admission_settled(self, arrived_at: int) -> None:
+        self._admission_owned.discard(arrived_at)
+        self._incoming.pop(arrived_at, None)
 
     def import_busy(self) -> bool:
         """Whether a new import would be refused for lack of room right now."""
@@ -919,6 +938,10 @@ class KnowledgeService:
         admission = asyncio.ensure_future(admit())
         self._detached.add(admission)
         admission.add_done_callback(self._detached.discard)
+        # The admission outlives a cancelled request; until it ends (with a
+        # job remembered, or a refusal) the import stays visible as incoming.
+        self._admission_owned.add(arrived_at)
+        admission.add_done_callback(lambda _done: self._admission_settled(arrived_at))
         return await asyncio.shield(admission)
 
     async def _admit_import(

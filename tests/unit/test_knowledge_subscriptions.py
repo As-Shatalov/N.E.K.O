@@ -258,6 +258,47 @@ async def test_identity_is_rechecked_under_the_lock_at_commit(tmp_path, monkeypa
         await service.stop()
 
 
+async def test_a_subscription_import_is_visible_before_it_becomes_a_job(tmp_path):
+    service = await _started(tmp_path)
+    try:
+        await service._admission_lock.acquire()  # hold admission before the job exists
+        raw = _raw(_pack())
+        caller = asyncio.create_task(service.import_pack(raw, subscription=_subscription(raw)))
+        local = asyncio.create_task(service.import_pack(_raw(_pack("local-pack"))))
+        for _ in range(200):
+            # Both admissions started (parsed, waiting on the held lock).
+            if len(service._admission_owned) == 2:
+                break
+            await asyncio.sleep(0.01)
+        (incoming,) = service.admitting_subscriptions()  # the local import is not listed
+        assert incoming["provider_package_id"] == "42" and service.list_jobs() == []
+        # The caller going away does not hide an admission that still runs.
+        caller.cancel()
+        await asyncio.gather(caller, return_exceptions=True)
+        assert service.admitting_subscriptions() == [incoming]
+        service._admission_lock.release()
+        for _ in range(200):
+            if not service.admitting_subscriptions() and len(service.list_jobs()) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert service.admitting_subscriptions() == []
+        assert any(job["subscription"] for job in service.list_jobs())
+        await local
+    finally:
+        await service.stop()
+
+
+async def test_a_refused_subscription_import_leaves_nothing_incoming(tmp_path):
+    service = await _started(tmp_path)
+    try:
+        raw = _raw(_pack())
+        result = await service.import_pack(raw, subscription=_subscription(raw, pack_id="other-pack"))
+        assert result["ok"] is False
+        assert service.admitting_subscriptions() == []
+    finally:
+        await service.stop()
+
+
 async def test_queued_install_of_a_package_blocks_another_pack_claiming_it(tmp_path):
     service = await _started(tmp_path)
     try:
@@ -422,6 +463,13 @@ def _apply_form(raw: bytes, subscription: dict, *, protocol: str = "1"):
         "data": {"protocol_version": protocol, "subscription": json.dumps(subscription)},
         "files": {"pack": ("pack.neko-knowledge.json", raw, "application/json")},
     }
+
+
+async def test_jobs_route_lists_incoming_subscription_imports(client, monkeypatch):
+    http, service = client
+    monkeypatch.setattr(service, "admitting_subscriptions", lambda: [{"provider_package_id": "42"}])
+    body = (await http.get("/internal/knowledge/packs/jobs")).json()
+    assert body["admitting"] == [{"provider_package_id": "42"}] and body["jobs"] == []
 
 
 async def test_apply_route_installs_a_subscription(client):

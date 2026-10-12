@@ -345,7 +345,8 @@ async def knowledge_packs():
 @router.get("/packs/jobs")
 async def knowledge_pack_jobs():
     async def run(svc: KnowledgeService) -> dict[str, Any]:
-        return {"jobs": svc.list_jobs()}
+        # "admitting": subscription imports not yet a job (an unsubscribe waits for them).
+        return {"jobs": svc.list_jobs(), "admitting": svc.admitting_subscriptions()}
 
     return await _call(run)
 
