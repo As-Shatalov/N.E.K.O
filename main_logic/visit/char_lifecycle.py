@@ -796,10 +796,12 @@ async def handover_blocks_visit(
     """Whether this character must not start a visit yet: the entries under ``name`` are not its own yet.
 
     The rename that handed ``name`` over is reconciled first (under the
-    caller's character-config lock). False once it settled, or when it is
-    ambiguous for good (it would never settle, and the character could never
-    visit again); True while it can still settle. An unreadable roster blocks
-    nothing, like every other name check.
+    caller's character-config lock). False once it settled; True while its
+    marker still owns ``name``, ambiguous included: that ambiguity lifts when
+    the character occupying one of its names is deleted, and reconciliation
+    then carries every entry under ``name`` off to the renamed character,
+    visits this character made meanwhile among them. An unreadable roster
+    blocks nothing, like every other name check.
     """
     if not await handover_pending(config_dir, name, character_uid):
         return False
@@ -807,7 +809,9 @@ async def handover_blocks_visit(
         await _settle_handed_over(Path(config_dir), name, character_uid, load_names)
     except RenamePendingElsewhere:
         return True
-    return False
+    # 永久歧义也照拦：占着另一个名字的角色被删后歧义就解开，对账会把这个名字下的条目
+    # （包括这期间接手的角色串门写下的）全部迁给原角色
+    return await handover_pending(config_dir, name, character_uid)
 
 
 async def _own_rename_pending(config_dir: Path, name: str, character_uid: str | None, *, queued_only: bool) -> bool:

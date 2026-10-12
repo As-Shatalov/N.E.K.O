@@ -1313,15 +1313,21 @@ async def test_handover_blocks_visit_only_while_the_handing_rename_can_still_set
     assert "pending_rename" not in _peers(tmp_path)
 
 
-async def test_handover_does_not_block_visits_for_good_when_the_handing_rename_is_ambiguous(tmp_path):
-    await seed_roster(tmp_path, own_char="A")
+async def test_handover_keeps_blocking_visits_while_the_handing_rename_is_ambiguous(tmp_path):
+    roster = await seed_roster(tmp_path, own_char="A")
     handed = {"old": "A", "new": "B", "uid": CHAR_UID_A, "source": lc.CLOUDSAVE_SOURCE,
               "handed_over": ["A"], "chained": ["C"]}
     await set_roster_marker(tmp_path, "pending_rename", handed)
     uid_of = {"A": CHAR_UID_B, "B": "e" * 32, "C": CHAR_UID_A}
-    # 交出 A 的那笔改名永久歧义：等不到迁完，不能让接手的角色永远串不了门（变异：照拦必红）
-    assert await lc.handover_blocks_visit(tmp_path, "A", CHAR_UID_B, _loader(set(uid_of), uid_of)) is False
+    # 交出 A 的那笔改名歧义（B 被 uid e 占着）：照拦。歧义并不永久——uid e 被删后对账会把
+    # A 下的条目全迁给 uid A，这期间 uid B 串门写下的也会被带走（变异：歧义时放行必红）
+    assert await lc.handover_blocks_visit(tmp_path, "A", CHAR_UID_B, _loader(set(uid_of), uid_of)) is True
     assert _peers(tmp_path)["pending_rename"] == handed
+    # uid e 删掉后歧义解开：先把 uid A 的条目迁到 C，再放行
+    del uid_of["B"]
+    assert await lc.handover_blocks_visit(tmp_path, "A", CHAR_UID_B, _loader(set(uid_of), uid_of)) is False
+    assert await roster.get_char_entry(PEER_X, "C") is not None and await roster.get_char_entry(PEER_X, "A") is None
+    assert "pending_rename" not in _peers(tmp_path)
 
 
 async def test_handover_check_lets_an_unreadable_roster_through(tmp_path):
