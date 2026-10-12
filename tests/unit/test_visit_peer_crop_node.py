@@ -356,3 +356,5 @@ def test_png_capture_follows_mirror_and_viewport():
     edge = out["edge"]["last"]
     center_css = 1700 + (edge["x"] + edge["w"] / 2) / 2.5
     assert out["edge"]["frames"] > 0 and abs(center_css - 1810) < 15
+    # 取景框可以伸到屏幕外，但交给打包器的可见源图区域只到视口右边缘：(1920-1700)*2.5 = 550
+    assert edge["visible"] == {"x": 0, "y": 0, "w": 550, "h": 2000}

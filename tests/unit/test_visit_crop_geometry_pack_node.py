@@ -115,3 +115,40 @@ def test_guest_tells_the_parent_when_it_publishes():
         """
     )
     assert out == [True, False]
+
+
+def test_clip_to_source_honours_the_visible_region():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const P = ctx.NekoVisitTransport.pack;
+        const src = { naturalWidth: 1000, naturalHeight: 2000 };
+        return {
+          plain: P.clipToSource(src, -100, 0, 600, 800, 300, 400),
+          visible: P.clipToSource(src, -100, 0, 600, 800, 300, 400, { x: 0, y: 0, w: 200, h: 2000 }),
+          none: P.clipToSource(src, 400, 0, 100, 100, 300, 400, { x: 0, y: 0, w: 200, h: 2000 }),
+        };
+        """
+    )
+    assert out["plain"] == {"sx": 0, "sy": 0, "sw": 500, "sh": 800, "dx": 50, "dy": 0, "dw": 250, "dh": 400}
+    assert out["visible"] == {"sx": 0, "sy": 0, "sw": 200, "sh": 800, "dx": 50, "dy": 0, "dw": 100, "dh": 400}
+    assert out["none"] is None
+
+
+def test_packer_draws_only_the_visible_source_region():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const pk = new ctx.NekoVisitTransport.pack.Packer({ document: ctx.document, crop: 'upper' });
+        pk.active = true;
+        const draws = [];
+        pk.pctx.drawImage = (...a) => { if (a.length === 9) draws.push(a.slice(1, 5)); };
+        const src = { naturalWidth: 1000, naturalHeight: 2000 };
+        pk.onFrame(src, { x: -100, y: 0, w: 600, h: 840, visible: { x: 0, y: 0, w: 200, h: 2000 } });
+        pk.onFrame(src, { x: -100, y: 0, w: 600, h: 840 });
+        return draws;
+        """
+    )
+    assert out == [[0, 0, 200, 840], [0, 0, 500, 840]]

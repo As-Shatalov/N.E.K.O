@@ -112,6 +112,11 @@
       return sender.setParameters(params).then(function () { return true; });
     }
 
+    /** applyProfile 解析成 false（发送端 / 编码参数还没就绪）同样算没设上。 */
+    function profileResult(applied) {
+      return applied === true ? true : 'profile_failed';
+    }
+
     function considerPublication(pub, participant) {
       if (!participant || !isPeer(participant.identity)) return;
       if (!pub || pub.kind !== 'video') return;
@@ -288,7 +293,7 @@
           // 同一条轨已在发布：SDK 整体重连时会按发布时的选项重发（码率 / 帧率回到房间默认），
           // 这里按调用方给的当前 profile 再设一次发送端参数
           if (publication && publishedTrack === track) {
-            return applyProfile(profile).then(function () { return true; }, function () { return 'profile_failed'; });
+            return applyProfile(profile).then(profileResult, function () { return 'profile_failed'; });
           }
           var gen = roomGen;
           var current = room;
@@ -311,7 +316,7 @@
             txMark = null;
             // 发布时就按传入的 profile 设码率 / 帧率上限（重连恢复的降档级别、兼容模式 15 fps）；
             // 设不上不算发布失败，但要让控制器走 pushProfile 的重试（返回 'profile_failed'）
-            return applyProfile(profile).then(function () { return true; }, function () { return 'profile_failed'; });
+            return applyProfile(profile).then(profileResult, function () { return 'profile_failed'; });
           });
         }).then(done, function (err) { done(); throw err; });
       },

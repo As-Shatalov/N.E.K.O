@@ -1359,3 +1359,25 @@ def test_livekit_failed_subscription_is_retried():
         """
     )
     assert out == {"early": [True], "all": [True, False, True, False]}
+
+
+def test_livekit_publish_treats_an_unready_sender_as_profile_failed():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp8' } });
+        LK.sender.params = { encodings: [] };
+        const profile = { width: 256, height: 704, frameRate: 15, bitrate: 400 };
+        const track = { id: 'pack' };
+        const first = await a.publish(track, profile);
+        const again = await a.publish(track, profile);
+        LK.sender.params = { encodings: [{ maxBitrate: 560000, maxFramerate: 30 }] };
+        return [first, again, await a.publish(track, profile)];
+        """
+    )
+    assert out == ["profile_failed", "profile_failed", True]

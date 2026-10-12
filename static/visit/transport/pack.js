@@ -154,7 +154,7 @@
   };
 
   /** 源矩形与源图求交，并按比例换算出目标矩形；不相交返回 null。 */
-  function clipToSource(src, sx, sy, sw, sh, w, h) {
+  function clipToSource(src, sx, sy, sw, sh, w, h, visible) {
     var srcW = src.naturalWidth || src.videoWidth || src.width || 0;
     var srcH = src.naturalHeight || src.videoHeight || src.height || 0;
     if (!(srcW > 0 && srcH > 0)) return null;
@@ -162,6 +162,13 @@
     var y0 = Math.max(sy, 0);
     var x1 = Math.min(sx + sw, srcW);
     var y1 = Math.min(sy + sh, srcH);
+    if (visible) {
+      // 源图里只有屏幕上可见的这一块能发（PNG 原图比视口大，取景框外扩后会落到屏幕外的像素）
+      x0 = Math.max(x0, visible.x);
+      y0 = Math.max(y0, visible.y);
+      x1 = Math.min(x1, visible.x + visible.w);
+      y1 = Math.min(y1, visible.y + visible.h);
+    }
     if (!(x1 > x0 && y1 > y0)) return null;
     var kx = w / sw;
     var ky = h / sh;
@@ -205,7 +212,7 @@
     sctx.clearRect(0, 0, w, h);
     // 取景框可能越出源图（全身构图外扩 4%、模型挂在屏幕边缘）：只画与源图的交集，
     // 遮罩也只在交集里填白——越界部分在两半里都保持「黑 / 透明」，不会编成不透明黑边
-    var part = clipToSource(src, sx, sy, sw, sh, w, h);
+    var part = clipToSource(src, sx, sy, sw, sh, w, h, rectPx.visible || null);
     if (part) {
       // flipX：源在屏幕上是水平镜像显示的（PNG mirror），两半都按镜像画，对端看到的朝向与本地一致
       var flip = rectPx.flipX === true;

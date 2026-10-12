@@ -223,6 +223,14 @@
       };
     }
 
+    function visibleSourcePixels(source, metrics) {
+      var r = source.getBoundingClientRect();
+      var v = geo.intersectRect({ x: r.left, y: r.top, width: r.width, height: r.height },
+        { x: 0, y: 0, width: win.innerWidth || 0, height: win.innerHeight || 0 });
+      var px = v && geo.cssRectToPixelRect(v, metrics);
+      return px ? { x: px.x, y: px.y, w: px.w, h: px.h } : null;
+    }
+
     function containerHidden(type) {
       var id = type === 'pngtuber' ? 'pngtuber-container' : type === 'vrm' ? 'vrm-container' : type === 'mmd' ? 'mmd-container' : 'live2d-container';
       var el = doc.getElementById(id);
@@ -551,6 +559,13 @@
       var metrics = sourceMetrics(source, type);
       var rectPx = metrics && geo.cssRectToPixelRect(rectCss, metrics);
       if (!rectPx) return false;
+      if (type === 'pngtuber') {
+        // PNG 取的是原图：取景框（全身外扩 4%、补宽高比）可能伸到屏幕外，那部分原图不能发——
+        // 只把屏幕上可见的源图区域交给打包器，其余保持透明
+        var visible = visibleSourcePixels(source, metrics);
+        if (!visible) return false;
+        rectPx.visible = visible;
+      }
       var ok = false;
       try {
         ok = state.sink.onFrame(source, rectPx, nowMs) === true;
