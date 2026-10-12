@@ -571,6 +571,24 @@ async def test_a_handed_over_name_is_admitted_once_its_rename_settles(env, monke
     assert "pending_rename" not in peers
 
 
+async def test_a_handed_over_name_waits_for_the_startup_recovery_without_reconciling(env, monkeypatch):
+    from main_routers.visit_router import background
+
+    running = {"v": True}
+    monkeypatch.setattr(background, "startup_recovery_running", lambda: running["v"])
+    _configured(monkeypatch, {"Host": HOST_CHAR_UID, "Moved": "e" * 32}, env.host.config_dir)
+    marker = _handed_over(env.host, "Host")
+    # 启动对账在被改名角色的守卫里迁这笔改名、不拿配置锁：准入不另对账（会与它并发改同一份标记，
+    # 它清标记失败就把这次启动的清除重放与补录推到下次启动），直接拒绝（变异：照样对账必红）
+    resp = await _rooms(env)
+    assert resp.status_code == 409 and resp.json()["reason"] == "handover_pending" and _no_slot()
+    peers = json.loads((env.host.config_dir / "visit_peers.json").read_text(encoding="utf-8"))
+    assert peers["pending_rename"] == marker
+    # 启动对账结束后（它没迁完的话）准入照常先对账、迁完放行
+    running["v"] = False
+    assert (await _rooms(env)).status_code == 202
+
+
 async def test_a_name_handed_over_to_another_character_does_not_block(env, monkeypatch):
     async def unread():
         raise AssertionError("the character config is not read when nothing is handed over to this character")

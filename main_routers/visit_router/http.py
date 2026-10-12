@@ -277,13 +277,21 @@ async def _handover_pending(name: str, uid: str) -> bool:
     character's rename still owns the entries under it: roster entries and
     spools a visit writes now would migrate to that character. The
     character-config lock (to reconcile first) is only taken when such a
-    rename is pending. A failed check refuses (retry later).
+    rename is pending, and not while the startup recovery runs: it
+    reconciles that rename under the renamed character's guard, not under
+    this lock, and is about to settle it. A failed check refuses (retry later).
     """
     config_dir = _config_dir()
     try:
         if not await char_lifecycle.handover_pending(config_dir, name, uid):
             return False
+        from main_routers.visit_router import background
         from utils import character_memory
+
+        if background.startup_recovery_running():
+            # 启动对账在被改名角色的守卫里迁这笔改名、不拿配置锁：这里再对一遍会和它并发改同一份标记，
+            # 它清标记失败就把这次启动的清除重放与逐场补录推到下次启动。它马上会迁完，先拒绝
+            return True
 
         async with character_memory.character_config_mutation_lock:
             return await char_lifecycle.handover_blocks_visit(config_dir, name, uid, _strict_local_names)

@@ -115,6 +115,11 @@ def start_visit_background_tasks() -> None:
         _recovery_task = asyncio.create_task(_recover_in_background(), name="visit-recovery")
 
 
+def startup_recovery_running() -> bool:
+    """Whether the startup recovery task is still running (it reconciles pending renames under their guards)."""
+    return _recovery_task is not None and not _recovery_task.done()
+
+
 def _cancel(task: Optional[asyncio.Task]) -> None:
     if task is not None and not task.done():
         task.cancel()
