@@ -28,6 +28,8 @@
   var PEER_STATS_FRESH_MS = 12000;
   var SOFTENC_WINDOW_MS = 10000;      // VISIT_VP9_CPU_FALLBACK 的秒数
   var SOFTENC_FPS_RATIO = 0.9;        // 27 / 30：编码帧率低于目标帧率的 90 % 算软编跟不上
+  var PUBLISH_RETRY_BASE_MS = 2000;   // SDK 拒绝发布后的首次重试间隔，之后翻倍
+  var PUBLISH_RETRY_MAX_MS = 30000;
   var VISIT_ID_RE = /^[A-Za-z0-9_-]{22}$/;
   var IN_ROOM = { joined: 1, connected: 1 };
 
@@ -173,6 +175,8 @@
     this.softencSince = null;
     this.statsMark = null;
     this.codecOverride = null;
+    this.publishRetries = 0;
+    this.publishRetryTimer = null;
     var self = this;
     this.core = new NVT.TransportCore({
       visitId: this.visitId,
@@ -367,6 +371,7 @@
     var sent = this.profile();
     this.adapter.publish(track, sent).then(function (ok) {
       if (ok === true && self.media.publish && !self.stopped) {
+        self.publishRetries = 0;
         // 发布挂起期间构图 / 阶梯 / 取帧帧率变了（那时 updateProfile 因未发布而无效）：补一次
         var now = self.profile();
         if (now.width !== sent.width || now.height !== sent.height || now.frameRate !== sent.frameRate || now.bitrate !== sent.bitrate) {
@@ -378,7 +383,29 @@
     }, function (err) {
       self.log('warn', 'publish failed', String(err && err.code));
       self.announcePublish(false);
+      self.schedulePublishRetry();
     });
+  };
+
+  /**
+   * SDK 拒绝发布（暂时性协商失败等）：后端的 media 快照只在状态变化时发一次，不能等它；
+   * 仍要发布时按退避间隔自己重试，直到成功、不再发布或结束。
+   */
+  P.schedulePublishRetry = function () {
+    if (this.publishRetryTimer || this.stopped || !this.media.publish) return;
+    var delay = Math.min(PUBLISH_RETRY_MAX_MS, PUBLISH_RETRY_BASE_MS * Math.pow(2, this.publishRetries));
+    this.publishRetries += 1;
+    var self = this;
+    this.publishRetryTimer = setTimeout(function () {
+      self.publishRetryTimer = null;
+      if (!self.stopped && self.media.publish && self.adapter && self.packer) self.publishNow();
+    }, delay);
+  };
+
+  P.cancelPublishRetry = function () {
+    if (this.publishRetryTimer) clearTimeout(this.publishRetryTimer);
+    this.publishRetryTimer = null;
+    this.publishRetries = 0;
   };
 
   /** SDK 自动重连失败（旧凭证鉴权失败）：用最新凭证、同一个 vid 手动重新入房。 */
@@ -514,6 +541,7 @@
         if (this.adapter) this.publishNow();
       } else if (msg.publish === false) {
         this.media.publish = false;
+        this.cancelPublishRetry();
         this.announcePublish(false);
         this.packer.active = false;
         if (this.adapter) this.adapter.unpublish();
@@ -531,6 +559,7 @@
   /** 停掉全部媒体（不离房、不 stop 画布轨）：guest 取消发布，host 取消订阅。同步执行。 */
   P.stopAllMedia = function () {
     this.media.publish = false;
+    this.cancelPublishRetry();
     this.loss = null;
     this.announcePublish(false);
     this.media.subscribe = false;
@@ -574,6 +603,7 @@
   };
 
   P.teardown = function () {
+    this.cancelPublishRetry();
     if (this.statsTimer) clearInterval(this.statsTimer);
     this.statsTimer = null;
     if (this.hiddenTimer) clearTimeout(this.hiddenTimer);

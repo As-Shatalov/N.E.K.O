@@ -1007,7 +1007,7 @@ def test_failed_trtc_remote_subscription_is_retried():
         await settle();
         await advance(2100);
         await settle();
-        await advance(2100);
+        await advance(4100);
         await settle();
         return kinds(h.log).filter((k) => k.startsWith('startRemote'));
         """
@@ -1033,3 +1033,88 @@ def test_capability_gate_finishing_after_socket_close_does_not_join():
         """
     )
     assert out == {"enter": 0, "sdkCaps": 0}
+
+
+def test_trtc_remote_subscription_keeps_retrying_with_backoff():
+    out = run_visit_js(
+        """
+        const h = await joinedController('host');
+        let fails = 8;
+        const orig = h.trtc.startRemoteVideo;
+        h.trtc.startRemoteVideo = (c) => { if (fails > 0) { fails -= 1; h.log.push(['startRemote-fail', clock.now]); return Promise.reject(new Error('transient')); } return orig(c); };
+        h.ws.serverSend({ type: 'media', subscribe: true, peer_vid: 'g_peer' });
+        h.trtc.emit('REMOTE_VIDEO_AVAILABLE', { userId: 'g_peer', streamType: 'main' });
+        await settle();
+        for (let i = 0; i < 12; i++) { await advance(31000); await settle(); }
+        const fails_at = h.log.filter((e) => e[0] === 'startRemote-fail').map((e) => e[1]);
+        const gaps = fails_at.slice(1).map((t, i) => t - fails_at[i]);
+        return { started: kinds(h.log).includes('startRemoteVideo'), failures: fails_at.length, maxGap: Math.max(...gaps) };
+        """
+    )
+    assert out["started"] is True
+    assert out["failures"] == 8
+    assert out["maxGap"] <= 31000
+
+
+def test_rejected_publish_is_retried_with_backoff():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        let fail = 2;
+        const orig = h.trtc.startLocalVideo;
+        h.trtc.startLocalVideo = (c) => { if (fail > 0) { fail -= 1; h.log.push(['startLocalVideo-fail']); return Promise.reject(new Error('transient')); } return orig(c); };
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        await advance(2100); await settle();
+        const afterFirst = kinds(h.log).filter((k) => k.startsWith('startLocalVideo'));
+        await advance(4100); await settle();
+        return { afterFirst, all: kinds(h.log).filter((k) => k.startsWith('startLocalVideo')),
+                 announced: h.posted.filter((m) => m.t === 'publish').map((m) => m.on) };
+        """
+    )
+    assert out["afterFirst"] == ["startLocalVideo-fail", "startLocalVideo-fail"]
+    assert out["all"] == ["startLocalVideo-fail", "startLocalVideo-fail", "startLocalVideo"]
+    assert out["announced"] == [False, True]
+
+
+def test_publish_retry_stops_when_publication_is_withdrawn():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        h.trtc.startLocalVideo = () => { h.log.push(['startLocalVideo-fail']); return Promise.reject(new Error('transient')); };
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        h.ws.serverSend({ type: 'media', publish: false });
+        await advance(60000); await settle();
+        return kinds(h.log).filter((k) => k.startsWith('startLocalVideo'));
+        """
+    )
+    assert out == ["startLocalVideo-fail"]
+
+
+def test_trtc_leave_waits_for_a_pending_enter_room():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const log = [];
+        const TRTC = makeFakeTRTC(log);
+        const states = [];
+        const handlers = { onPiece() {}, onPeer() {}, onState(s) { states.push(s); }, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = ctx.NekoVisitTransport.vendors.trtc.createAdapter({ sdk: TRTC, handlers });
+        let finishEnter;
+        const origCreate = TRTC.create;
+        TRTC.create = () => { const inst = origCreate(); inst.enterRoom = () => new Promise((r) => { finishEnter = r; }); return inst; };
+        const joining = a.join(credsFor('guest')).then(() => 'joined-resolved');
+        await settle();
+        let left = false;
+        a.leave().then(() => { left = true; });
+        await settle();
+        const leftBefore = left;
+        finishEnter();
+        await settle();
+        await joining;
+        return { leftBefore, leftAfter: left, states, canSend: a.canSend() };
+        """
+    )
+    assert out == {"leftBefore": False, "leftAfter": True, "states": ["joining"], "canSend": False}

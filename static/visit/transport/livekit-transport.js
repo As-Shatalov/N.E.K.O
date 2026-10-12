@@ -68,6 +68,7 @@
     var rxMark = null;
     var txMark = null;
     var localQuality = null;
+    var entering = null;
 
     function vendorOf(c) {
       return (c && c.vendor && c.vendor.livekit) || {};
@@ -216,7 +217,11 @@
         room = newRoom(c);
         bind();
         handlers.onState('joining', {});
-        return room.connect(v.url, v.token, { autoSubscribe: false }).then(function () {
+        var gen = roomGen;
+        var p = room.connect(v.url, v.token, { autoSubscribe: false });
+        entering = p.then(null, function () {});
+        return p.then(function () {
+          if (gen !== roomGen) return;   // 连接期间已离房：迟到的完成不记状态、不报 joined
           joined = true;
           room.remoteParticipants.forEach(function (p) {
             // 入房前就在的对端不会再触发 ParticipantConnected
@@ -315,7 +320,7 @@
         localQuality = null;
         if (!room) return Promise.resolve();
         var disconnecting = room.disconnect(false).catch(function () {});
-        return Promise.all([disconnecting, opChain]).then(function () {});
+        return Promise.all([disconnecting, opChain, entering]).then(function () {});
       },
       destroy: function () {
         room = null;

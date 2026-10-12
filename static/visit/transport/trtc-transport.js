@@ -11,8 +11,8 @@
   'use strict';
 
   var NVT = root.NekoVisitTransport = root.NekoVisitTransport || {};
-  var REMOTE_RETRY_DELAY_MS = 2000;   // startRemoteVideo 失败后的重试间隔
-  var REMOTE_RETRY_MAX = 5;           // 同一次可用之内最多重试几次
+  var REMOTE_RETRY_BASE_MS = 2000;    // startRemoteVideo 失败后的首次重试间隔，之后翻倍
+  var REMOTE_RETRY_MAX_MS = 30000;    // 重试间隔上限（一直重试到取消订阅 / 对端视频不可用 / 离房）
 
   function createTrtcAdapter(opts) {
     var TRTC = opts.sdk;
@@ -44,6 +44,7 @@
     var remoteStarted = false;
     var remoteRetries = 0;
     var remoteRetryTimer = null;
+    var entering = null;
     var lastStats = null;
     var lastNetwork = null;
 
@@ -82,6 +83,7 @@
         if (ev.userId !== remoteVideoUser) return;
         remoteVideoUser = null;
         remoteStarted = false;
+        clearRemoteRetry();
         handlers.onRemoteTrack(null);
       });
       trtc.on(E.TRACK, function (ev) {
@@ -145,14 +147,15 @@
           }, function (err) {
             remoteStarted = false;
             handlers.onLog('warn', 'trtc startRemoteVideo failed', String(err && err.code));
-            // REMOTE_VIDEO_AVAILABLE 只在可用性变化时来一次：同一订阅仍想要时隔一会儿自己重试
-            if (gen !== roomGen || remoteRetries >= REMOTE_RETRY_MAX) return;
+            // REMOTE_VIDEO_AVAILABLE 只在可用性变化时来一次：同一订阅仍想要时按退避间隔一直重试
+            if (gen !== roomGen) return;
+            var delay = Math.min(REMOTE_RETRY_MAX_MS, REMOTE_RETRY_BASE_MS * Math.pow(2, remoteRetries));
             remoteRetries += 1;
             clearRemoteRetry();
             remoteRetryTimer = setTimeout(function () {
               remoteRetryTimer = null;
               if (gen === roomGen && user === remoteVideoUser) maybeStartRemote();
-            }, REMOTE_RETRY_DELAY_MS);
+            }, delay);
           });
       });
     }
@@ -182,7 +185,12 @@
           bind();
         }
         handlers.onState('joining', {});
-        return enterRoom().then(function () {
+        var gen = roomGen;
+        var p = enterRoom();
+        // 离房的「完成」要等这次入房结束：否则重连可能在同一实例上再 enterRoom，与迟到的旧入房交错
+        entering = p.then(null, function () {});
+        return p.then(function () {
+          if (gen !== roomGen) return;   // 入房期间已离房：迟到的完成不记状态、不报 joined
           joined = true;
           // 防 SDK 自动把远端切到小流（串门只有一路主流）
           var stopping = trtc.stopPlugin('SmallStreamAutoSwitcher');
@@ -254,6 +262,7 @@
           maybeStartRemote();
           return Promise.resolve();
         }
+        clearRemoteRetry();
         handlers.onRemoteTrack(null);
         if (!trtc || !remoteStarted || !remoteVideoUser) return Promise.resolve();
         remoteStarted = false;
@@ -278,7 +287,7 @@
         // exitRoom 立即发出；交给重连的「离房完成」还要等在途的发布 / 撤销跑完，
         // 免得旧的 SDK 调用与新一次 enterRoom 交错
         var exiting = trtc.exitRoom().catch(function () {});
-        return Promise.all([exiting, opChain]).then(function () {});
+        return Promise.all([exiting, opChain, entering]).then(function () {});
       },
       destroy: function () {
         if (trtc) {
