@@ -1431,6 +1431,11 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
         mine = [row for row in rows if row.get("origin") == "neko_visit" and row.get("visit_id") == req.visit_id]
         already = len(mine)
         known_effects = {row.get("effect_key") for row in mine}
+        expected = {idempotency.effect_key_for(key, i): text for i, text in enumerate(texts)}
+        if any(expected.get(row.get("effect_key")) != row.get("text") for row in mine):
+            # 键记录缺失 / 畸形时才走到这里按事实池恢复：池里本场的行与这次请求的文本对不上，
+            # 就不能把这次的内容报成已写（与 content_hash 不符同一处理）
+            raise HTTPException(status_code=422, detail="visit_id reused with different facts")
         try:
             # 上次已落盘一部分、标 done 之前中断（或之后被删 / 被恢复掉几条）：照样带 effect_key 走一遍，
             # 已在的行按 effect_key 跳过，只补缺的；written 按真实条数算

@@ -950,3 +950,19 @@ async def test_a_terminal_facts_record_without_its_hash_is_not_trusted(env):
     body = await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
     assert body.get("duplicate") is not True and body["written"] == 2
     assert len([r for r in _pool(env) if r.get("visit_id") == VISIT]) == 2
+
+
+async def test_recovering_from_the_pool_refuses_different_fact_texts(env):
+    # 键记录丢失（或缺哈希）时按事实池恢复：池里本场的行与这次请求文本不同，不能报成已写
+    from fastapi import HTTPException
+
+    from app.memory_server import idempotency
+
+    await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
+    Path(idempotency.keys_path(NAME)).write_text("{}", encoding="utf-8")
+    with pytest.raises(HTTPException) as caught:
+        await _facts(env, ["在邻居家看了月亮", "邻居家有只白猫"])
+    assert caught.value.status_code == 422
+    # 同样的文本照常判为已写
+    body = await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
+    assert body["duplicate"] is True and body["written"] == 2
