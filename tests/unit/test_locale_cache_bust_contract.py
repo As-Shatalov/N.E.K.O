@@ -173,6 +173,8 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-10-03-assist-model-id-removal",
         "2026-10-03-model-picker-url-hint",
         "2026-10-03-assist-model-picker",
+        "2026-10-03-theater-air-basketball-main-merge",
+        "2026-10-03-model-picker-main-merge-round5",
         "2026-10-03-requesty-air-basketball-main-merge",
         "2026-10-01-click-guide-memory-reactivation",
         "2026-10-01-click-guide-review-main-merge",
