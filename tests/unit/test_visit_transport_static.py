@@ -866,3 +866,56 @@ def test_host_rejoin_waits_for_a_pending_remote_subscription():
         """
     )
     assert out == {"before": 0, "after": 1}
+
+
+def test_profile_change_during_pending_publish_is_applied_after_it():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        let finish;
+        const orig = h.trtc.startLocalVideo;
+        h.trtc.startLocalVideo = (c) => new Promise((r) => { finish = () => r(orig(c)); });
+        h.ws.serverSend({ type: 'media', publish: true, crop: 'upper', ladder: 0 });
+        await settle();
+        h.c.setGeometry('upper', 1);          // 发布挂起期间降了一档
+        finish();
+        await settle();
+        await settle();
+        const updates = h.log.filter((e) => e[0] === 'updateLocalVideo').map((e) => [e[1].width, e[1].height, e[1].bitrate]);
+        return updates[updates.length - 1];
+        """
+    )
+    assert out == [256, 704, 400]
+
+
+def test_new_socket_clears_backpressure():
+    out = run_visit_js(
+        """
+        const h = await joinedController('guest');
+        return h.ws.sent.filter((m) => m.type === 'tx_backpressure').map((m) => m.on);
+        """
+    )
+    assert out == [False]
+
+
+def test_persistent_livekit_quality_keeps_driving_the_ladder():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        const before = a.currentLossPct() ?? null;
+        await a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9' } });
+        const room = LK.Room.last;
+        room.emit('ConnectionQualityChanged', 'poor', room.localParticipant);
+        const poor = [a.currentLossPct(), a.currentLossPct()];
+        room.emit('ConnectionQualityChanged', 'good', room.localParticipant);
+        const good = a.currentLossPct();
+        await a.leave();
+        return { before, poor, good, afterLeave: a.currentLossPct() ?? null };
+        """
+    )
+    assert out == {"before": None, "poor": [100, 100], "good": 0, "afterLeave": None}

@@ -66,6 +66,7 @@
     var remotePublication = null;
     var remoteTrack = null;
     var rxMark = null;
+    var localQuality = null;
 
     function vendorOf(c) {
       return (c && c.vendor && c.vendor.livekit) || {};
@@ -185,7 +186,8 @@
       });
       room.on(E.ConnectionQualityChanged, function (quality, participant) {
         if (participant && room && participant === room.localParticipant) {
-          // poor / lost 视同上行丢包超阈值（拥塞阶梯用）
+          // 只在质量变化时回调：记住当前值，统计节拍每拍按它取样（currentLossPct）
+          localQuality = quality;
           var bad = quality === 'poor' || quality === 'lost';
           handlers.onNetwork({ lossPct: bad ? 100 : 0 });
         }
@@ -305,6 +307,7 @@
         remotePublication = null;
         remoteTrack = null;
         rxMark = null;
+        localQuality = null;
         if (!room) return Promise.resolve();
         var disconnecting = room.disconnect(false).catch(function () {});
         return Promise.all([disconnecting, opChain]).then(function () {});
@@ -317,6 +320,13 @@
       },
       stats: function () {
         return {};
+      },
+      /** 当前连接质量换算的丢包样本（poor / lost 视同超阈值）；未知返回 undefined。 */
+      currentLossPct: function () {
+        if (!joined || !localQuality) return undefined;
+        if (localQuality === 'poor' || localQuality === 'lost') return 100;
+        if (localQuality === 'excellent' || localQuality === 'good') return 0;
+        return undefined;
       },
       /** host 侧接收统计（rx_kbps / loss_pct / rtt_ms），取自订阅轨的 RTCRtpReceiver；后端要字段齐全才转给对端。 */
       receiverStats: function (nowMs) {

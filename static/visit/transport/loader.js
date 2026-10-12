@@ -226,6 +226,8 @@
     };
     if (this.preflight.reason) caps.reason = this.preflight.reason;
     this.sendBackend(caps);
+    // 本页的出站队列是新的：显式告诉后端没有背压（旧页面重载前报过 on:true 时，后端的标志不会自己清）
+    this.sendBackend({ type: 'tx_backpressure', on: false, queue: this.core.queueLength(), dropped: false });
   };
 
   P.onDownlink = function (msg) {
@@ -362,8 +364,16 @@
   P.publishNow = function () {
     var self = this;
     var track = this.packer.ensureTrack();
-    this.adapter.publish(track, this.profile()).then(function (ok) {
-      if (ok === true && self.media.publish && !self.stopped) self.announcePublish(true);
+    var sent = this.profile();
+    this.adapter.publish(track, sent).then(function (ok) {
+      if (ok === true && self.media.publish && !self.stopped) {
+        // 发布挂起期间构图 / 阶梯 / 取帧帧率变了（那时 updateProfile 因未发布而无效）：补一次
+        var now = self.profile();
+        if (now.width !== sent.width || now.height !== sent.height || now.frameRate !== sent.frameRate || now.bitrate !== sent.bitrate) {
+          self.adapter.updateProfile(now).then(null, function () {});
+        }
+        self.announcePublish(true);
+      }
       else if (ok === false) self.announcePublish(false);
     }, function (err) {
       self.log('warn', 'publish failed', String(err && err.code));
@@ -686,7 +696,9 @@
     if (!this.ladder || !this.media.publish) return;
     var rxFps = this.peerRxFps && now - this.peerRxFps.at <= PEER_STATS_FRESH_MS ? this.peerRxFps.value : undefined;
     // 丢包样本与对端接收帧率同样只认新鲜的（重连期间 SDK 可能不再回调质量）
-    var lossPct = this.loss && now - this.loss.at <= PEER_STATS_FRESH_MS ? this.loss.value : undefined;
+    var current = this.adapter && typeof this.adapter.currentLossPct === 'function' ? this.adapter.currentLossPct() : undefined;
+    var lossPct = typeof current === 'number' ? current
+      : (this.loss && now - this.loss.at <= PEER_STATS_FRESH_MS ? this.loss.value : undefined);
     var level = this.ladder.feed({ nowMs: now, rxFps: rxFps, lossPct: lossPct });
     if (level !== null) this.setGeometry(this.media.crop, level);
   };
