@@ -966,3 +966,17 @@ async def test_recovering_from_the_pool_refuses_different_fact_texts(env):
     # 同样的文本照常判为已写
     body = await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
     assert body["duplicate"] is True and body["written"] == 2
+
+
+@pytest.mark.parametrize("bad", ["two", -1, True, 1.5])
+async def test_a_terminal_facts_record_with_malformed_counters_recovers_from_the_pool(env, bad):
+    # 终态记录的计数畸形（手改 / 旧版本）：不抛 500，按事实池恢复
+    from app.memory_server import idempotency, routes
+
+    await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
+    data = json.loads(Path(idempotency.keys_path(NAME)).read_text(encoding="utf-8"))
+    data[f"visit-facts:{VISIT}"]["written"] = bad
+    Path(idempotency.keys_path(NAME)).write_text(json.dumps(data), encoding="utf-8")
+    body = await _facts(env, ["在邻居家看了星星", "邻居家有只白猫"])
+    assert body["duplicate"] is True and body["written"] == 2
+    assert len([r for r in _pool(env) if r.get("visit_id") == VISIT]) == 2

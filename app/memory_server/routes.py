@@ -1417,11 +1417,20 @@ async def write_visit_facts(lanlan_name: str, req: VisitFactsRequest):
         if stored_hash is not None and stored_hash != facts_hash:
             # 同一场只有一份事实（客户端重试用落盘的同一份）：内容变了是调用方的错，不能报成已写
             raise HTTPException(status_code=422, detail="visit_id reused with different facts")
+        def _counter(value: object) -> int | None:
+            if value is None:
+                return 0
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            return value
+
+        written_n = _counter(record.get("written")) if record is not None else None
+        deduped_n = _counter(record.get("deduped")) if record is not None else None
         if (record is not None and record.get("state") in idempotency.TERMINAL_KEY_STATES
-                and isinstance(stored_hash, str) and stored_hash):
-            return {"ok": True, "written": int(record.get("written") or 0),
-                    "deduped": int(record.get("deduped") or 0), "duplicate": True}
-        # 记录缺内容哈希（畸形）：不凭它回「已写过」，与没有记录一样按事实池里本场的行判定、只补缺的
+                and isinstance(stored_hash, str) and stored_hash
+                and written_n is not None and deduped_n is not None):
+            return {"ok": True, "written": written_n, "deduped": deduped_n, "duplicate": True}
+        # 记录缺内容哈希或计数畸形：不凭它回「已写过」，与没有记录一样按事实池里本场的行判定、只补缺的
         try:
             rows = await runtime.fact_store.aload_facts_strict(lanlan_name, include_archive=True)
         except RuntimeError as exc:
