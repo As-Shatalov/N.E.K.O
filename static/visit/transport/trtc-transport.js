@@ -187,8 +187,12 @@
         handlers.onState('joining', {});
         var gen = roomGen;
         var p = enterRoom();
-        // 离房的「完成」要等这次入房结束：否则重连可能在同一实例上再 enterRoom，与迟到的旧入房交错
-        entering = p.then(null, function () {});
+        // 离房的「完成」要等这次入房结束：否则重连可能在同一实例上再 enterRoom，与迟到的旧入房交错。
+        // 入房期间已离房、旧入房又迟到成功：先发的 exitRoom 可能落在它之前，这里再退一次
+        entering = p.then(function () {
+          if (gen !== roomGen && trtc) return trtc.exitRoom().catch(function () {});
+          return undefined;
+        }, function () {});
         return p.then(function () {
           if (gen !== roomGen) return;   // 入房期间已离房：迟到的完成不记状态、不报 joined
           joined = true;
@@ -336,7 +340,8 @@
       if (d.isH264EncodeSupported || d.isH264DecodeSupported) codecs.push('h264');
       if (d.isVp8EncodeSupported || d.isVp8DecodeSupported) codecs.push('vp8');
       return {
-        transportOk: d.isWebRTCSupported !== false && typeof root.RTCPeerConnection === 'function',
+        // result 是 SDK 的总判定（还看浏览器、媒体设备等），detail 只是其中几项
+        transportOk: !!(res && res.result === true) && d.isWebRTCSupported !== false && typeof root.RTCPeerConnection === 'function',
         encode: !!(d.isH264EncodeSupported || d.isVp8EncodeSupported),
         decode: !!(d.isH264DecodeSupported || d.isVp8DecodeSupported),
         codecs: codecs,

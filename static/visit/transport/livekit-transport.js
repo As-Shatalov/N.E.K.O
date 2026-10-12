@@ -258,8 +258,13 @@
         bind();
         handlers.onState('joining', {});
         var gen = roomGen;
-        var p = room.connect(v.url, v.token, { autoSubscribe: false });
-        entering = p.then(null, function () {});
+        var current = room;
+        var p = current.connect(v.url, v.token, { autoSubscribe: false });
+        // 连接期间已离房、旧连接又迟到成功：再断开那个旧房间对象一次
+        entering = p.then(function () {
+          if (gen !== roomGen) return Promise.resolve(current.disconnect(false)).catch(function () {});
+          return undefined;
+        }, function () {});
         return p.then(function () {
           if (gen !== roomGen) return;   // 连接期间已离房：迟到的完成不记状态、不报 joined
           joined = true;

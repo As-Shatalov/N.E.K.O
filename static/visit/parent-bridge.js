@@ -22,6 +22,9 @@
   var CROP_REFRESH_MS = 600;            // VISIT_CROP_REFRESH_MS 区间内
   var STARVATION_MS = 1000;             // VISIT_FRAME_STARVATION_S
   var READY_TIMEOUT_MS = 15000;
+  var TOKEN_LOOKUP_TIMEOUT_MS = 5000;   // 取 CSRF token 卡住时按失败处理
+  var TOKEN_RETRY_BASE_MS = 1000;       // 取不到 token 时的重试间隔，之后翻倍
+  var TOKEN_RETRY_MAX_MS = 15000;
   var PEER_AWAY_OPACITY = '0.6';
   var CROP_ASPECT = { upper: 320 / 448, full: 256 / 560 };   // 与传输页 CROP_GEOMETRY 同一构图
   var HOST_FRAME_STYLE = 'position:fixed;z-index:4;border:0;background:transparent;pointer-events:none;' +
@@ -92,6 +95,8 @@
       sink: null,
       ready: false,
       readyTimer: null,
+      authTimer: null,
+      authGen: 0,
       tickTimer: null,
       lastCropAt: -Infinity,
       cropMode: 'upper',
@@ -292,6 +297,8 @@
       stopTick();
       if (state.readyTimer !== null) clearTimeoutFn(state.readyTimer);
       state.readyTimer = null;
+      if (state.authTimer !== null) clearTimeoutFn(state.authTimer);
+      state.authTimer = null;
       if (state.frame) {
         try {
           state.frame.remove();
@@ -331,6 +338,62 @@
       return sec.getMutationHeaders().then(function (h) { return (h && h['X-CSRF-Token']) || ''; });
     }
 
+    /** 重取 token：页面配置一时失败时 getToken 会一直给缓存的空结果，要走 refreshToken。 */
+    function refreshTokenLookup() {
+      if (typeof env.getToken === 'function') return env.getToken();
+      var sec = win.nekoLocalMutationSecurity;
+      if (sec && typeof sec.refreshToken === 'function') return Promise.resolve(sec.refreshToken()).then(function (t) { return t || ''; });
+      return getToken();
+    }
+
+    function boundedToken(lookup) {
+      return new Promise(function (resolve) {
+        var done = false;
+        var timer = setTimeoutFn(function () {
+          if (done) return;
+          done = true;
+          resolve('');
+        }, TOKEN_LOOKUP_TIMEOUT_MS);
+        Promise.resolve(lookup).then(function (t) { return t; }, function () { return ''; }).then(function (t) {
+          if (done) return;
+          done = true;
+          clearTimeoutFn(timer);
+          resolve(typeof t === 'string' ? t : '');
+        });
+      });
+    }
+
+    /**
+     * iframe 报 ready 后交 token 让它连传输 WS。iframe 只报一次 ready：取不到（卡住 / 空）
+     * 就按退避重取，直到拿到或这个 iframe 被换掉。
+     */
+    function authenticate(f, sink, attempt, gen) {
+      boundedToken(attempt === 0 ? getToken() : refreshTokenLookup()).then(function (token) {
+        if (state.frame !== f || gen !== state.authGen) return;
+        if (!token) {
+          var delay = Math.min(TOKEN_RETRY_MAX_MS, TOKEN_RETRY_BASE_MS * Math.pow(2, attempt));
+          if (state.authTimer !== null) clearTimeoutFn(state.authTimer);
+          state.authTimer = setTimeoutFn(function () {
+            state.authTimer = null;
+            if (state.frame === f && gen === state.authGen) authenticate(f, sink, attempt + 1, gen);
+          }, delay);
+          return;
+        }
+        // 先同步交 token，iframe 拿到 token 才连传输 WS（首帧 auth）
+        sink.setAuthToken(token);
+        state.sink = sink;
+        state.ready = true;
+        // 就绪前发出的 place / crop 落在 iframe 的监听器装好之前、已经丢了：清缓存让下一拍重发
+        state.place = null;
+        state.rect = null;
+        state.rectFrom = null;
+        state.lastCropAt = -Infinity;
+        if (state.phase) post({ t: 'visit_state', phase: state.phase });
+        syncCapture();
+        tick(true);
+      });
+    }
+
     function onFrameMessage(event) {
       var f = state.frame;
       if (!f || event.source !== f.contentWindow || event.origin !== win.location.origin) return;
@@ -340,21 +403,11 @@
         if (data.visit_id !== state.visitId || data.side !== state.side) return;
         var sink = f.contentWindow && f.contentWindow.__nekoVisitFrameSink;
         if (!sink || typeof sink.setAuthToken !== 'function') return;
-        getToken().then(function (token) {
-          if (state.frame !== f || !token) return;
-          // 先同步交 token，iframe 拿到 token 才连传输 WS（首帧 auth）
-          sink.setAuthToken(token);
-          state.sink = sink;
-          state.ready = true;
-          // 就绪前发出的 place / crop 落在 iframe 的监听器装好之前、已经丢了：清缓存让下一拍重发
-          state.place = null;
-          state.rect = null;
-          state.rectFrom = null;
-          state.lastCropAt = -Infinity;
-          if (state.phase) post({ t: 'visit_state', phase: state.phase });
-          syncCapture();
-          tick(true);
-        });
+        // iframe 每报一次 ready 就重新交一次 token（它重载过就要新的）；旧的重试作废
+        state.authGen += 1;
+        if (state.authTimer !== null) clearTimeoutFn(state.authTimer);
+        state.authTimer = null;
+        authenticate(f, sink, 0, state.authGen);
       } else if (data.t === 'publish') {
         state.publishing = data.on === true;
         syncCapture();

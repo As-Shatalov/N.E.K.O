@@ -1452,3 +1452,72 @@ def test_hidden_avatar_does_not_count_as_vp9_overload():
         """
     )
     assert out == {"hidden": [False, False, False, False], "shown": [False, False, True, True]}
+
+
+def test_trtc_stale_enter_room_is_exited_again():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const log = [];
+        const TRTC = makeFakeTRTC(log);
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = ctx.NekoVisitTransport.vendors.trtc.createAdapter({ sdk: TRTC, handlers });
+        let finishEnter;
+        const origCreate = TRTC.create;
+        TRTC.create = () => { const inst = origCreate(); inst.enterRoom = () => new Promise((r) => { finishEnter = r; }); return inst; };
+        a.join(credsFor('guest'));
+        await settle();
+        let left = false;
+        a.leave().then(() => { left = true; });
+        await settle();
+        const exitsBefore = kinds(log).filter((k) => k === 'exitRoom').length;
+        finishEnter();
+        await settle();
+        return { exitsBefore, exitsAfter: kinds(log).filter((k) => k === 'exitRoom').length, left };
+        """
+    )
+    assert out == {"exitsBefore": 1, "exitsAfter": 2, "left": True}
+
+
+def test_livekit_stale_connect_is_disconnected_again():
+    out = run_visit_js(
+        _FAKE_LIVEKIT + """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const LKV = ctx.NekoVisitTransport.vendors.livekit;
+        const LK = makeFakeLK([]);
+        let finish;
+        let disconnects = 0;
+        const origConnect = LK.Room.prototype.connect;
+        LK.Room.prototype.connect = function () { return new Promise((r) => { finish = r; }); };
+        LK.Room.prototype.disconnect = function () { disconnects += 1; return Promise.resolve(); };
+        const handlers = { onPiece() {}, onPeer() {}, onState() {}, onRemoteTrack() {}, onNetwork() {}, onNeedRejoin() {}, onLog() {} };
+        const a = LKV.createAdapter({ sdk: LK, handlers });
+        a.join({ vendor: { livekit: { url: 'wss://lk.example.com', token: 't' } }, allowed_hosts: ['lk.example.com'], publish: { codec: 'vp9' } });
+        await settle();
+        let left = false;
+        a.leave().then(() => { left = true; });
+        await settle();
+        const before = { disconnects, left };
+        finish();
+        await settle();
+        return { before, after: { disconnects, left } };
+        """
+    )
+    assert out == {"before": {"disconnects": 1, "left": False}, "after": {"disconnects": 2, "left": True}}
+
+
+def test_trtc_capabilities_require_the_overall_verdict():
+    out = run_visit_js(
+        """
+        const ctx = makeContext();
+        load(ctx, FILES);
+        const caps = ctx.NekoVisitTransport.vendors.trtc.capabilities;
+        const detail = { isWebRTCSupported: true, isH264EncodeSupported: true, isVp8EncodeSupported: true, isH264DecodeSupported: true, isVp8DecodeSupported: true };
+        const ok = await caps({ isSupported: () => Promise.resolve({ result: true, detail }) });
+        const no = await caps({ isSupported: () => Promise.resolve({ result: false, detail }) });
+        return [ok.transportOk, no.transportOk];
+        """
+    )
+    assert out == [True, False]

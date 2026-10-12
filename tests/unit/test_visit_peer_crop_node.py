@@ -28,7 +28,7 @@ function makeBridge(opts) {
   };
   ctx.avatarPortrait = { normalizeModelType: () => 'live2d', capture: () => Promise.resolve('img') };
   load(ctx, FILES);
-  const bridge = ctx.NekoVisitParentBridge.createParentBridge({ window: ctx, document: ctx.document, getToken: () => Promise.resolve('tok'), assetVersion: '9' });
+  const bridge = ctx.NekoVisitParentBridge.createParentBridge({ window: ctx, document: ctx.document, getToken: opts.getToken || (() => Promise.resolve('tok')), assetVersion: '9' });
   const child = { posted: [], onFrames: [], token: null, suspended: [] };
   child.postMessage = (m) => child.posted.push(JSON.parse(JSON.stringify(m)));
   child.__nekoVisitFrameSink = {
@@ -358,3 +358,26 @@ def test_png_capture_follows_mirror_and_viewport():
     assert out["edge"]["frames"] > 0 and abs(center_css - 1810) < 15
     # 取景框可以伸到屏幕外，但交给打包器的可见源图区域只到视口右边缘：(1920-1700)*2.5 = 550
     assert edge["visible"] == {"x": 0, "y": 0, "w": 550, "h": 2000}
+
+
+def test_token_lookup_is_retried_until_the_iframe_can_authenticate():
+    out = run_visit_js(
+        _BRIDGE_JS + """
+        const answers = [() => new Promise(() => {}), () => Promise.resolve(''), () => Promise.reject(new Error('net')), () => Promise.resolve('tok')];
+        let calls = 0;
+        const h = makeBridge({ getToken: () => answers[Math.min(calls++, answers.length - 1)]() });
+        await open(h, 'guest', false);
+        const early = h.child.token;
+        await advance(5100);      // 第一次卡住：5 s 超时
+        await advance(1100);      // 空 token → 1 s 后重取
+        await advance(2100);      // 拒绝 → 2 s 后重取
+        await advance(4100);      // 第四次拿到
+        const got = h.child.token;
+        const n = calls;
+        await advance(60000);
+        change(h, 'ended');
+        return { early, got, calls: n, later: calls };
+        """,
+        files=BRIDGE_FILES,
+    )
+    assert out == {"early": None, "got": "tok", "calls": 4, "later": 4}
