@@ -144,6 +144,37 @@ class _StreamingMixin:
         self._conversation_history = [
             SystemMessage(content=instructions)
         ]
+
+        # Discover the *loaded* context capacity when the provider can report
+        # it.  This is intentionally best-effort and local-only today: a failed
+        # probe must never prevent the chat from starting.  The core turn
+        # lifecycle consumes this value to replace the old arbitrary 10-turn /
+        # 5k-token rollover with a high-water mark derived from the model that
+        # is actually loaded.
+        try:
+            from main_logic.context_window import resolve_context_window_tokens
+
+            self.context_window_tokens = await resolve_context_window_tokens(
+                base_url=self.base_url,
+                model=self.model,
+                api_key=self.api_key,
+            )
+        except Exception as exc:  # pragma: no cover - best-effort discovery
+            logger.debug("OmniOfflineClient: context-window discovery skipped: %s", exc)
+            self.context_window_tokens = None
+
+        if self.context_window_tokens:
+            logger.info(
+                "OmniOfflineClient: loaded context window detected: %s tokens (model=%s)",
+                self.context_window_tokens,
+                self.model,
+            )
+        else:
+            logger.info(
+                "OmniOfflineClient: context window unknown; using legacy session rollover policy "
+                "(model=%s)",
+                self.model,
+            )
         logger.info("OmniOfflineClient initialized with instructions")
 
     async def send_event(self, event) -> None:

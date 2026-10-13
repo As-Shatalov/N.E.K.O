@@ -203,16 +203,37 @@ TTS_PROVIDER_REGISTRY: dict[str, TTSProviderMeta] = {
         audio_format="PCM (采样率由服务端决定) → resample 48kHz",
         notes="连接本地 GPT-SoVITS 服务；支持 voice_id|JSON 高级参数",
     ),
+    # HELI_TTS_LOCAL_COSYVOICE_META_V1
     "local_cosyvoice": TTSProviderMeta(
         name="local_cosyvoice",
-        category="local",
-        protocol="HTTP POST (本地 CosyVoice 服务)",
-        input_streaming=False,
+
+        # The existing worker is a true
+        # bidirectional WebSocket stream.
+        category="ws_bistream",
+
+        protocol=(
+            "WebSocket "
+            "(local CosyVoice-compatible stream)"
+        ),
+
+        input_streaming=True,
         output_streaming=True,
-        client_sentence_split=True,
-        audio_format="PCM → resample 48kHz",
-        notes="连接本地 CosyVoice 服务",
+
+        # The Heli Gateway handles sentence
+        # buffering before Fish S2.
+        client_sentence_split=False,
+
+        audio_format=(
+            "PCM 22.05kHz -> "
+            "resample 48kHz"
+        ),
+
+        notes=(
+            "Heli local TTS gateway; "
+            "routes N.E.K.O speech to Fish S2"
+        ),
     ),
+
     "vllm_omni": TTSProviderMeta(
         name="vllm_omni",
         category="ws_bistream",

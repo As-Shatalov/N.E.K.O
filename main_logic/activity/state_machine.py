@@ -162,6 +162,50 @@ _QUESTION_MARKS: tuple[str, ...] = ('?', '？')
 # 的非句末用法，收了会把「我不知道該說什麼」误判成问句。
 _CN_QUESTION_PARTICLES: tuple[str, ...] = ('吗', '嗎', '呢', '么', '吧')
 
+# Low-information conversational closers should NOT become unfinished threads.
+#
+# ``unfinished_thread`` is a strong proactive-chat signal: once opened, it can
+# override normal source gating and invite a follow-up even when the user stays
+# silent.  Treating generic chatbot glue ("what next?", "anything else?")
+# as a real unresolved topic therefore creates exactly the wrong feedback loop.
+# Keep this list deliberately conservative and exact-match only: a question that
+# carries any additional subject matter (for example "what next with the 429
+# error?") must remain eligible.  Entries are stored in the normalized form
+# produced by ``_normalize_question_clause`` below.
+_GENERIC_CONVERSATION_CLOSERS: frozenset[str] = frozenset({
+    # Russian
+    'что дальше', 'а что дальше', 'и что дальше', 'ну что дальше',
+    'ну и что дальше', 'что теперь', 'а что теперь', 'что будем делать',
+    'что будем делать дальше', 'что делаем дальше', 'чем займёмся',
+    'чем займемся', 'о чём поговорим', 'о чем поговорим',
+    'о чём поговорим дальше', 'о чем поговорим дальше', 'что ещё',
+    'что еще', 'чего хочешь', 'что хочешь делать', 'что хочешь дальше',
+    # English
+    'what next', 'so what next', 'and what next', 'whats next',
+    'what do we do next', 'what should we do next', 'what do you want to do',
+    'what do you want to talk about', 'anything else', 'what else',
+    # Simplified / Traditional Chinese
+    '接下来呢', '接下來呢', '接下来做什么', '接下來做什麼',
+    '接下来想做什么', '接下來想做什麼', '还想聊什么', '還想聊什麼',
+    '还想做什么', '還想做什麼', '然后呢', '然後呢', '还有什么',
+    '還有什麼', '下一步呢',
+    # Japanese
+    '次はどうする', '次は何する', '何話す', '他に何か',
+    # Korean
+    '다음은', '다음에 뭐 할까', '뭐 할까', '무슨 얘기할까',
+    # Spanish
+    'qué sigue', 'que sigue', 'qué hacemos ahora', 'que hacemos ahora',
+    'de qué hablamos', 'de que hablamos', 'algo más', 'algo mas',
+    # Portuguese
+    'e agora', 'o que fazemos agora', 'sobre o que vamos falar',
+    'mais alguma coisa',
+})
+
+_QUESTION_CLAUSE_BREAKS: tuple[str, ...] = ('\n', '.', '。', '!', '！')
+_QUESTION_CLAUSE_PUNCTUATION = str.maketrans({
+    ch: ' ' for ch in "\t\r,，、:：;；?？!！.。…~～—–-_()[]{}<>\"'“”‘’`"
+})
+
 
 def _strip_emotion_tags(text: str) -> str:
     """Drop ``<emotion>`` decoration so it doesn't count toward tail.
@@ -186,32 +230,61 @@ def _strip_emotion_tags(text: str) -> str:
     return ''.join(out)
 
 
+def _normalize_question_clause(text: str) -> str:
+    """Return a stable, low-noise form of the final conversational clause.
+
+    Only hard sentence boundaries are considered here. Question marks are NOT
+    boundaries: ``"Ты проверил билд? Что дальше?"`` contains a substantive
+    question before the generic closer, so the full clause intentionally fails
+    the exact generic-closer match and remains an unfinished thread.
+    """
+    cleaned = _strip_emotion_tags(text).strip()
+    if not cleaned:
+        return ''
+
+    start = max(cleaned.rfind(mark) for mark in _QUESTION_CLAUSE_BREAKS)
+    clause = cleaned[start + 1:] if start >= 0 else cleaned
+    normalized = clause.casefold().translate(_QUESTION_CLAUSE_PUNCTUATION)
+    return ' '.join(normalized.split())
+
+
+def _is_generic_conversation_closer(text: str) -> bool:
+    """Whether the final question is low-information chatbot glue.
+
+    Exact matching is intentional.  We would rather let an unusual generic
+    closer through than suppress a real topic-bearing question.
+    """
+    return _normalize_question_clause(text) in _GENERIC_CONVERSATION_CLOSERS
+
+
 def _text_has_open_question(text: str | None) -> bool:
-    """Heuristic: did the AI just ask something the user hasn't answered?
+    """Heuristic: did the AI just ask something worth following up?
 
-    True when:
-      * Last ``_QUESTION_TAIL_LEN`` chars contain ``?`` or ``？``, OR
-      * Trailing chars (after stripping whitespace + one trailing
-        punctuation) end with a CN sentence-final question particle.
+    True when the turn has a question in its tail (or a CJK sentence-final
+    question particle) *and* the final clause is not a known low-information
+    conversational closer such as "what next?" / "что дальше?".
 
-    False positives are tolerable — they at most enable one extra
-    follow-up window. False negatives just mean we miss a thread.
+    The generic-closer guard is deliberately conservative because an
+    ``unfinished_thread`` is a strong proactive-chat signal. False negatives
+    merely miss one follow-up opportunity; false positives can make the
+    character nag the user about a question that carried no actual topic.
     """
     if not text:
         return False
     cleaned = _strip_emotion_tags(text).strip()
     if not cleaned:
         return False
+
     tail = cleaned[-_QUESTION_TAIL_LEN:]
-    if any(m in tail for m in _QUESTION_MARKS):
-        return True
-    # CJK particle check: strip up to one trailing punctuation.
-    trail = cleaned.rstrip(' 。、，,.!！~～…')
-    if not trail:
+    has_question = any(m in tail for m in _QUESTION_MARKS)
+    if not has_question:
+        # CJK particle check: strip up to one trailing punctuation.
+        trail = cleaned.rstrip(' 。、，,.!！~～…')
+        has_question = bool(trail and trail[-1] in _CN_QUESTION_PARTICLES)
+
+    if not has_question:
         return False
-    if trail[-1] in _CN_QUESTION_PARTICLES:
-        return True
-    return False
+    return not _is_generic_conversation_closer(cleaned)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────

@@ -19,6 +19,9 @@ def _restore_state_globals():
     source_loaded_path = state._source_history_loaded_path
     totals = dict(state._proactive_chat_totals)
     ever_delivered = dict(state._invite_ever_delivered)
+    engagement = {
+        name: dict(entry) for name, entry in state._proactive_engagement_state.items()
+    }
     totals_loaded = state._proactive_chat_totals_loaded
     totals_loaded_path = state._proactive_chat_totals_loaded_path
     yield
@@ -30,6 +33,8 @@ def _restore_state_globals():
     state._proactive_chat_totals.update(totals)
     state._invite_ever_delivered.clear()
     state._invite_ever_delivered.update(ever_delivered)
+    state._proactive_engagement_state.clear()
+    state._proactive_engagement_state.update(engagement)
     state._proactive_chat_totals_loaded = totals_loaded
     state._proactive_chat_totals_loaded_path = totals_loaded_path
 
@@ -128,6 +133,7 @@ async def test_totals_schema_and_atomic_invite_update_use_explicit_root(
     final_snapshot = writer.await_args_list[-1].args[1]
     assert final_snapshot["totals"] == {"Yui": 2}
     assert final_snapshot["ever_delivered"] == {"Yui": True}
+    assert final_snapshot["engagement"] == {}
 
 
 @pytest.mark.asyncio

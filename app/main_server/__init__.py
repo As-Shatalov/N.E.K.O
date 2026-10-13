@@ -216,6 +216,18 @@ templates = Jinja2Templates(directory=template_dir)
 
 
 def initialize_steamworks(*, quiet: bool = False):
+    #Добавил этот блок
+    if os.getenv("NEKO_DISABLE_STEAMWORKS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        if "logger" in globals():
+            logger.info(
+                "Steamworks disabled by NEKO_DISABLE_STEAMWORKS"
+            )
+        return None
     # quiet=True 供后台静默重试使用：无 Steam 环境（如远端服务器部署）下，
     # 前端轮询会每隔几秒触发一次重试，若按 ERROR/print 输出会无限刷屏。静默
     # 模式把进度与失败日志统一降到 DEBUG，只有首次启动的尝试保持可见。

@@ -68,6 +68,7 @@ from main_logic.proactive_chat.decisions import (
     _decide_busy_entry_guard,
     _decide_closed_activity_gate,
     _decide_empty_source_gate,
+    _decide_engagement_policy,
     _decide_game_route_entry_guard,
     _decide_manager_entry_guard,
     _decide_probabilistic_activity_gate,
@@ -121,6 +122,8 @@ from main_logic.proactive_chat.state import (
     _ensure_source_history_loaded,
     _format_recent_proactive_chats,
     _increment_proactive_chat_total,
+    _reconcile_proactive_user_engagement,
+    _record_proactive_engagement_delivery,
     _record_invite_delivery_persistent,
     _record_source_used,
     _source_hash,
@@ -158,6 +161,29 @@ __all__ = [
 
 
 logger = get_module_logger(__name__, "Main")
+
+
+def _render_engagement_guidance(policy) -> str:
+    """Render a compact Phase-2 style constraint for social-pressure state."""
+    if policy is None or not getattr(policy, "avoid_questions", False):
+        return ""
+    unanswered = max(0, int(getattr(policy, "unanswered_streak", 0) or 0))
+    if unanswered:
+        reason = (
+            f"The user has not replied to the last {unanswered} proactive "
+            "message(s). Silence is not a request for another question."
+        )
+    else:
+        reason = "Recent proactive messages have leaned too heavily on questions."
+    return (
+        "<EngagementPressure>\n"
+        f"- {reason}\n"
+        "- Do NOT end this proactive message with a question.\n"
+        "- Do NOT ask what to do next, what to talk about, or ask the user to choose a topic.\n"
+        "- Prefer one self-contained observation, recollection, joke, opinion, "
+        "or gentle remark that does not require a reply.\n"
+        "</EngagementPressure>"
+    )
 
 
 def _consume_repeat_suppressed_break_reminder(
@@ -567,6 +593,16 @@ async def handle_proactive_chat(
             else {}
         )
 
+        # PATCH 03: reconcile persisted social-pressure state against the
+        # manager's authoritative latest genuine user engagement. A user reply
+        # after the last proactive turn clears the unanswered streak; passive
+        # scheduler ticks do not.
+        engagement_snapshot = await _reconcile_proactive_user_engagement(
+            lanlan_name,
+            user_engagement_at=getattr(mgr, "last_user_engagement_time", None),
+            **state_storage_kwargs,
+        )
+
         # 检查能否发起新一轮主动搭话：状态机统一把 "AI 正在响应"（_is_responding）、
         # "另一轮 proactive 在跑"（phase != IDLE）两个信号收拢到 O(1) 判定。
         # mgr.is_active 仅用于判断 session 是否已实例化，故仍需保留。
@@ -631,6 +667,18 @@ async def handle_proactive_chat(
                     body=entry_result.body,
                     status_code=entry_result.status_code,
                 )
+            voice_engagement_policy = _decide_engagement_policy(engagement_snapshot)
+            if voice_engagement_policy.result is not None:
+                logger.info(
+                    "[%s] voice proactive social backoff: unanswered=%d retry_after=%.0fs",
+                    lanlan_name,
+                    voice_engagement_policy.unanswered_streak,
+                    voice_engagement_policy.retry_after_seconds,
+                )
+                return ProactiveChatResult(
+                    body=voice_engagement_policy.result.body,
+                    status_code=voice_engagement_policy.result.status_code,
+                )
             voice_language = _resolve_proactive_locale(command, mgr, fmt="full")
             delivered = await mgr.trigger_voice_proactive_nudge(
                 language=voice_language,
@@ -642,6 +690,11 @@ async def handle_proactive_chat(
                 # 持久化"累计成功投递的主动搭话总数"，给 force-first 用。
                 await _increment_proactive_chat_total(
                     lanlan_name, **state_storage_kwargs
+                )
+                await _record_proactive_engagement_delivery(
+                    lanlan_name,
+                    message=None,
+                    **state_storage_kwargs,
                 )
             else:
                 logger.info(
@@ -1321,24 +1374,25 @@ async def handle_proactive_chat(
                 )
             )
 
-        # 用户把所有 source toggle 都关了（仅留 mini-game 邀请独立 toggle 触发本轮
-        # 请求），mini-game 短路又没命中：没什么可聊。直接 pass 而不是落到下面源
-        # picking 走空 list / 撞 "所有信息源获取失败" 500 分支。例外：仍然有未收尾
-        # 话题 → 让 Phase 2 走 text-only 跟进路径（与 sources={} 但 thread 在的兜
-        # 底语义对齐）。codex P1 指出：BC fallback 已经按 "字段缺席 vs 显式 []" 分
-        # 流，这里对显式空清晰退出。
-        source_result = _decide_empty_source_gate(
-            enabled_modes,
+        # PATCH 03 social-pressure gate. Must-fire reminders and mini-game invites
+        # already had their dedicated chance above; this only throttles ordinary
+        # unsolicited conversation. A meaningful unfinished thread keeps its one
+        # follow-up privilege (PATCH 01 already strips generic closers).
+        engagement_policy = _decide_engagement_policy(
+            engagement_snapshot,
             has_unfinished_thread=_has_unfinished_thread,
         )
-        if source_result is not None:
-            print(
-                f"[{lanlan_name}] enabled_modes 空 + mini-game miss + 无 unfinished_thread → pass"
+        if engagement_policy.result is not None:
+            logger.info(
+                "[%s] proactive social backoff: unanswered=%d retry_after=%.0fs",
+                lanlan_name,
+                engagement_policy.unanswered_streak,
+                engagement_policy.retry_after_seconds,
             )
             return await _end_proactive(
                 ProactiveChatResult(
-                    body=source_result.body,
-                    status_code=source_result.status_code,
+                    body=engagement_policy.result.body,
+                    status_code=engagement_policy.result.status_code,
                 )
             )
 
@@ -1356,22 +1410,11 @@ async def handle_proactive_chat(
         avatar_position = command.avatar_position
 
         if not sources:
-            # 例外：未收尾话题模式下 enabled_modes 可能本就被清空（restricted_screen_only
-            # + 无 vision），sources 必定为空但不应当 pass —— 让 Phase 2 拿对话
-            # 历史 + state_section 跑 text-only [CHAT] 跟进。
-            if not _has_unfinished_thread:
-                return await _end_proactive(
-                    ProactiveChatResult(
-                        body=_proactive_pass_body(
-                            PROACTIVE_REASON_ERROR_SOURCE_FETCH_FAILED,
-                            success=False,
-                            error="所有信息源获取失败",
-                        ),
-                        status_code=500,
-                    )
-                )
+            # 不在这里提前失败。Memory Server 的 followup_topics 还没有读取；
+            # 一条有效的长期回忆线索本身就是合法的 proactive source。最终的
+            # source-empty / fetch-failed 判定放到回忆候选取完之后。
             print(
-                f"[{lanlan_name}] sources 为空但有未收尾话题，进入 text-only 跟进路径"
+                f"[{lanlan_name}] 外部 sources 为空，延后到 memory follow-up 后再判定是否 pass"
             )
 
         # Phase 1 preempt check：信息源并行 fetch 完，正式进入 LLM 前先瞄一眼
@@ -1537,6 +1580,51 @@ async def handle_proactive_chat(
                 )
             )
 
+        # Memory follow-up topics are a first-class proactive source.  Only a
+        # rendered cue counts: blank/duplicate candidates filtered out by
+        # _render_followup_topic_hooks must not keep an otherwise empty turn alive.
+        _has_memory_initiative = bool(followup_topics_prompt)
+
+        # The old source-empty gate ran before memory lookup, so users who disabled
+        # web/screen/music also accidentally disabled memory-driven initiative.
+        # Decide only now, after both the external-source fetch and memory cue lookup.
+        source_result = _decide_empty_source_gate(
+            enabled_modes,
+            has_unfinished_thread=_has_unfinished_thread,
+            has_memory_initiative=_has_memory_initiative,
+        )
+        if source_result is not None:
+            print(
+                f"[{lanlan_name}] no external modes + no unfinished thread + no memory cue → pass"
+            )
+            return await _end_proactive(
+                ProactiveChatResult(
+                    body=source_result.body,
+                    status_code=source_result.status_code,
+                )
+            )
+
+        if not sources and not _has_unfinished_thread and not _has_memory_initiative:
+            return await _end_proactive(
+                ProactiveChatResult(
+                    body=_proactive_pass_body(
+                        PROACTIVE_REASON_ERROR_SOURCE_FETCH_FAILED,
+                        success=False,
+                        error="所有信息源获取失败",
+                    ),
+                    status_code=500,
+                )
+            )
+        if not sources:
+            reason = (
+                "memory follow-up"
+                if _has_memory_initiative
+                else "unfinished thread"
+            )
+            print(
+                f"[{lanlan_name}] sources 为空但有 {reason}，进入 text-only proactive 路径"
+            )
+
         # ========== 4. 获取 LLM 配置 ==========
         # 主动搭话全链路（Phase1 筛选 / Phase2 生成 / regen）用 conversation tier
         # 而非 correction tier：correction（纠错）模型在不开思考时较难稳定遵循
@@ -1688,6 +1776,10 @@ async def handle_proactive_chat(
                 _surfaced_reflection_ids = []
                 followup_topics_prompt = ""
 
+        # Weighting may suppress reminiscence after the initial source gate.  Phase 1
+        # must use the post-suppression truth so a throttled memory cue does not
+        # masquerade as an active reason to speak.
+        _has_memory_initiative = bool(followup_topics_prompt)
 
         # Build once after source suppression so candidates are decayed only once.
         web_modes = [mode for mode in web_modes if mode in sources]
@@ -2055,6 +2147,7 @@ async def handle_proactive_chat(
             phase1_topics,
             vision_content,
             has_unfinished_thread=_has_unfinished_thread,
+            has_memory_initiative=_has_memory_initiative,
         )
         if phase1_decision.result is not None:
             print(f"[{lanlan_name}] Phase 1 所有通道均无可用话题")
@@ -2062,9 +2155,14 @@ async def handle_proactive_chat(
                 ProactiveChatResult(body=phase1_decision.result.body)
             )
         if not phase1_topics and not vision_content:
-            print(
-                f"[{lanlan_name}] Phase 1 无话题但有未收尾话题，进入 text-only 跟进 Phase 2"
-            )
+            if _has_memory_initiative:
+                print(
+                    f"[{lanlan_name}] Phase 1 无外部话题但有 memory follow-up，进入 reminiscence-only Phase 2"
+                )
+            else:
+                print(
+                    f"[{lanlan_name}] Phase 1 无话题但有未收尾话题，进入 text-only 跟进 Phase 2"
+                )
 
         # Phase 1 preempt check：topic assembly 完，进入 Phase 2 前最后一次瞄
         if mgr.state.is_proactive_preempted():
@@ -2299,6 +2397,14 @@ async def handle_proactive_chat(
         else:
             display_snap = None
             state_section = ""
+
+        engagement_guidance = _render_engagement_guidance(engagement_policy)
+        if engagement_guidance:
+            state_section = (
+                f"{state_section}\n{engagement_guidance}"
+                if state_section
+                else engagement_guidance
+            )
 
         # 静动分离：generate_prompt 作为静态 SystemMessage（可被缓存），
         # 追加的音乐/表情包指令作为动态上下文注入 HumanMessage

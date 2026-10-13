@@ -391,9 +391,10 @@ _PROACTIVE_MATERIAL_HISTORY_MAX = 10
 
 # --- 持久化"该角色累计成功投递的主动搭话次数 + 是否曾被邀请过"---
 # 单文件 schema：
-#   {"version": 2,
+#   {"version": 3,
 #    "totals": {<lanlan_name>: <int>, ...},
-#    "ever_delivered": {<lanlan_name>: true, ...}}
+#    "ever_delivered": {<lanlan_name>: true, ...},
+#    "engagement": {<lanlan_name>: {...}, ...}}
 # 跨进程重启保留。两份数据合一个文件方便维护。
 #
 # - totals: 「新用户第 N 次主动搭话强制走 mini-game 邀请」(N=NEW_USER_FORCE_AT)
@@ -408,13 +409,51 @@ _PROACTIVE_MATERIAL_HISTORY_MAX = 10
 _PROACTIVE_CHAT_TOTALS_FILENAME = "proactive_chat_totals.json"
 
 
-_PROACTIVE_CHAT_TOTALS_SCHEMA_VERSION = 2
+_PROACTIVE_CHAT_TOTALS_SCHEMA_VERSION = 3
 
 
 _proactive_chat_totals: dict[str, int] = {}
 
 
 _invite_ever_delivered: dict[str, bool] = {}
+
+
+# Persistent social-pressure state for ordinary proactive chat.  This lives in
+# the same small state file as the cumulative counters so it survives restarts
+# without creating another sidecar that has to participate in cloud-save/root
+# switching.  It is deliberately behavioural, not memory/persona data: the
+# character card says *who she is*; this only remembers whether recent
+# unsolicited attempts were answered and whether they overused questions.
+#
+# Shape per character:
+#   {"unanswered_streak": int,
+#    "last_proactive_at": float,
+#    "last_user_engagement_at": float,
+#    "recent_question_flags": [bool, ...]}
+#
+# The rolling question window is bounded because only a short local tendency is
+# useful for style correction.  Long-term relationship development belongs to
+# memory/persona, not this throttle state.
+_PROACTIVE_QUESTION_WINDOW = 6
+_proactive_engagement_state: dict[str, dict[str, Any]] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class ProactiveEngagementSnapshot:
+    """Read-only social-pressure view used by proactive policy decisions."""
+
+    unanswered_streak: int = 0
+    last_proactive_at: float = 0.0
+    last_user_engagement_at: float = 0.0
+    recent_question_flags: tuple[bool, ...] = ()
+
+    @property
+    def question_ratio(self) -> float:
+        if not self.recent_question_flags:
+            return 0.0
+        return sum(1 for flag in self.recent_question_flags if flag) / len(
+            self.recent_question_flags
+        )
 
 
 _proactive_chat_totals_lock = asyncio.Lock()
@@ -681,16 +720,16 @@ async def _ensure_proactive_chat_totals_loaded(
 ) -> None:
     """Lazy-load the persisted cumulative counters + ever_delivered. Idempotent. File reads go to the thread pool.
 
-    schema: {"version": 2,
+    schema: {"version": 3,
              "totals": {<lanlan_name>: <int>, ...},
-             "ever_delivered": {<lanlan_name>: true, ...}}
+             "ever_delivered": {<lanlan_name>: true, ...},
+             "engagement": {<lanlan_name>: {...}, ...}}
 
     A missing file / corrupted JSON is not fatal — start from empty, and the next
-    increment writes a fresh file. The old schema v1 has no ever_delivered field,
-    so it loads as an empty dict — after upgrading, the first proactive chat will
-    "force-first re-deliver once" for existing users (at most once, because
-    ever_delivered is set True and persisted immediately after delivery); this is
-    a one-off v1→v2 migration cost and needs no dedicated migration script."""
+    write creates a fresh file. Schema v1 has no ``ever_delivered`` field, so the
+    existing one-off force-first migration behavior is preserved. Schema v2 has
+    no ``engagement`` field; it simply loads the all-clear engagement baseline and
+    is upgraded to v3 on the next write. No dedicated migration script is needed."""
     global _proactive_chat_totals_loaded, _proactive_chat_totals_loaded_path
     path = _proactive_chat_totals_path(memory_dir=memory_dir)
     if _proactive_chat_totals_loaded and _proactive_chat_totals_loaded_path == path:
@@ -700,6 +739,7 @@ async def _ensure_proactive_chat_totals_loaded(
             return
         _proactive_chat_totals.clear()
         _invite_ever_delivered.clear()
+        _proactive_engagement_state.clear()
         try:
             data = await asyncio.to_thread(read_json, path)
             totals = data.get("totals") if isinstance(data, dict) else None
@@ -712,6 +752,36 @@ async def _ensure_proactive_chat_totals_loaded(
                 for k, v in ever.items():
                     if isinstance(k, str) and bool(v):
                         _invite_ever_delivered[k] = True
+            engagement = data.get("engagement") if isinstance(data, dict) else None
+            if isinstance(engagement, dict):
+                for k, raw in engagement.items():
+                    if not isinstance(k, str) or not isinstance(raw, dict):
+                        continue
+                    try:
+                        unanswered = max(
+                            0, int(raw.get("unanswered_streak", 0) or 0)
+                        )
+                        last_proactive = max(
+                            0.0, float(raw.get("last_proactive_at", 0.0) or 0.0)
+                        )
+                        last_user = max(
+                            0.0,
+                            float(raw.get("last_user_engagement_at", 0.0) or 0.0),
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    flags_raw = raw.get("recent_question_flags") or []
+                    flags = (
+                        [bool(flag) for flag in flags_raw[-_PROACTIVE_QUESTION_WINDOW:]]
+                        if isinstance(flags_raw, list)
+                        else []
+                    )
+                    _proactive_engagement_state[k] = {
+                        "unanswered_streak": unanswered,
+                        "last_proactive_at": last_proactive,
+                        "last_user_engagement_at": last_user,
+                        "recent_question_flags": flags,
+                    }
         except FileNotFoundError:
             # 首次启动 / cleanup 后没文件——按全空起步，下次 increment 会创建。
             # 不是异常，不打 warning。
@@ -738,7 +808,10 @@ def _was_invite_ever_delivered(lanlan_name: str) -> bool:
 
 
 async def _persist_totals_unlocked(*, memory_dir: str | Path | None = None) -> None:
-    """Persist totals + ever_delivered to disk. The caller must hold _proactive_chat_totals_lock."""
+    """Persist totals, invite history and engagement state atomically.
+
+    The caller must hold ``_proactive_chat_totals_lock``.
+    """
     try:
         await atomic_write_json_async(
             _proactive_chat_totals_path(memory_dir=memory_dir),
@@ -746,6 +819,23 @@ async def _persist_totals_unlocked(*, memory_dir: str | Path | None = None) -> N
                 "version": _PROACTIVE_CHAT_TOTALS_SCHEMA_VERSION,
                 "totals": dict(_proactive_chat_totals),
                 "ever_delivered": dict(_invite_ever_delivered),
+                "engagement": {
+                    name: {
+                        "unanswered_streak": int(
+                            entry.get("unanswered_streak", 0) or 0
+                        ),
+                        "last_proactive_at": float(
+                            entry.get("last_proactive_at", 0.0) or 0.0
+                        ),
+                        "last_user_engagement_at": float(
+                            entry.get("last_user_engagement_at", 0.0) or 0.0
+                        ),
+                        "recent_question_flags": list(
+                            entry.get("recent_question_flags") or []
+                        ),
+                    }
+                    for name, entry in _proactive_engagement_state.items()
+                },
             },
             indent=2,
             ensure_ascii=False,
@@ -755,6 +845,103 @@ async def _persist_totals_unlocked(*, memory_dir: str | Path | None = None) -> N
             "proactive_chat_totals persist failed (in-memory still up-to-date): %s",
             exc,
         )
+
+
+def _get_proactive_engagement_snapshot(lanlan_name: str) -> ProactiveEngagementSnapshot:
+    """Return the cached engagement state for *lanlan_name*.
+
+    The caller should await ``_ensure_proactive_chat_totals_loaded`` first when
+    persistence matters.  A missing entry is the all-clear baseline.
+    """
+    raw = _proactive_engagement_state.get(lanlan_name) or {}
+    flags = raw.get("recent_question_flags") or []
+    return ProactiveEngagementSnapshot(
+        unanswered_streak=max(0, int(raw.get("unanswered_streak", 0) or 0)),
+        last_proactive_at=max(0.0, float(raw.get("last_proactive_at", 0.0) or 0.0)),
+        last_user_engagement_at=max(
+            0.0, float(raw.get("last_user_engagement_at", 0.0) or 0.0)
+        ),
+        recent_question_flags=tuple(
+            bool(flag) for flag in flags[-_PROACTIVE_QUESTION_WINDOW:]
+        ),
+    )
+
+
+def _proactive_text_ends_with_question(text: str | None) -> bool:
+    """Conservative style signal: was the delivered proactive line a question?"""
+    if not text:
+        return False
+    return text.rstrip().endswith(("?", "？"))
+
+
+async def _record_proactive_engagement_delivery(
+    lanlan_name: str,
+    *,
+    message: str | None = None,
+    delivered_at: float | None = None,
+    memory_dir: str | Path | None = None,
+) -> ProactiveEngagementSnapshot:
+    """Persist one ordinary proactive delivery as awaiting user response.
+
+    ``message=None`` is used by the realtime voice nudge path: it still adds
+    social pressure, but it does not vote in the question-fatigue window because
+    the final provider-generated utterance is not available here.
+    """
+    await _ensure_proactive_chat_totals_loaded(memory_dir=memory_dir)
+    ts = float(time.time() if delivered_at is None else delivered_at)
+    async with _proactive_chat_totals_lock:
+        raw = dict(_proactive_engagement_state.get(lanlan_name) or {})
+        raw["unanswered_streak"] = max(0, int(raw.get("unanswered_streak", 0) or 0)) + 1
+        raw["last_proactive_at"] = max(
+            float(raw.get("last_proactive_at", 0.0) or 0.0), ts
+        )
+        raw["last_user_engagement_at"] = max(
+            0.0, float(raw.get("last_user_engagement_at", 0.0) or 0.0)
+        )
+        flags = list(raw.get("recent_question_flags") or [])
+        if message is not None:
+            flags.append(_proactive_text_ends_with_question(message))
+            del flags[:-_PROACTIVE_QUESTION_WINDOW]
+        raw["recent_question_flags"] = flags
+        _proactive_engagement_state[lanlan_name] = raw
+        await _persist_totals_unlocked(memory_dir=memory_dir)
+        return _get_proactive_engagement_snapshot(lanlan_name)
+
+
+async def _reconcile_proactive_user_engagement(
+    lanlan_name: str,
+    *,
+    user_engagement_at: float | None,
+    memory_dir: str | Path | None = None,
+) -> ProactiveEngagementSnapshot:
+    """Reset the unanswered streak once a genuine newer user action exists.
+
+    No direct hook from the input path is required: every proactive entry already
+    has the manager's authoritative ``last_user_engagement_time``.  Reconciling
+    here keeps the lifecycle one-way and makes restart recovery natural.
+    """
+    await _ensure_proactive_chat_totals_loaded(memory_dir=memory_dir)
+    current = _get_proactive_engagement_snapshot(lanlan_name)
+    if user_engagement_at is None:
+        return current
+    try:
+        engagement_ts = float(user_engagement_at)
+    except (TypeError, ValueError, OverflowError):
+        return current
+    if engagement_ts <= current.last_user_engagement_at:
+        return current
+    # Only a user action *after* the last proactive delivery answers the streak.
+    answered = engagement_ts > current.last_proactive_at
+    async with _proactive_chat_totals_lock:
+        raw = dict(_proactive_engagement_state.get(lanlan_name) or {})
+        raw["last_user_engagement_at"] = engagement_ts
+        if answered:
+            raw["unanswered_streak"] = 0
+        raw.setdefault("last_proactive_at", current.last_proactive_at)
+        raw.setdefault("recent_question_flags", list(current.recent_question_flags))
+        _proactive_engagement_state[lanlan_name] = raw
+        await _persist_totals_unlocked(memory_dir=memory_dir)
+        return _get_proactive_engagement_snapshot(lanlan_name)
 
 
 async def _increment_proactive_chat_total(

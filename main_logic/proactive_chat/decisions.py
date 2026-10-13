@@ -49,6 +49,17 @@ from .state import (
 logger = get_module_logger(__name__, "Main")
 
 
+# Social-pressure policy for ordinary proactive chat.  Two ignored deliveries
+# are enough to stop asking for attention on every scheduler tick; subsequent
+# silence doubles the minimum retry delay up to two hours.  This is separate
+# from source cooldowns: source decay answers "have I used this material?",
+# while this policy answers "is it socially appropriate to speak again yet?".
+_PROACTIVE_UNANSWERED_BACKOFF_BASE_SECONDS = 30 * 60
+_PROACTIVE_UNANSWERED_BACKOFF_MAX_SECONDS = 2 * 60 * 60
+_PROACTIVE_QUESTION_FATIGUE_MIN_SAMPLES = 3
+_PROACTIVE_QUESTION_FATIGUE_RATIO = 0.5
+
+
 def _public_web_link(link: dict[str, Any]) -> dict[str, Any]:
     """Strip every platform's internal metadata at the response boundary."""
 
@@ -296,6 +307,95 @@ def _decide_probabilistic_activity_gate(
 
 
 @dataclass(frozen=True, slots=True)
+class EngagementPolicyDecision:
+    """Social-pressure decision derived from persisted engagement state."""
+
+    result: ProactiveChatResult | None = None
+    avoid_questions: bool = False
+    unanswered_streak: int = 0
+    question_ratio: float = 0.0
+    retry_after_seconds: float = 0.0
+
+
+def _decide_engagement_policy(
+    engagement_snapshot: Any,
+    *,
+    has_unfinished_thread: bool = False,
+    now: float | None = None,
+) -> EngagementPolicyDecision:
+    """Throttle ignored proactive turns and flag question fatigue.
+
+    A real unfinished thread keeps its one allowed follow-up priority: PATCH 01
+    already removes generic "what next?" glue before such a thread can exist.
+    Even in that override case ``avoid_questions`` may stay true, nudging the
+    follow-up toward a self-contained statement rather than another demand for a
+    reply.
+    """
+    if engagement_snapshot is None:
+        return EngagementPolicyDecision()
+
+    try:
+        unanswered = max(0, int(engagement_snapshot.unanswered_streak))
+    except (AttributeError, TypeError, ValueError):
+        unanswered = 0
+    try:
+        last_proactive = max(0.0, float(engagement_snapshot.last_proactive_at))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        last_proactive = 0.0
+    try:
+        flags = tuple(bool(v) for v in engagement_snapshot.recent_question_flags)
+    except (AttributeError, TypeError):
+        flags = ()
+
+    question_ratio = (
+        sum(1 for flag in flags if flag) / len(flags) if flags else 0.0
+    )
+    fatigue = (
+        len(flags) >= _PROACTIVE_QUESTION_FATIGUE_MIN_SAMPLES
+        and question_ratio >= _PROACTIVE_QUESTION_FATIGUE_RATIO
+    )
+    avoid_questions = unanswered >= 1 or fatigue
+
+    if unanswered < 2 or has_unfinished_thread or last_proactive <= 0:
+        return EngagementPolicyDecision(
+            avoid_questions=avoid_questions,
+            unanswered_streak=unanswered,
+            question_ratio=question_ratio,
+        )
+
+    exponent = min(unanswered - 2, 8)
+    backoff_seconds = min(
+        _PROACTIVE_UNANSWERED_BACKOFF_BASE_SECONDS * (2 ** exponent),
+        _PROACTIVE_UNANSWERED_BACKOFF_MAX_SECONDS,
+    )
+    ref = float(time.time() if now is None else now)
+    retry_after = max(0.0, last_proactive + backoff_seconds - ref)
+    if retry_after <= 0:
+        return EngagementPolicyDecision(
+            avoid_questions=True,
+            unanswered_streak=unanswered,
+            question_ratio=question_ratio,
+        )
+
+    return EngagementPolicyDecision(
+        result=ProactiveChatResult(
+            body=_proactive_pass_body(
+                PROACTIVE_REASON_PASS_THROTTLED,
+                message=(
+                    "proactive social backoff: recent initiatives unanswered"
+                ),
+                unanswered_streak=unanswered,
+                retry_after_seconds=int(math.ceil(retry_after)),
+            )
+        ),
+        avoid_questions=True,
+        unanswered_streak=unanswered,
+        question_ratio=question_ratio,
+        retry_after_seconds=retry_after,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class SourceModeSelection:
     """Initial source modes plus activity-based restrictions."""
 
@@ -375,14 +475,24 @@ def _decide_empty_source_gate(
     enabled_modes: Any,
     *,
     has_unfinished_thread: bool,
+    has_memory_initiative: bool = False,
 ) -> ProactiveChatResult | None:
-    """Pass after the mini-game opportunity when no source or thread remains."""
-    if enabled_modes or has_unfinished_thread:
+    """Pass only when no external source, thread, or memory cue can drive a turn.
+
+    Memory follow-up topics are an independent proactive-chat source. This gate
+    therefore runs *after* the memory-server follow-up lookup in ``service.py``:
+    explicitly disabling web/screen/music sources must not silence a valid
+    reminiscence cue.
+    """
+    if enabled_modes or has_unfinished_thread or has_memory_initiative:
         return None
     return ProactiveChatResult(
         body=_proactive_pass_body(
             PROACTIVE_REASON_PASS_SOURCE_EMPTY,
-            message="no source modes enabled and mini-game invite did not fire",
+            message=(
+                "no source modes enabled, no unfinished thread, and no memory "
+                "follow-up cue"
+            ),
         )
     )
 

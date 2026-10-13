@@ -1,0 +1,5 @@
+[plugin_runtime]
+auto_start = true
+
+[proactive_controller]
+default_mode_on_first_run = "normal"

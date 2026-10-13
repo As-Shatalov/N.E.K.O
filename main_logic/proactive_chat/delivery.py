@@ -38,6 +38,7 @@ from .mini_game_invite import _mini_game_invite_count_post_response_chat
 from .music_recommendation import _append_music_recommendations
 from .state import (
     _increment_proactive_chat_total,
+    _record_proactive_engagement_delivery,
     _proactive_feed_rejected_for_takeover,
     _proactive_material_key,
     _proactive_turn_still_owned,
@@ -419,6 +420,11 @@ async def _record_committed_delivery(
     )
     _mini_game_invite_count_post_response_chat(lanlan_name)
     await _increment_proactive_chat_total(lanlan_name, **state_storage_kwargs)
+    await _record_proactive_engagement_delivery(
+        lanlan_name,
+        message=response_text,
+        **state_storage_kwargs,
+    )
     if surfaced_reflection_ids:
         _record_reminiscence_usage(lanlan_name)
 

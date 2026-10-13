@@ -137,7 +137,11 @@ from .workers.elevenlabs import (
     _elevenlabs_clone_is_selected,
     _elevenlabs_clone_resolve,
 )
-from .workers.local_cosyvoice import local_cosyvoice_worker
+from .workers.local_cosyvoice import (
+    local_cosyvoice_worker,
+    _local_cosyvoice_is_selected,
+    _local_cosyvoice_resolve,
+)
 from .workers.dummy import dummy_tts_worker
 
 logger = get_module_logger(__name__, "Main")
@@ -457,6 +461,40 @@ _tts_providers.register(_tts_providers.TTSProvider(
     resolve=_gptsovits_resolve,
     probe_kind='local_http',
 ))
+
+# HELI_TTS_LOCAL_COSYVOICE_PROVIDER_V1
+
+_tts_providers.register(_tts_providers.TTSProvider(
+    key="local_cosyvoice",
+    kind="local",
+
+    # After local GPT-SoVITS but before
+    # vLLM-Omni and cloud fallbacks.
+    priority=15,
+
+    # heli.s2voice behaves as a configured
+    # local preset from N.E.K.O's point of view.
+    capabilities=frozenset({"preset"}),
+
+    is_selected=_local_cosyvoice_is_selected,
+    resolve=_local_cosyvoice_resolve,
+
+    default_url="ws://127.0.0.1:8093",
+    default_model="fish-s2-q5",
+    default_voice="heli",
+
+    editable_endpoint=True,
+    configured_preset_voice=True,
+
+    # Heli Gateway performs its own readiness
+    # and Fish warm-up checks.
+    probe_kind="none",
+
+    # If our local TTS fails we don't silently
+    # replace Heli's voice with another provider.
+    fallback_on_failure=False,
+))
+
 
 _tts_providers.register(_tts_providers.TTSProvider(
     key='vllm_omni',

@@ -183,7 +183,11 @@ def local_cosyvoice_worker(request_queue, response_queue, audio_api_key, voice_i
             resampler = soxr.ResampleStream(SRC_RATE, 48000, 1, dtype='float32')
             
             logger.info(f"🔄 [LocalTTS] 正在连接: {WS_URL}")
-            ws = await websockets.connect(WS_URL, ping_interval=None)
+            ws = await websockets.connect(
+                WS_URL,
+                ping_interval=None,
+                proxy=None,
+            )
             logger.info("✅ [LocalTTS] 连接成功")
             
             # 发送配置
@@ -309,3 +313,68 @@ def local_cosyvoice_worker(request_queue, response_queue, audio_api_key, voice_i
     except Exception as e:
         logger.error(f"Local CosyVoice Worker 崩溃: {e}")
         response_queue.put(("__ready__", False))
+
+
+# HELI_TTS_LOCAL_COSYVOICE_ADAPTER_V1
+
+def _local_cosyvoice_is_selected(ctx) -> bool:
+    """
+    Select the local CosyVoice-compatible endpoint
+    configured through the N.E.K.O TTS settings.
+
+    Our Heli TTS Gateway exposes that protocol while
+    internally routing synthesis to Fish S2.
+    """
+
+    provider = str(
+        ctx.core_config.get(
+            "ttsModelProvider"
+        )
+        or ""
+    ).strip().lower()
+
+    if provider != "local_cosyvoice":
+        return False
+
+    try:
+        tts_config = (
+            ctx.cm.get_model_api_config(
+                "tts_custom"
+            )
+            or {}
+        )
+    except Exception:
+        return False
+
+    if not tts_config.get("is_custom"):
+        return False
+
+    base_url = str(
+        tts_config.get("base_url")
+        or ""
+    ).strip().lower()
+
+    return base_url.startswith(
+        (
+            "ws://",
+            "wss://",
+        )
+    )
+
+
+def _local_cosyvoice_resolve(ctx):
+    """
+    Resolve the configured provider to the existing
+    local CosyVoice worker.
+
+    The gateway is local and doesn't need an API key.
+    """
+
+    _ = ctx
+
+    return (
+        local_cosyvoice_worker,
+        None,
+        "local_cosyvoice",
+    )
+

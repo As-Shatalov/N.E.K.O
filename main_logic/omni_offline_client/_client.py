@@ -285,6 +285,10 @@ class OmniOfflineClient(_ToolingMixin, _GenaiMixin, _StreamingMixin, _MediaMixin
         self._last_finish_reason: Optional[str] = None
         self._last_block_reason: Optional[str] = None
         self._last_prompt_tokens: Optional[int] = None
+        # Best-effort provider-reported loaded context window. Filled during
+        # ``connect`` for providers that expose it (currently local LM Studio).
+        # ``None`` keeps the legacy 10-turn/5k-token rollover policy.
+        self.context_window_tokens: Optional[int] = None
 
         # 重复度检测
         self._recent_responses = []  # 存储最近3轮助手回复

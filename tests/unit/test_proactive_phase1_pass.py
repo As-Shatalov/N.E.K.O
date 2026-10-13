@@ -1,3 +1,4 @@
+import inspect
 import os
 import sys
 from collections import deque
@@ -354,8 +355,68 @@ def test_bilibili_following_wins_duplicate_from_video_radar(monkeypatch):
     assert [item["bvid"] for item in selected["video"]] == ["BVother"]
 
 
+def test_memory_followup_lookup_precedes_empty_source_gate_in_service():
+    source = inspect.getsource(proactive_service.handle_proactive_chat)
+
+    assert source.index("/followup_topics/{lanlan_name}") < source.index(
+        "_decide_empty_source_gate("
+    )
+
+
+def test_empty_source_gate_allows_memory_only_initiative():
+    result = sr_sources._decide_empty_source_gate(
+        [],
+        has_unfinished_thread=False,
+        has_memory_initiative=True,
+    )
+
+    assert result is None
+
+
+def test_empty_source_gate_still_passes_without_thread_or_memory():
+    result = sr_sources._decide_empty_source_gate(
+        [],
+        has_unfinished_thread=False,
+        has_memory_initiative=False,
+    )
+
+    assert result is not None
+    assert result.body["reason_code"] == "PASS_SOURCE_EMPTY"
+
+
+def test_phase1_memory_only_reaches_phase2_as_reminiscence_channel():
+    decision = sr_parsing._decide_phase1_channels(
+        [],
+        None,
+        has_unfinished_thread=False,
+        has_memory_initiative=True,
+    )
+
+    assert decision.result is None
+    assert decision.active_channels == ["reminiscence"]
+    assert decision.primary_channel == "reminiscence"
+
+
+def test_phase1_memory_cue_coexists_with_external_topic_without_stealing_primary():
+    decision = sr_parsing._decide_phase1_channels(
+        [("web", "interesting external topic")],
+        None,
+        has_unfinished_thread=False,
+        has_memory_initiative=True,
+    )
+
+    assert decision.result is None
+    assert decision.active_channels == ["web", "reminiscence"]
+    assert decision.primary_channel == "web"
+
+
 def test_phase1_passes_when_all_source_candidates_are_empty():
-    decision = sr_parsing._decide_phase1_channels([], None, has_unfinished_thread=False)
+    decision = sr_parsing._decide_phase1_channels(
+        [],
+        None,
+        has_unfinished_thread=False,
+        has_memory_initiative=False,
+    )
 
     assert decision.result is not None
     assert decision.result.body["reason_code"] == "PASS_MODEL_PASS"

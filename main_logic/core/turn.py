@@ -649,47 +649,83 @@ class TurnMixin:
                 #    （已删除 elapsed >= 40s 的纯时间触发：长时间发呆不应强制
                 #     归档 cache，由 turn / token 真实驱动。）
                 if hasattr(self, 'is_preparing_new_session') and not self.is_preparing_new_session:
-                    _turn_threshold_met = self._session_turn_count >= SESSION_TURN_THRESHOLD
-                    # Session 历史 token 总量阈值。turn-end 后的冷路径，
-                    # sync count_tokens 即可（10 条消息合计 < 50ms）。
-                    # m.content 在多模态消息下是 list[dict]（含 image_url base64）；
-                    # 直接 str() 会把 base64 一起算进 budget，带图对话会被过早判定。
-                    # 这里只统计可见文本部分。
+                    _ctx_total = 0
+                    _ctx_limit = SESSION_ARCHIVE_TRIGGER_TOKENS
+                    _renewal_policy = "legacy"
+
                     if isinstance(self.session, OmniOfflineClient):
-                        from utils.tokenize import count_tokens as _ct
-
-                        def _budget_text(message) -> str:
-                            content = getattr(message, "content", "")
-                            if isinstance(content, str):
-                                return content
-                            if isinstance(content, list):
-                                return "\n".join(
-                                    str(part.get("text") or "").strip()
-                                    for part in content
-                                    if isinstance(part, dict)
-                                    and str(part.get("type") or "") in {"text", "input_text", "output_text"}
-                                )
-                            return ""
-
-                        _ctx_total = sum(
-                            _ct(_budget_text(m))
-                            for m in self.session._conversation_history[1:]
+                        from main_logic.context_window import (
+                            build_context_window_budget,
+                            estimate_message_context_tokens,
                         )
-                        _ctx_threshold_met = _ctx_total >= SESSION_ARCHIVE_TRIGGER_TOKENS
+
+                        # Prefer the capacity of the model instance that is
+                        # actually loaded.  When it is known, the arbitrary
+                        # 10-turn rollover is disabled: live raw dialogue stays
+                        # visible until the real model window is nearly full.
+                        _adaptive_budget = build_context_window_budget(
+                            getattr(self.session, "context_window_tokens", None),
+                            getattr(self.session, "max_response_length", None),
+                        )
+                        if _adaptive_budget is not None:
+                            _renewal_policy = "adaptive"
+                            _turn_threshold_met = False
+                            _ctx_limit = _adaptive_budget.renewal_threshold_tokens
+
+                            # Provider-reported prompt_tokens includes template /
+                            # tool overhead but describes the request *before*
+                            # this assistant reply.  The local estimate includes
+                            # the freshly persisted assistant reply but cannot see
+                            # hidden wire overhead.  max() gets the useful side of
+                            # both measurements.
+                            _estimated_now = estimate_message_context_tokens(
+                                getattr(self.session, "_conversation_history", None)
+                            )
+                            try:
+                                _provider_prompt = int(
+                                    getattr(self.session, "_last_prompt_tokens", 0) or 0
+                                )
+                            except (TypeError, ValueError):
+                                _provider_prompt = 0
+                            _ctx_total = max(_estimated_now, _provider_prompt)
+                            _ctx_threshold_met = _ctx_total >= _ctx_limit
+                        else:
+                            # Unknown/cloud providers keep the old conservative
+                            # policy until their capacity can be discovered
+                            # authoritatively.  No behaviour regression there.
+                            _turn_threshold_met = (
+                                self._session_turn_count >= SESSION_TURN_THRESHOLD
+                            )
+                            _legacy_history = list(
+                                getattr(self.session, "_conversation_history", None) or []
+                            )
+                            _ctx_total = estimate_message_context_tokens(
+                                _legacy_history[1:]
+                            )
+                            _ctx_threshold_met = (
+                                _ctx_total >= SESSION_ARCHIVE_TRIGGER_TOKENS
+                            )
                     else:
+                        _turn_threshold_met = (
+                            self._session_turn_count >= SESSION_TURN_THRESHOLD
+                        )
                         _ctx_threshold_met = False
+
                     if _turn_threshold_met or _ctx_threshold_met:
                         logger.info(
                             "[%s] Main Listener: session renewal threshold met "
-                            "(turns=%d/%d turn_threshold=%s context_tokens=%d/%d "
-                            "context_threshold=%s). Marking for new session preparation.",
+                            "(policy=%s turns=%d/%d turn_threshold=%s "
+                            "context_tokens=%d/%d context_threshold=%s window=%s). "
+                            "Marking for new session preparation.",
                             self.lanlan_name,
+                            _renewal_policy,
                             self._session_turn_count,
                             SESSION_TURN_THRESHOLD,
                             _turn_threshold_met,
-                            _ctx_total if isinstance(self.session, OmniOfflineClient) else 0,
-                            SESSION_ARCHIVE_TRIGGER_TOKENS,
+                            _ctx_total,
+                            _ctx_limit,
                             _ctx_threshold_met,
+                            getattr(self.session, "context_window_tokens", None),
                         )
                         self.is_preparing_new_session = True
                         self.summary_triggered_time = datetime.now()

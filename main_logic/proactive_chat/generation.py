@@ -843,9 +843,22 @@ def _decide_phase1_channels(
     vision_content: str | None,
     *,
     has_unfinished_thread: bool,
+    has_memory_initiative: bool = False,
 ) -> Phase1Decision:
-    """Finalize Phase 1 without changing source order or continuation rules."""
-    if not phase1_topics and not vision_content and not has_unfinished_thread:
+    """Finalize Phase 1, treating reminiscence as a first-class text source.
+
+    ``followup_topics`` are already curated by the memory server and rendered
+    into the Phase 2 memory-cue section. They do not need a second Phase 1 LLM
+    screening pass; their presence is enough to allow a text-only Phase 2 turn.
+    ``reminiscence`` is exposed as an active channel for diagnostics/telemetry,
+    while final delivery still uses ordinary ``[CHAT]`` semantics.
+    """
+    if (
+        not phase1_topics
+        and not vision_content
+        and not has_unfinished_thread
+        and not has_memory_initiative
+    ):
         return Phase1Decision(
             result=ProactiveChatResult(
                 body=_proactive_pass_body(
@@ -869,6 +882,8 @@ def _decide_phase1_channels(
             music_topic = topic
     if vision_content:
         active_channels.append("vision")
+    if has_memory_initiative:
+        active_channels.append("reminiscence")
     primary_channel = (
         "vision"
         if vision_content

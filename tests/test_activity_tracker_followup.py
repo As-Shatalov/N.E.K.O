@@ -1291,6 +1291,44 @@ def test_update_window_collapses_on_canonical_but_invalidates_on_intensity_chang
     assert snap2.tone == 'playful'
 
 
+# ── unfinished_thread generic-question filter ────────────────────────
+
+
+@pytest.mark.parametrize('text', [
+    'Что дальше?',
+    'Ну и что дальше？ <happy>',
+    'Хм. Что будем делать дальше?',
+    'Anything else?',
+    'So, what next?',
+    '接下来呢？',
+    '次はどうする？',
+])
+def test_generic_conversation_closer_does_not_open_unfinished_thread(text):
+    """Low-information chatbot glue must not become a proactive follow-up."""
+    sm = ActivityStateMachine(prefs=ActivityPreferences())
+    sm.update_ai_message(text=text, now=100.0)
+
+    assert sm._unfinished_thread is None
+
+
+@pytest.mark.parametrize('text', [
+    'Ты всё-таки запустил тот билд?',
+    'Ошибка 429 после перезапуска осталась?',
+    'Что дальше с ошибкой 429?',
+    'Did the TTS recover after you restored the provider?',
+    '你昨天说要测试 TTS，后来成功了吗？',
+    # A substantive question before a generic closer must keep the thread alive.
+    'Ты проверил сохранение после перезапуска? Что дальше?',
+])
+def test_topic_bearing_question_still_opens_unfinished_thread(text):
+    """The filter must not swallow questions that carry an actual subject."""
+    sm = ActivityStateMachine(prefs=ActivityPreferences())
+    sm.update_ai_message(text=text, now=100.0)
+
+    assert sm._unfinished_thread is not None
+    assert sm._unfinished_thread['follow_up_count'] == 0
+
+
 # ── unfinished_thread max_followups respects threshold (CR Major) ─────
 
 

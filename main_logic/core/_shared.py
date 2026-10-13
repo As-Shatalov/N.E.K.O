@@ -135,9 +135,12 @@ logger = get_module_logger("main_logic.core", "Main")
 # 用户静默达到此阈值 → 后台 loop 主动 end_session，让下一条消息触发
 # start_session(new=False) 重新拉 /new_dialog 注入新鲜时间/长间隔提示/节日
 # 上下文，解决长挂机 session 上下文僵化（"猫娘还停留在前一晚"）的问题。
-# 周期检查间隔故意远小于阈值（粒度 ~1 min），避免静默 30:01 时还要再等
-# 一整轮。
-IDLE_SESSION_RESET_THRESHOLD_SECONDS = 1800
+#
+# PATCH 03: 30min 对有主动搭话 + reflection 的常驻陪伴场景太激进：memory
+# worker 刚形成可用反思，session 就可能已经被 idle reset 收掉，主动搭话无法
+# 再利用这批新上下文。默认放宽到 90min；仍保留硬 reset，避免无限长 session
+# 长期持有陈旧 /new_dialog 上下文。周期检查保持 60s 粒度。
+IDLE_SESSION_RESET_THRESHOLD_SECONDS = 90 * 60
 IDLE_SESSION_RESET_CHECK_INTERVAL_SECONDS = 60
 
 # 前端文本会话 start_session 等 session_started 的硬超时（static/app/app-buttons.js
