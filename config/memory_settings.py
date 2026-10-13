@@ -114,12 +114,15 @@ MAX_KNOWN_POOL_FACTS = 30
 EVIDENCE_ARCHIVE_SWEEP_INTERVAL_SECONDS = 3600
 
 # §3.6 render budget（PR-3 使用，此处先占位）
+# Fork PATCH 05: modest +20% headroom for private-dialog continuity. Keep the
+# same relative split instead of removing the gates entirely; these remain safety
+# ceilings, not targets the renderer must fill.
 # 私聊 / 本体（legacy，subjects 为空）时这两条各是一个全局池；scoped 渲染
 # （群聊，subjects 非空）时改为**每个 subject 各一份**，再由下面的
 # SCOPED_RENDER_TOTAL_MAX_TOKENS 总闸兜底。改前群 subject 与成员 subject 抢
 # 的是同一个 2000，成员越多群自己的人设越薄。
-PERSONA_RENDER_MAX_TOKENS = 2000         # 非-protected persona 预算（per subject）
-REFLECTION_RENDER_MAX_TOKENS = 2000      # reflection 渲染预算（pending+confirmed 总和，per subject）
+PERSONA_RENDER_MAX_TOKENS = 2400         # 非-protected persona 预算（per subject）
+REFLECTION_RENDER_MAX_TOKENS = 2400      # reflection 渲染预算（pending+confirmed 总和，per subject）
 PERSONA_RENDER_ENCODING = "o200k_base"   # tiktoken encoding
 
 # ── scoped（群聊）L10 核心记忆的整块总闸 ─────────────────────────────────
@@ -130,10 +133,10 @@ PERSONA_RENDER_ENCODING = "o200k_base"   # tiktoken encoding
 # 都把群排在第一位）。曾经给群 subject 留过一份保底额度，对所有现有与已规划
 # 的调用方都是死代码，而它的每一处交互（多个群、空群、只有免预算内容的群、
 # 没花完的额度外溢）都是一种把它本想保护的顺序倒过来的方式，故删除。
-# 选 16000：4 个 subject 各拿满 (2000 persona + 2000 reflection) 的量。当前
+# 选 19200：4 个 subject 各拿满 (2400 persona + 2400 reflection) 的量。当前
 # 调用方传 [群, 当前发言人]，后续 PR 扩到 [群, 当前发言人, 最近说话的另外
 # 3 人] 共 5 个——最后一个会分到剩量，正是这条常量该起作用的地方。
-SCOPED_RENDER_TOTAL_MAX_TOKENS = 16000
+SCOPED_RENDER_TOTAL_MAX_TOKENS = 19200
 
 # 单个 subject 的最小可用额度：总闸剩不到这个数就整段跳过该 subject，而不
 # 是塞进一两条。半截的 persona 比没有更糟——模型会拿残缺的人设当完整的用
@@ -465,7 +468,9 @@ HYBRID_RECALL_VEC_CACHE_MAX_BYTES = 32 * 1024 * 1024
 # ========================================================================
 
 # ---- Memory: recent history compression ----
-RECENT_HISTORY_MAX_ITEMS = 10
+# Fork PATCH 05: modest +20% retention window. The threshold and per-message
+# budgets move together so compression cadence and detail retention stay balanced.
+RECENT_HISTORY_MAX_ITEMS = 12
 """压缩后保留的近期消息条数。
 - 用途：CompressedRecentHistoryManager 把超过 compress_threshold 的旧消息
   压缩成 1 条 summary 后，原始消息列表保留最后 N 条。
@@ -473,27 +478,27 @@ RECENT_HISTORY_MAX_ITEMS = 10
 - 互动：和 RECENT_COMPRESS_THRESHOLD_ITEMS 配对——压缩后保留 N 条 +
   Stage-1 summary 1 条 = N+1 条进入下次压缩计数。"""
 
-RECENT_COMPRESS_THRESHOLD_ITEMS = 20
+RECENT_COMPRESS_THRESHOLD_ITEMS = 24
 """触发 LLM 压缩的条数阈值。
 - 用途：当某 lanlan 的 user_histories 累积到 > 此值时调一次
   compress_history。
 - 上游：累积的对话条数。"""
 
-RECENT_SUMMARY_MAX_TOKENS = 1000
+RECENT_SUMMARY_MAX_TOKENS = 1200
 """Stage-1 压缩输出的 token 上限。
 - 用途：Stage-1 LLM 把 N 条原始消息压缩成一段文本；如果输出
   > 此值则触发 Stage-2 进一步压缩（500 chars/words 硬截）。
 - 上游：Stage-1 LLM 自由生成的摘要长度。
 - 触发关系：output_tokens > 此值 → further_compress() 二次压缩。"""
 
-RECENT_PER_MESSAGE_MAX_TOKENS = 500
+RECENT_PER_MESSAGE_MAX_TOKENS = 600
 """压缩输入的单条 message token 上限。
 - 用途：compress_history 把每条原始 message 拼进 prompt 前先做头尾保留
-  截断（utils.tokenize.truncate_head_tail_tokens，head=tail=250）。
+  截断（utils.tokenize.truncate_head_tail_tokens，head=tail=300）。
 - 上游：用户/AI 的原始对话文本，正常一轮 30-500 token，长贴可能数 KB。
-- 截断策略：保留头尾各 250 token，中段用 "…[省略中段]…" 替换。"""
+- 截断策略：保留头尾各 300 token，中段用 "…[省略中段]…" 替换。"""
 
-RECENT_COMPRESS_INPUT_BUDGET_TOKENS = 8000
+RECENT_COMPRESS_INPUT_BUDGET_TOKENS = 9600
 """后台 best-effort 压缩的单段输入 token 预算（分段阈值）。
 - 用途：待压积压渲染成文本后若超过此值，compress_history 走分段
   map-reduce——切成每段 ≤ 此值的小段分别压成中间摘要，再 reduce 成最终
@@ -510,7 +515,7 @@ RECENT_HARD_CAP_TOKENS = 60000
 - 上游：未被压缩而累积的 recent 历史 token 数。"""
 
 # ---- Memory: reflection ----
-REFLECTION_TEXT_MAX_TOKENS = 150
+REFLECTION_TEXT_MAX_TOKENS = 180
 """单条 reflection 文本的 soft cap。
 - 用途：超过此值的 reflection 在保存时会剥离 ontology 字段
   (relation_type / temporal_scope) — 文本本身不丢。

@@ -1386,9 +1386,9 @@ class CompressedRecentHistoryManager:
         return 'merged'
 
     async def further_compress(self, initial_summary):
-        # Stage-2 LLM 输出硬限：RECENT_SUMMARY_MAX_TOKENS + 100 余量 = 1100 token。
+        # Stage-2 LLM 输出硬限：RECENT_SUMMARY_MAX_TOKENS + 100 余量。
         # prompt 要求 700 字/words：CJK 700 字 ≈ 1050 token (×1.5)、
-        # EN 700 words ≈ 933 token，都安全落在 1100 cap 之下。
+        # EN 700 words ≈ 933 token，都安全落在当前 cap 之下。
         # 仍然防 LLM 写小作文；如果真撞到 cap，下面句末标点回溯保证语义边界。
         from utils.tokenize import truncate_to_last_sentence_end
         stage2_cap = RECENT_SUMMARY_MAX_TOKENS + 100
