@@ -1289,6 +1289,23 @@ class RenderingMixin:
             subject_from_entry(entry), aliases,
         ) in skipped
 
+    @staticmethod
+    def _resolve_legacy_render_budget(value: int | None, default: int) -> int:
+        """Normalize an optional private-dialog render ceiling.
+
+        Scoped/group rendering keeps its existing per-subject allocator; PATCH 06
+        only supplies these overrides to the private `/new_dialog` bootstrap.
+        ``None`` therefore remains bit-for-bit legacy behaviour for every other
+        caller.  Zero is valid and means "render no budgeted entries" (protected
+        character-card entries remain exempt by their existing contract).
+        """
+        if value is None:
+            return default
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError, OverflowError):
+            return default
+
     def _compose_persona_markdown(
         self, name: str, persona: dict, name_mapping: dict,
         pending_reflections: list[dict] | None,
@@ -1296,6 +1313,9 @@ class RenderingMixin:
         subjects=None,
         include_legacy_private: bool | None = None,
         participant_groups=None,
+        *,
+        persona_budget_tokens: int | None = None,
+        reflection_budget_tokens: int | None = None,
     ) -> str:
         """Sync 3-phase render path. Used by `render_persona_markdown` and
         any test/migration caller that doesn't have an event loop."""
@@ -1310,11 +1330,17 @@ class RenderingMixin:
                 self._trim_scoped_by_subject(prep, now)
             )
         else:
+            persona_budget = self._resolve_legacy_render_budget(
+                persona_budget_tokens, PERSONA_RENDER_MAX_TOKENS,
+            )
+            reflection_budget = self._resolve_legacy_render_budget(
+                reflection_budget_tokens, REFLECTION_RENDER_MAX_TOKENS,
+            )
             trimmed_non_protected, _ = self._score_trim_entries(
-                prep.flat_non_protected, PERSONA_RENDER_MAX_TOKENS, now,
+                prep.flat_non_protected, persona_budget, now,
             )
             trimmed_reflections, _ = self._score_trim_entries(
-                prep.reflections, REFLECTION_RENDER_MAX_TOKENS, now,
+                prep.reflections, reflection_budget, now,
                 # Reflections have no `_personas`-style in-memory view —
                 # they're always loaded fresh from disk. Writing cache
                 # fields onto the transient dicts would be collected on
@@ -1361,7 +1387,9 @@ class RenderingMixin:
                                    confirmed_reflections: list[dict] | None = None,
                                    *, subjects=None,
                                    include_legacy_private: bool | None = None,
-                                   participant_groups=None) -> str:
+                                   participant_groups=None,
+                                   persona_budget_tokens: int | None = None,
+                                   reflection_budget_tokens: int | None = None) -> str:
         """Render persona as markdown for LLM context injection.
 
         Suppressed entries are rendered in a separate "暂不主动提及" ("not
@@ -1375,6 +1403,8 @@ class RenderingMixin:
         return self._compose_persona_markdown(
             name, persona, name_mapping, pending_reflections, confirmed_reflections,
             subjects, include_legacy_private, participant_groups,
+            persona_budget_tokens=persona_budget_tokens,
+            reflection_budget_tokens=reflection_budget_tokens,
         )
 
     async def arender_persona_markdown(
@@ -1385,6 +1415,8 @@ class RenderingMixin:
         subjects=None,
         include_legacy_private: bool | None = None,
         participant_groups=None,
+        persona_budget_tokens: int | None = None,
+        reflection_budget_tokens: int | None = None,
     ) -> str:
         """Async 3-phase render path. Production hot path — uses
         `acount_tokens` so the event loop doesn't stall on tiktoken IO.
@@ -1407,11 +1439,17 @@ class RenderingMixin:
                 await self._atrim_scoped_by_subject(prep, now)
             )
         else:
+            persona_budget = self._resolve_legacy_render_budget(
+                persona_budget_tokens, PERSONA_RENDER_MAX_TOKENS,
+            )
+            reflection_budget = self._resolve_legacy_render_budget(
+                reflection_budget_tokens, REFLECTION_RENDER_MAX_TOKENS,
+            )
             trimmed_non_protected, _ = await self._ascore_trim_entries(
-                prep.flat_non_protected, PERSONA_RENDER_MAX_TOKENS, now,
+                prep.flat_non_protected, persona_budget, now,
             )
             trimmed_reflections, _ = await self._ascore_trim_entries(
-                prep.reflections, REFLECTION_RENDER_MAX_TOKENS, now,
+                prep.reflections, reflection_budget, now,
                 # See sync twin: reflections have no `_personas`-style
                 # in-memory view, so we compute fresh every render without
                 # writing cache fields back onto the transient dicts.

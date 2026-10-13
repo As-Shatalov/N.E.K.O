@@ -1422,14 +1422,37 @@ class LifecycleMixin:
         if self._is_free_preset_voice:
             logger.info(f"🆓 当前使用免费预设音色: '{self.voice_id}'")
 
-        # 日志输出模型配置（直接从配置读取，避免创建不必要的实例变量）
+        # 日志输出模型配置。conversation_config 在 PATCH 06 还承担一个
+        # 启动前职责：若 provider 能报告可信的已加载 context window，就把这个
+        # capacity hint 交给 Memory Server，让 `/new_dialog` 用自适应记忆预算。
         _realtime_model = realtime_config.get('model', '')
-        _conversation_model = (await self._config_manager.aget_model_api_config(
-            'conversation', core_config=core_config_snapshot
-        )).get('model', '')
-        _vision_model = (await self._config_manager.aget_model_api_config(
-            'vision', core_config=core_config_snapshot
-        )).get('model', '')
+        conversation_config, vision_config = await asyncio.gather(
+            self._config_manager.aget_model_api_config(
+                'conversation', core_config=core_config_snapshot
+            ),
+            self._config_manager.aget_model_api_config(
+                'vision', core_config=core_config_snapshot
+            ),
+        )
+        _conversation_model = conversation_config.get('model', '')
+        _vision_model = vision_config.get('model', '')
+        self._memory_context_window_tokens = None
+        if input_mode == 'text':
+            try:
+                from main_logic.context_window import resolve_context_window_tokens
+                self._memory_context_window_tokens = await resolve_context_window_tokens(
+                    base_url=conversation_config.get('base_url', ''),
+                    model=conversation_config.get('model', ''),
+                    api_key=conversation_config.get('api_key'),
+                )
+            except Exception as exc:
+                # Discovery is an optimisation/safety hint, never a startup
+                # dependency. Unknown providers keep PATCH-05 memory budgets.
+                logger.debug(
+                    "[%s] memory context-window hint unavailable: %s",
+                    self.lanlan_name, exc,
+                )
+                self._memory_context_window_tokens = None
         logger.info(f"📌 已重新加载配置: core_api={self.core_api_type}, realtime_model={_realtime_model}, text_model={_conversation_model}, vision_model={_vision_model}, voice_id={self.voice_id}")
         logger.info(f"[语音会话诊断] 配置加载完成 (耗时: {time.time() - diag_start:.2f}秒)")
         return realtime_config, core_config_snapshot
@@ -1598,14 +1621,20 @@ class LifecycleMixin:
         return True
 
     def _new_dialog_request_kwargs(self) -> dict:
-        """Share explicit-locale provenance across initial and hot-swap bootstrap."""
+        """Share locale provenance and known model capacity with Memory Server."""
         request_kwargs = {"timeout": 5.0}
+        params: dict[str, object] = {}
         if getattr(self, "_user_language_explicit", False):
-            request_kwargs["params"] = {"language": self.user_language}
+            params["language"] = self.user_language
         elif getattr(self, "_conversation_render_language", None):
-            request_kwargs["params"] = {
-                "render_language": self._conversation_render_language,
-            }
+            params["render_language"] = self._conversation_render_language
+
+        context_window = getattr(self, "_memory_context_window_tokens", None)
+        if isinstance(context_window, int) and context_window > 0:
+            params["context_window_tokens"] = context_window
+
+        if params:
+            request_kwargs["params"] = params
         return request_kwargs
 
     async def _start_session_fetch_new_dialog(self, lanlan_name, port):

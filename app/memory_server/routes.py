@@ -55,6 +55,10 @@ from utils.language_utils import (
 from utils.llm_client import convert_to_messages
 from utils.time_format import format_elapsed as _format_elapsed
 from utils.cloudsave_runtime import MaintenanceModeError, assert_cloudsave_writable
+from memory.context_budget import (
+    build_memory_context_budget,
+    fit_recent_lines_to_budget,
+)
 from memory.external_markdown_import import MAX_ENTRIES, MAX_ENTRY_CHARS
 from memory.outbox import OP_PERSIST_PROMPT_LOCALE
 from memory.persona.fusion import ExternalMemoryImportTooLargeError
@@ -68,6 +72,7 @@ from utils.natural_expression_candidates import (
 from . import gates, locale_state, outbox_infra, post_turn, review, runtime
 from ._shared import logger, validate_lanlan_name
 from utils.character_name import PROFILE_NAME_MAX_UNITS, validate_character_name
+from utils.tokenize import acount_tokens
 from .rows import _has_human_messages
 from .runtime import app
 
@@ -3614,10 +3619,16 @@ async def new_dialog(
     lanlan_name: str,
     language: str | None = None,
     render_language: str | None = None,
+    context_window_tokens: int | None = None,
 ):
     request_language = language if is_supported_language_code(language) else render_language
     with language_context(_activate_request_language(request_language)):
-        return await _new_dialog(lanlan_name, language, render_language)
+        return await _new_dialog(
+            lanlan_name,
+            language,
+            render_language,
+            context_window_tokens=context_window_tokens,
+        )
 
 
 async def _write_new_dialog_locale(
@@ -3734,6 +3745,8 @@ async def _new_dialog(
     lanlan_name: str,
     language: str | None = None,
     render_language: str | None = None,
+    *,
+    context_window_tokens: int | None = None,
 ):
     lanlan_name = validate_lanlan_name(lanlan_name)
     gates._touch_activity()
@@ -3854,6 +3867,13 @@ async def _new_dialog(
     # cacheable 机会，记进来反而污染 per_char 分布。
     _new_dialog_qps_counter[lanlan_name] = _new_dialog_qps_counter.get(lanlan_name, 0) + 1
 
+    # PATCH 06: known-capacity text models get one bounded bootstrap-memory
+    # envelope. Unknown/realtime providers return None and keep the exact
+    # PATCH-05 static behaviour. The router itself is deterministic; memory
+    # relevance continues to come from the existing evidence scorer and the
+    # model can still pull distant material with recall_memory on demand.
+    memory_budget = build_memory_context_budget(context_window_tokens)
+
     # settle_lock 保留：等 /renew /settle 的首轮摘要完成，读到一致数据。
     # review 不持此锁，且写盘是「整体引用替换 + fingerprint patch」原子操作，
     # 与本路径读取无 race；Phase C 已让 review 设计成可与 /process 并行的后台
@@ -3879,9 +3899,18 @@ async def _new_dialog(
             pending_reflections = await runtime.reflection_engine.aget_pending_reflections(lanlan_name)
             confirmed_reflections = await runtime.reflection_engine.aget_confirmed_reflections(lanlan_name)
             result = _loc(PERSONA_HEADER, _lang).format(name=lanlan_name)
-            persona_md = await runtime.persona_manager.arender_persona_markdown(
-                lanlan_name, pending_reflections, confirmed_reflections,
-            )
+            if memory_budget is None:
+                persona_md = await runtime.persona_manager.arender_persona_markdown(
+                    lanlan_name, pending_reflections, confirmed_reflections,
+                )
+            else:
+                persona_md = await runtime.persona_manager.arender_persona_markdown(
+                    lanlan_name,
+                    pending_reflections,
+                    confirmed_reflections,
+                    persona_budget_tokens=memory_budget.persona_tokens,
+                    reflection_budget_tokens=memory_budget.reflection_tokens,
+                )
         if persona_md:
             result += persona_md
         else:
@@ -3904,13 +3933,62 @@ async def _new_dialog(
             time=get_timestamp(),
         )
 
-        for i in await runtime.recent_history_manager.aget_recent_history(lanlan_name):
-            if isinstance(i.content, str):
-                cleaned_content = brackets_pattern.sub('', i.content).strip()
-                result += f"{name_mapping[i.type]} | {cleaned_content}\n"
-            else:
-                texts = [brackets_pattern.sub('', j['text']).strip() for j in i.content if j['type'] == 'text']
-                result += f"{name_mapping[i.type]} | " + "\n".join(texts) + "\n"
+        recent_history = await runtime.recent_history_manager.aget_recent_history(lanlan_name)
+        if memory_budget is None:
+            for i in recent_history:
+                if isinstance(i.content, str):
+                    cleaned_content = brackets_pattern.sub('', i.content).strip()
+                    result += f"{name_mapping[i.type]} | {cleaned_content}\n"
+                else:
+                    texts = [brackets_pattern.sub('', j['text']).strip() for j in i.content if j['type'] == 'text']
+                    result += f"{name_mapping[i.type]} | " + "\n".join(texts) + "\n"
+        else:
+            recent_lines: list[str] = []
+            for i in recent_history:
+                if isinstance(i.content, str):
+                    cleaned_content = brackets_pattern.sub('', i.content).strip()
+                    recent_lines.append(f"{name_mapping[i.type]} | {cleaned_content}\n")
+                else:
+                    texts = [
+                        brackets_pattern.sub('', j['text']).strip()
+                        for j in i.content
+                        if j['type'] == 'text'
+                    ]
+                    recent_lines.append(
+                        f"{name_mapping[i.type]} | " + "\n".join(texts) + "\n"
+                    )
+
+            # Charge the *actual* rendered prefix, including protected persona
+            # entries that intentionally ignore the ordinary section ceiling.
+            # Whatever ordinary sections leave unused may flow into recent
+            # history. Protected character-card identity keeps its old exemption;
+            # if it alone exceeds the envelope, recent simply receives zero.
+            used_prefix_tokens = await acount_tokens(result)
+            recent_budget_tokens = memory_budget.recent_tokens_after_prefix(
+                used_prefix_tokens,
+            )
+            pin_first = bool(
+                recent_history
+                and getattr(recent_history[0], 'type', '') == 'system'
+            )
+            selected_recent_lines = await fit_recent_lines_to_budget(
+                recent_lines,
+                recent_budget_tokens,
+                pin_first=pin_first,
+            )
+            result += "".join(selected_recent_lines)
+            logger.debug(
+                "[MemoryBudget] %s window=%d total=%d persona=%d reflection=%d "
+                "recent_budget=%d recent_lines=%d/%d",
+                lanlan_name,
+                memory_budget.context_window_tokens,
+                memory_budget.total_tokens,
+                memory_budget.persona_tokens,
+                memory_budget.reflection_tokens,
+                recent_budget_tokens,
+                len(selected_recent_lines),
+                len(recent_lines),
+            )
 
         # ── 距上次聊天间隔提示（放在最末尾，紧接 CONTEXT_SUMMARY_READY 之前） ──
         try:

@@ -178,6 +178,10 @@ class LLMSessionManager(
         realtime_config = self._config_manager.get_model_api_config('realtime')
         self.core_api_type = realtime_config.get('api_type', '') or self._config_manager.get_core_config().get('CORE_API_TYPE', '')
         self.memory_server_port = MEMORY_SERVER_PORT
+        # PATCH 06: best-effort capacity hint for Memory Server `/new_dialog`.
+        # Filled during text-session preparation when the provider exposes a
+        # trustworthy loaded context window (currently local LM Studio).
+        self._memory_context_window_tokens: int | None = None
         self.audio_api_key = self._config_manager.get_core_config()['AUDIO_API_KEY']  # 用于CosyVoice自定义音色
         self._apply_voice_id_for_route()
         # 注意：use_tts 会在 start_session 中根据 input_mode 重新设置

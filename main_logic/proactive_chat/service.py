@@ -477,9 +477,9 @@ def _resolve_declared_topic_hook_locale(
 def _new_dialog_locale_params(
     data: ProactiveChatCommand | dict,
     mgr,
-) -> dict[str, str] | None:
-    """Pass durable and render-only locale evidence through separate fields."""
-    params: dict[str, str] = {}
+) -> dict[str, object] | None:
+    """Pass locale evidence and any known model-capacity hint to memory."""
+    params: dict[str, object] = {}
     declared = _resolve_declared_topic_hook_locale(data, mgr)
     if declared:
         params["language"] = declared
@@ -491,6 +491,13 @@ def _new_dialog_locale_params(
         )
         if normalized_render_language:
             params["render_language"] = normalized_render_language
+
+    # Reuse the trusted capacity discovered by the normal text-session path.
+    # If proactive runs before any such discovery, omit the hint and Memory
+    # Server keeps the PATCH-05 fallback budgets.
+    context_window = getattr(mgr, "_memory_context_window_tokens", None)
+    if isinstance(context_window, int) and context_window > 0:
+        params["context_window_tokens"] = context_window
     return params or None
 
 
