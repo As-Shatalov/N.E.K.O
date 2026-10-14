@@ -4163,7 +4163,8 @@ FACT_DEDUP_PROMPT = {
 
 对于每组，从下列动作中选一个：
 - merge: 两条记录的确指向同一事件/偏好/状态，保留 existing，丢弃 candidate（existing 的 importance 会自动+1，candidate id 会被记入 merged_from_ids）
-- replace: 同样指向同一件事，但 candidate 措辞更准确/更新，应保留 candidate、丢弃 existing
+- replace: existing 本身不应被当作曾经成立的历史事实（例如记录错误、误解、措辞不准确，或 candidate 明确纠正了它）；保留 candidate、丢弃 existing。它不是时间上的状态变化
+- supersede: 同一可变化的状态/偏好/关系确实随时间发生了改变，candidate 是新的当前状态，existing 曾经成立但现在已过时。保留 candidate，并把 existing 作为历史状态归档
 - keep_both: 看似相似但其实是两件不同的事（如"喜欢"与"讨厌"，或同一对象在不同情境下的不同状态），都保留
 
 注意：
@@ -4180,7 +4181,8 @@ FACT_DEDUP_PROMPT = {
 
 對於每組，從下列動作中選一個：
 - merge: 兩條紀錄確實指向同一事件/偏好/狀態，保留 existing，丟棄 candidate（existing 的 importance 會自動+1，candidate id 會被記入 merged_from_ids）
-- replace: 同樣指向同一件事，但 candidate 措辭更準確/更新，應保留 candidate、丟棄 existing
+- replace: existing 本身不應被當作曾經成立的歷史事實（例如記錄錯誤、誤解、措辭不準確，或 candidate 明確糾正了它）；保留 candidate、丟棄 existing。這不是時間上的狀態變化
+- supersede: 同一個可變狀態/偏好/關係確實隨時間改變，candidate 是新的目前狀態，existing 曾經成立但現在已過時。保留 candidate，並把 existing 作為歷史狀態封存
 - keep_both: 看似相似但其實是兩件不同的事（如「喜歡」與「討厭」，或同一物件在不同情境下的不同狀態），都保留
 
 注意：
@@ -4197,7 +4199,8 @@ FACT_DEDUP_PROMPT = {
 
 For each pair, pick one action:
 - merge: the two records do refer to the same event/preference/state — keep existing, drop candidate (existing's importance will auto +1; candidate id is recorded in merged_from_ids)
-- replace: same underlying thing, but the candidate's wording is more accurate/up-to-date — keep candidate, drop existing
+- replace: existing should NOT be treated as a historically true state (for example it was mistaken, misunderstood, badly worded, or candidate explicitly corrects it) — keep candidate, drop existing. This is NOT a state change over time
+- supersede: the same mutable state/preference/relationship genuinely changed over time — candidate is current, while existing used to be true but is now stale. Keep candidate and archive existing as historical state
 - keep_both: they look similar but are actually distinct ("likes" vs "dislikes", or the same subject in different contexts) — keep both
 
 Notes:
@@ -4214,7 +4217,8 @@ Output only a JSON array, each item containing index and action:
 
 各ペアについて、以下のいずれかを選択：
 - merge: 同じ出来事/嗜好/状態を指している → existing を残し candidate を削除（existing の importance が自動 +1、candidate id は merged_from_ids に記録）
-- replace: 同じ事柄だが candidate の方が正確/最新 → candidate を残し existing を削除
+- replace: existing を過去に真だった状態として残すべきではない（記録ミス、誤解、不正確な表現、または candidate が明示的に訂正した場合）→ candidate を残し existing を削除。時間による状態変化ではない
+- supersede: 同じ可変の状態/嗜好/関係が時間とともに実際に変化した → candidate が現在、existing は以前は正しかったが今は古い。candidate を残し existing を履歴として保存
 - keep_both: 似ているが実際には別の事柄（"好き"と"嫌い"のような極性反転、あるいは異なる文脈での同じ対象）→ 両方残す
 
 注意：
@@ -4231,7 +4235,8 @@ JSON 配列のみを出力し、各項目に index と action を含めてくだ
 
 각 쌍에 대해 다음 중 하나를 선택:
 - merge: 두 기록이 실제로 같은 사건/선호/상태를 가리킴 — existing 유지, candidate 제거 (existing의 importance가 자동 +1, candidate id는 merged_from_ids에 기록됨)
-- replace: 같은 것을 가리키지만 candidate의 표현이 더 정확/최신 — candidate 유지, existing 제거
+- replace: existing을 과거에 참이었던 상태로 남기면 안 됨(기록 오류, 오해, 부정확한 표현 또는 candidate가 명시적으로 정정한 경우) — candidate 유지, existing 제거. 시간에 따른 상태 변화는 아님
+- supersede: 같은 변경 가능한 상태/선호/관계가 실제로 시간에 따라 바뀜 — candidate가 현재 상태이고 existing은 과거에는 맞았지만 지금은 오래됨. candidate를 유지하고 existing을 역사 상태로 보관
 - keep_both: 비슷해 보이지만 실제로는 다른 것 ("좋아함"과 "싫어함" 같은 극성 반전, 혹은 다른 맥락의 같은 대상) — 둘 다 유지
 
 주의:
@@ -4248,7 +4253,8 @@ JSON 배열만 출력하고 각 항목에 index와 action을 포함하세요:
 
 Для каждой пары выберите одно из действий:
 - merge: записи описывают одно и то же событие/предпочтение/состояние — сохранить existing, отбросить candidate (importance у existing увеличится на 1, id candidate запишется в merged_from_ids)
-- replace: то же самое, но формулировка candidate точнее/актуальнее — сохранить candidate, отбросить existing
+- replace: existing не следует считать когда-либо верным историческим состоянием (например, это была ошибка записи, недопонимание, неточная формулировка или candidate явно исправляет её) — сохранить candidate, отбросить existing. Это НЕ изменение состояния со временем
+- supersede: одно и то же изменяемое состояние/предпочтение/отношение действительно изменилось со временем — candidate является текущим, а existing раньше был верным, но теперь устарел. Сохранить candidate, existing архивировать как историческое состояние
 - keep_both: похожи внешне, но на самом деле разные ("любит" vs "не любит", тот же объект в разных контекстах) — сохранить обе
 
 Замечания:
@@ -4265,7 +4271,8 @@ JSON 배열만 출력하고 각 항목에 index와 action을 포함하세요:
 
 Para cada par, elige una acción:
 - merge: los dos registros sí apuntan al mismo evento/preferencia/estado; conserva existing y descarta candidate (importance de existing subirá +1 automáticamente; el id de candidate se registrará en merged_from_ids)
-- replace: apuntan a lo mismo, pero candidate está mejor redactado o más actualizado; conserva candidate y descarta existing
+- replace: existing NO debe tratarse como un estado históricamente verdadero (por ejemplo fue un error, un malentendido, una redacción imprecisa o candidate lo corrige explícitamente); conserva candidate y descarta existing. NO es un cambio de estado con el tiempo
+- supersede: el mismo estado/preferencia/relación mutable cambió realmente con el tiempo; candidate es el estado actual y existing fue válido antes pero ya está obsoleto. Conserva candidate y archiva existing como estado histórico
 - keep_both: parecen similares pero son cosas distintas (por ejemplo "le gusta" vs "no le gusta", o el mismo sujeto en contextos diferentes); conserva ambos
 
 Notas:
@@ -4282,7 +4289,8 @@ Devuelve solo un array JSON; cada elemento contiene index y action:
 
 Para cada par, escolha uma ação:
 - merge: os dois registros realmente apontam para o mesmo evento/preferência/estado; mantenha existing e descarte candidate (a importance de existing subirá +1 automaticamente; o id de candidate será registrado em merged_from_ids)
-- replace: apontam para a mesma coisa, mas candidate está mais preciso ou atualizado; mantenha candidate e descarte existing
+- replace: existing NÃO deve ser tratado como um estado historicamente verdadeiro (por exemplo foi erro, mal-entendido, formulação imprecisa ou candidate o corrige explicitamente); mantenha candidate e descarte existing. NÃO é uma mudança de estado ao longo do tempo
+- supersede: o mesmo estado/preferência/relação mutável realmente mudou ao longo do tempo; candidate é o estado atual e existing já foi válido, mas agora está desatualizado. Mantenha candidate e arquive existing como estado histórico
 - keep_both: parecem semelhantes, mas são coisas distintas (por exemplo "gosta" vs "não gosta", ou o mesmo assunto em contextos diferentes); mantenha ambos
 
 Notas:

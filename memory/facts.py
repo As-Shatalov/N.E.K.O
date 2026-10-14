@@ -288,7 +288,9 @@ def _merge_archive_entries(existing: list, incoming: list) -> list[dict]:
                 replacement = dict(entry)
                 for key in (
                     'arbitration_archived_at', 'arbitration_reason',
-                    'superseded_by',
+                    'superseded_by', 'supersession_kind',
+                    'belief_valid_from_at', 'belief_valid_to_at',
+                    'temporal_superseded_at',
                 ):
                     if key in previous:
                         replacement[key] = previous[key]
@@ -1212,6 +1214,15 @@ class FactStore:
                         )
                         if spec.get('superseded_by'):
                             copy['superseded_by'] = spec['superseded_by']
+                        # PATCH 07: temporal supersession is an audit trail, not a
+                        # destructive overwrite.  These fields describe the interval
+                        # during which this fact was the system's current belief.
+                        for key in (
+                            'supersession_kind', 'belief_valid_from_at',
+                            'belief_valid_to_at', 'temporal_superseded_at',
+                        ):
+                            if spec.get(key) is not None:
+                                copy[key] = spec[key]
                         stamped.append(copy)
                     merged_archive = _merge_archive_entries(archived, stamped)
                     loser_identities = {
@@ -1907,12 +1918,18 @@ class FactStore:
                     restored = dict(matches[-1])
                     for key in (
                         'arbitration_archived_at', 'arbitration_reason',
-                        'superseded_by',
+                        'superseded_by', 'supersession_kind',
+                        'belief_valid_from_at', 'belief_valid_to_at',
+                        'temporal_superseded_at',
                     ):
                         restored.pop(key, None)
                     restored_at = datetime.now().isoformat()
                     restored['arbitration_restored_at'] = restored_at
                     restored['restored_at'] = restored_at
+                    # A manual restore makes the assertion current again. Do not
+                    # reuse its old closed belief interval on a later supersede.
+                    restored['belief_valid_from_at'] = restored_at
+                    restored['belief_valid_to_at'] = None
                     active = list(facts)
                     if selected_identity not in active_identities:
                         active.append(restored)
@@ -3920,6 +3937,14 @@ class FactStore:
                 'tags': [],
                 'hash': content_hash,
                 'created_at': created_at_iso,
+                # PATCH 07: belief-time is deliberately separate from event-time.
+                # event_* answers "when did the described event happen?";
+                # belief_valid_* answers "during which interval did N.E.K.O treat
+                # this assertion as its current knowledge?".  New facts start
+                # open-ended and only gain a closing bound when a later fact
+                # explicitly supersedes them.
+                'belief_valid_from_at': created_at_iso,
+                'belief_valid_to_at': None,
                 # Schema v2 (memory/temporal.py)：事件发生时间，LLM 用相对偏移
                 # 输出（offset+unit），系统按 created_at 解算。event_when_raw
                 # 留底供后续重判 / debug 反查。

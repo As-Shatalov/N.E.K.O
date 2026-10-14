@@ -784,6 +784,12 @@ _ARCHIVE_RECALL_KEYS = frozenset({
     'subject_kind', 'subject_id', 'scope',
     'entity',
     'created_at', 'event_start_at', 'event_end_at',
+    # PATCH 07 temporal lineage.  Arbitration markers are kept in the
+    # in-memory archive projection so current recall can exclude them while
+    # explicit time recall may selectively admit temporal supersessions.
+    'arbitration_archived_at', 'arbitration_reason', 'superseded_by',
+    'supersession_kind', 'supersedes_fact_id',
+    'belief_valid_from_at', 'belief_valid_to_at', 'temporal_superseded_at',
 })
 
 
@@ -794,7 +800,9 @@ def _project_archive_row(row: dict) -> dict:
     return {k: v for k, v in row.items() if k in _ARCHIVE_RECALL_KEYS}
 
 
-async def _aload_archive_facts(fact_store, lanlan_name: str) -> list[dict]:
+async def _aload_archive_facts(
+    fact_store, lanlan_name: str, *, include_temporal_superseded: bool = False,
+) -> list[dict]:
     """Load ``facts_archive.json`` directly. Returns ``[]`` on missing /
     parse error — archive miss is non-fatal for recall.
 
@@ -823,14 +831,15 @@ async def _aload_archive_facts(fact_store, lanlan_name: str) -> list[dict]:
         # 的语义就是「这个群/成员的记忆整体退出候选」——这里是两条召
         # 回路径（hybrid_recall / recall_by_time）唯一的 archive 池装
         # 配点，单点过滤即可覆盖。恢复路径会剥掉标记，行自然回池。
+        # Cache a policy-neutral projection: subject-archived rows never
+        # participate in recall, but arbitration rows stay in the cached pool
+        # so the caller can choose whether an explicit historical query should
+        # see temporal supersessions.  Filtering them here would make the cache
+        # key depend on the first caller's policy.
         rows = [
             row for row in data
             if not (
-                isinstance(row, dict)
-                and (
-                    row.get('subject_archived_at')
-                    or row.get('arbitration_archived_at')
-                )
+                isinstance(row, dict) and row.get('subject_archived_at')
             )
         ]
         # 投影到召回真正读的字段（见 _ARCHIVE_RECALL_KEYS）。这一步同时把向量
@@ -847,7 +856,23 @@ async def _aload_archive_facts(fact_store, lanlan_name: str) -> list[dict]:
         return await asyncio.to_thread(_read)
 
     try:
-        return await _aload_pool_cached(path, _aread)
+        cached = await _aload_pool_cached(path, _aread)
+        # Current semantic recall must never resurrect an arbitration loser.
+        # Explicit historical recall is different: temporal supersessions are
+        # useful evidence of what was true/known before the update, while plain
+        # dedup/wording replacements remain hidden because they were never a
+        # distinct historical state.
+        return [
+            row for row in cached
+            if not (
+                isinstance(row, dict)
+                and row.get('arbitration_archived_at')
+                and not (
+                    include_temporal_superseded
+                    and row.get('supersession_kind') == 'temporal_update'
+                )
+            )
+        ]
     except FileNotFoundError:
         # "还没有归档文件" 是常态而非故障（新角色 / 从未触发过归档），以前由
         # 一次显式 os.path.exists 提前拦掉；现在 _file_identity 的 stat 已经是
@@ -1060,9 +1085,27 @@ def _entry_event_window(entry: dict):
     from memory.temporal import _parse_iso_safe, to_naive_local
     # aware（import/迁移的 +00:00 / Z）统一先转本地再剥 tz，避免 day 级窗口
     # 在日界处归错天（Codex）。to_naive_local 对 naive / None 是 no-op。
-    start = to_naive_local(_parse_iso_safe(entry.get('event_start_at')))
-    end = to_naive_local(_parse_iso_safe(entry.get('event_end_at')))
-    created = to_naive_local(_parse_iso_safe(entry.get('created_at')))
+    # PATCH 07: event time and knowledge-validity time are different axes.
+    # A superseded preference/state can be historically relevant for the whole
+    # interval during which it was N.E.K.O's current belief, even if its event
+    # timestamp was just the extraction instant.  Use belief validity only for
+    # explicit temporal-lineage rows; ordinary episodic facts retain the
+    # established event-time semantics.
+    temporal_lineage = (
+        entry.get('supersession_kind') == 'temporal_update'
+        or entry.get('supersedes_fact_id') is not None
+    )
+    if temporal_lineage:
+        start = to_naive_local(_parse_iso_safe(entry.get('belief_valid_from_at')))
+        end = to_naive_local(_parse_iso_safe(entry.get('belief_valid_to_at')))
+        created = to_naive_local(_parse_iso_safe(entry.get('created_at')))
+        if start is not None and end is None:
+            from datetime import datetime as _dt
+            end = _dt.now()
+    else:
+        start = to_naive_local(_parse_iso_safe(entry.get('event_start_at')))
+        end = to_naive_local(_parse_iso_safe(entry.get('event_end_at')))
+        created = to_naive_local(_parse_iso_safe(entry.get('created_at')))
     anchor = end or start or created
     if anchor is None:
         return None
@@ -1156,7 +1199,10 @@ async def hybrid_recall(
     active_facts, active_reflections, archive_facts = await asyncio.gather(
         fact_store.aload_facts(lanlan_name),
         _aload_reflections_for_recall(reflection_engine, lanlan_name),
-        _aload_archive_facts(fact_store, lanlan_name),
+        _aload_archive_facts(
+            fact_store, lanlan_name,
+            include_temporal_superseded=time_window is not None,
+        ),
     )
     active_facts = active_facts or []
     active_reflections = active_reflections or []
@@ -1337,7 +1383,9 @@ async def recall_by_time(
     active_facts, active_reflections, archive_facts = await asyncio.gather(
         fact_store.aload_facts(lanlan_name),
         _aload_reflections_for_recall(reflection_engine, lanlan_name),
-        _aload_archive_facts(fact_store, lanlan_name),
+        _aload_archive_facts(
+            fact_store, lanlan_name, include_temporal_superseded=True,
+        ),
     )
     active_facts = active_facts or []
     pool_raw = (

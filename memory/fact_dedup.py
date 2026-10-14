@@ -35,7 +35,7 @@ threshold:
      facts.json (a row that disappeared meanwhile is consumed via the
      stale-pair path) and batches the queue into one LLM call asking
      the model to classify each (candidate, existing) pair as
-     ``merge`` / ``replace`` / ``keep_both``.
+     ``merge`` / ``replace`` / ``supersede`` / ``keep_both``.
   3. Decisions are applied to facts.json under the FactStore's
      existing per-character file lock, then processed queue items
      are removed.
@@ -1191,7 +1191,7 @@ class FactDedupResolver:
     # preserved for retry — the alternative is silently dropping a
     # paraphrase pair the next batch can no longer surface (CodeRabbit
     # PR-957 Major).
-    _VALID_ACTIONS = frozenset({'merge', 'replace', 'keep_both'})
+    _VALID_ACTIONS = frozenset({'merge', 'replace', 'supersede', 'keep_both'})
 
     async def _aapply_decisions(
         self, name: str, batch: list[dict], results: list[dict],
@@ -1203,7 +1203,10 @@ class FactDedupResolver:
                            by +1 (capped at 10), append candidate_id
                            to existing.merged_from_ids
           * ``replace``  — drop the existing, keep the candidate
-                           (paraphrase but the new wording is better)
+                           (same truth, but the new wording is better)
+          * ``supersede``— the underlying mutable state/preference changed
+                           over time; keep candidate as current and archive
+                           existing with an explicit belief-validity interval
           * ``keep_both``— no mutation, just clear from queue (LLM
                            judged they're not actually duplicates)
 
@@ -1455,7 +1458,10 @@ class FactDedupResolver:
             elif action == 'replace':
                 # Mirror image: drop existing, keep candidate. Carry
                 # the existing's merged_from chain forward so we don't
-                # lose provenance back to its earlier paraphrases.
+                # lose provenance back to its earlier paraphrases. ``replace``
+                # is intentionally NON-temporal: it means the old row was a
+                # worse representation of the same truth, not a truth that
+                # used to hold and later changed.
                 merged = list(cand.get('merged_from_ids') or [])
                 for mid in (existing.get('merged_from_ids') or []):
                     if mid not in merged:
@@ -1469,15 +1475,45 @@ class FactDedupResolver:
                     cur = safe_importance(cand)
                     old = safe_importance(existing)
                     cand['importance'] = max(cur, old)
-                # ``replace`` selects the candidate assertion rather than
-                # corroborating it with the rejected row. Keep the selected
-                # author's provenance; the loser remains traceable through
-                # merged_from_ids and the archive record below.
                 mutated_survivor_identities.add(cand_identity)
                 identities_to_remove.add(exist_identity)
                 archive_specs[exist_identity] = {
                     'reason': 'fact_dedup_replace',
                     'superseded_by': cand_id,
+                }
+                processed_pairs.add(pair_key)
+                applied += 1
+            elif action == 'supersede':
+                # PATCH 07: mutable knowledge changed over time.  Do NOT fold
+                # the old id into merged_from_ids: that field means paraphrase
+                # consolidation, while this branch preserves two historically
+                # distinct beliefs linked by supersedes_fact_id.
+                effective_at = str(cand.get('created_at') or '').strip()
+                if not effective_at:
+                    effective_at = datetime.now(timezone.utc).isoformat()
+                old_valid_from = str(
+                    existing.get('belief_valid_from_at')
+                    or existing.get('created_at')
+                    or effective_at
+                ).strip()
+                cand['belief_valid_from_at'] = effective_at
+                cand['belief_valid_to_at'] = None
+                cand['supersedes_fact_id'] = exist_id
+                cand['supersession_kind'] = 'temporal_update'
+                # A state update may still be important even when the new
+                # wording is terse; preserve the stronger importance signal.
+                cur = safe_importance(cand)
+                old_imp = safe_importance(existing)
+                cand['importance'] = max(cur, old_imp)
+                mutated_survivor_identities.add(cand_identity)
+                identities_to_remove.add(exist_identity)
+                archive_specs[exist_identity] = {
+                    'reason': 'fact_temporal_supersede',
+                    'superseded_by': cand_id,
+                    'supersession_kind': 'temporal_update',
+                    'belief_valid_from_at': old_valid_from,
+                    'belief_valid_to_at': effective_at,
+                    'temporal_superseded_at': datetime.now(timezone.utc).isoformat(),
                 }
                 processed_pairs.add(pair_key)
                 applied += 1
