@@ -32,6 +32,21 @@ SESSION_TURN_THRESHOLD = 10
 - 计数语义：仅用户输入计数（AI 回复不算），见 core.py:980。
 - 设计依据：~10 轮约对应 5500 token 总量，跟 token 触发对齐。"""
 
+HOTSWAP_MEMORY_SETTLEMENT_WAIT_SECONDS = 32.0
+"""热切换预热等待 memory-server 结算完成的最长时间。
+- 旧流程只按固定 10 秒 sleep 猜测摘要已结束，然后 /new_dialog 仅等 5 秒；
+  summary provider 稍慢时会与 settle_lock 竞争，导致 pending session 反复预热失败。
+- 32 秒与 cross_server /renew|/settle 的 30 秒前台 HTTP deadline 对齐并留 2 秒
+  调度余量。它只阻塞后台 pending-session 预热，不阻塞当前正在工作的会话。
+- 超时后 fail-open：继续尝试 /new_dialog，而不是卡死热切换。"""
+
+HOTSWAP_NEW_DIALOG_RECOVERY_TIMEOUT_SECONDS = 20.0
+"""memory settlement 未确认成功时，热切换 /new_dialog 的恢复性 timeout。
+- 正常路径仍保留 lifecycle._new_dialog_request_kwargs() 的 5 秒快速失败；
+- 只有 /renew|/settle 超时或未确认时临时放宽到 20 秒，给 memory-server
+  已经开始但尚未释放 settle_lock 的安全收尾留空间。
+- 仍是后台等待，不延长用户当前 turn 的响应路径。"""
+
 USER_DIRECTIVE_TTL_SECONDS = 3 * 86400
 """用户显式 ban-topic 指令（"别再提 X / stop saying X"）的**基础**存活时长。
 - 用途：memory/user_directives.py 的 active 判定 + render_prompt_block

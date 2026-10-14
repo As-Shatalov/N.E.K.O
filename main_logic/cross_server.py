@@ -46,6 +46,7 @@ from utils.internal_http_client import get_internal_http_client
 from utils.language_utils import is_supported_language_code
 from utils.logger_config import get_module_logger
 from main_logic.agent_event_bus import publish_analyze_request_reliably
+from main_logic.hotswap_memory_barrier import complete_memory_settlement
 
 # Setup logger for this module
 logger = get_module_logger(__name__, "Main")
@@ -1035,9 +1036,12 @@ async def run_sync_connector(
                                 text_output_request_id = None
                             
                             if message["data"] == "renew session":
+                                _renew_started_at = time.monotonic()
+                                _renew_memory_ok = False
                                 # 检查是否正在关闭
                                 if shutdown_event.is_set():
                                     logger.info(f"[{lanlan_name}] 进程正在关闭，跳过renew session处理")
+                                    complete_memory_settlement(message, False)
                                     break
                                 
                                 # 先处理未完成的用户输入缓存（如果有）
@@ -1060,6 +1064,7 @@ async def run_sync_connector(
                                 # 再次检查关闭状态
                                 if shutdown_event.is_set():
                                     logger.info(f"[{lanlan_name}] 进程正在关闭，跳过memory_server请求")
+                                    complete_memory_settlement(message, False)
                                     chat_history.clear()
                                     break
                                 
@@ -1089,6 +1094,7 @@ async def run_sync_connector(
                                             except Exception:
                                                 pass
                                     else:
+                                        _renew_memory_ok = True
                                         logger.info(f"[{lanlan_name}] 热重置记忆已成功上传到 memory_server ({_renew_endpoint})")
                                 except RuntimeError as e:
                                     if "shutdown" in str(e).lower() or "closed" in str(e).lower():
@@ -1097,6 +1103,14 @@ async def run_sync_connector(
                                         logger.exception(f"[{lanlan_name}] 调用 /{_renew_endpoint} API 失败: {type(e).__name__}: {e}")
                                 except Exception as e:
                                     logger.exception(f"[{lanlan_name}] 调用 /{_renew_endpoint} API 失败: {type(e).__name__}: {e}")
+                                finally:
+                                    complete_memory_settlement(message, _renew_memory_ok)
+                                    logger.info(
+                                        "[%s] hot-swap memory settlement finished: endpoint=%s "
+                                        "success=%s elapsed=%.2fs",
+                                        lanlan_name, _renew_endpoint, _renew_memory_ok,
+                                        time.monotonic() - _renew_started_at,
+                                    )
                                 chat_history.clear()
                                 last_synced_index = 0
 

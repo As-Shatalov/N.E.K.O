@@ -732,7 +732,18 @@ class TurnMixin:
                         self.message_cache_for_new_session = []
                         self.initial_cache_snapshot_len = 0
                         self.initial_next_session_context_snapshot_len = 0
-                        self.sync_message_queue.put({'type': 'system', 'data': 'renew session'})
+                        # PATCH 08.1: tie pending-session warmup to the actual
+                        # memory settlement instead of the old fixed 10s guess.
+                        # The connector completes this Future after /renew or
+                        # /settle returns (success or failure).
+                        self._renew_memory_settlement_done = (
+                            asyncio.get_running_loop().create_future()
+                        )
+                        self.sync_message_queue.put({
+                            'type': 'system',
+                            'data': 'renew session',
+                            '_renew_memory_settlement_done': self._renew_memory_settlement_done,
+                        })
 
                 # 2. agent 任务结果即时触发（无需等待 40s）：有挂起的额外提示 → 立刻启动预热
                 has_extra = bool(getattr(self, 'pending_extra_replies', None))

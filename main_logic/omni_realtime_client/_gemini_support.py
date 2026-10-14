@@ -205,6 +205,23 @@ class _GeminiMixin:
                 ),
             }
 
+            # PATCH 08.1: let Gemini manage its own long-running Live context.
+            # Google recommends context-window compression for long audio
+            # sessions; without it a Live session can hit its context/session
+            # limit abruptly.  Keep this capability-gated so older google-genai
+            # SDK builds still connect instead of failing on an unknown type.
+            _compression_cls = getattr(types, "ContextWindowCompressionConfig", None)
+            _sliding_cls = getattr(types, "SlidingWindow", None)
+            if _compression_cls is not None and _sliding_cls is not None:
+                config["context_window_compression"] = _compression_cls(
+                    sliding_window=_sliding_cls()
+                )
+            else:
+                logger.warning(
+                    "Gemini Live SDK has no context-window compression types; "
+                    "long sessions will use legacy server limits"
+                )
+
             # MANUAL turn detection: disable Gemini's automatic activity
             # detection so end-of-turn is signalled explicitly by the
             # client (audio_stream_end / activity_end). SERVER_VAD path

@@ -195,6 +195,10 @@ class LLMSessionManager(
         self.initial_next_session_context_snapshot_len = 0
         self.pending_session_warmed_up_event = None
         self.pending_session_final_prime_complete_event = None
+        # PATCH 08.1: one-shot acknowledgement for the memory settlement that
+        # belongs to the current hot-swap generation.  Background preparation
+        # waits for this instead of guessing with a fixed sleep.
+        self._renew_memory_settlement_done = None
         self.session_start_time = None
         self._session_turn_count = 0  # 当前 session 的用户输入轮次计数
         self.pending_connector = None

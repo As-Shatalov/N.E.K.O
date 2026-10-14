@@ -44,6 +44,10 @@ from main_logic.proactive_delivery import (
 )
 from utils.gptsovits_config import is_gsv_disabled_voice_id
 from config.prompts.prompts_sys import get_context_summary_ready
+from config import (
+    HOTSWAP_MEMORY_SETTLEMENT_WAIT_SECONDS,
+    HOTSWAP_NEW_DIALOG_RECOVERY_TIMEOUT_SECONDS,
+)
 from utils.config_manager import _as_bool, ensure_default_yui_voice_for_free_api
 from utils.language_utils import normalize_language_code, get_global_language_full
 from utils.game_route_state import get_active_game_route_generation_identity
@@ -71,6 +75,8 @@ from .callback_render import (
 # those names here: a from-import snapshots the value at import time and the
 # facade patch would no longer reach this module's methods.
 from main_logic import core as _core_facade
+from main_logic.hotswap_memory_barrier import await_memory_settlement
+
 
 class LifecycleMixin:
     """Session lifecycle methods (see module docstring)."""
@@ -622,6 +628,7 @@ class LifecycleMixin:
             self.final_swap_task = None
         self.pending_session_warmed_up_event = None
         self.pending_session_final_prime_complete_event = None
+        self._renew_memory_settlement_done = None
         self.pending_use_tts = None
 
         if clear_main_cache:
@@ -2725,12 +2732,39 @@ class LifecycleMixin:
             # (``initial_cache_snapshot_len:`` below), so rendering the live
             # cache here primes those entries twice.
             initial_cache_snapshot = list(self.message_cache_for_new_session)
+            # PATCH 08.1: the old code guessed that memory settlement would
+            # finish within the fixed 10s prewarm delay.  A slower summary
+            # provider (notably Gemini / rate-limited proxies) can still hold
+            # memory_server's settle_lock at that point, while /new_dialog has
+            # only a 5s timeout.  Wait for the connector's actual acknowledgement
+            # first; this is background work, so the current live session remains
+            # fully usable while we wait.
+            _settlement_future = getattr(self, "_renew_memory_settlement_done", None)
+            _settlement_confirmed = await await_memory_settlement(
+                _settlement_future,
+                timeout_seconds=HOTSWAP_MEMORY_SETTLEMENT_WAIT_SECONDS,
+            )
+            if _settlement_confirmed is False:
+                logger.warning(
+                    "[%s] hot-swap memory settlement was not confirmed within %.1fs; "
+                    "continuing with recovery /new_dialog wait",
+                    self.lanlan_name,
+                    HOTSWAP_MEMORY_SETTLEMENT_WAIT_SECONDS,
+                )
+
             from utils.internal_http_client import get_internal_http_client
             _hs_client = get_internal_http_client()
+            _new_dialog_kwargs = self._new_dialog_request_kwargs()
+            if _settlement_confirmed is False:
+                _new_dialog_kwargs["timeout"] = max(
+                    float(_new_dialog_kwargs.get("timeout", 0) or 0),
+                    HOTSWAP_NEW_DIALOG_RECOVERY_TIMEOUT_SECONDS,
+                )
+            _new_dialog_started_at = time.monotonic()
             try:
                 resp = await _hs_client.get(
                     f"http://127.0.0.1:{self.memory_server_port}/new_dialog/{self.lanlan_name}",
-                    **self._new_dialog_request_kwargs(),
+                    **_new_dialog_kwargs,
                 )
             except httpx.ConnectError:
                 raise ConnectionError(f"❌ 记忆服务未启动！请先启动记忆服务 (端口 {self.memory_server_port})")
@@ -2738,13 +2772,24 @@ class LifecycleMixin:
                 raise ConnectionError(f"❌ 记忆服务响应超时！请检查记忆服务是否正常运行 (端口 {self.memory_server_port})")
             if not resp.is_success:
                 raise ConnectionError(f"❌ 记忆服务热切换时返回非2xx状态 {resp.status_code}: {resp.text[:200]}")
+            logger.info(
+                "[%s] hot-swap /new_dialog ready: settlement=%s elapsed=%.2fs",
+                self.lanlan_name, _settlement_confirmed,
+                time.monotonic() - _new_dialog_started_at,
+            )
             initial_prompt += (
                 resp.text
                 + self._convert_cache_to_str(next_session_context_messages)
                 + self._convert_cache_to_str(initial_cache_snapshot)
             )
             self._bind_session_lifecycle_callbacks(self.pending_session)
+            _pending_connect_started_at = time.monotonic()
             await self.pending_session.connect(initial_prompt, native_audio=not self.pending_use_tts)
+            logger.info(
+                "[%s] hot-swap pending session connected: client=%s elapsed=%.2fs",
+                self.lanlan_name, type(self.pending_session).__name__,
+                time.monotonic() - _pending_connect_started_at,
+            )
 
             # 同主 session 路径：热切换的 pending_session 也要在 connect 后
             # 补一次 sync，覆盖 connect 期间发生的 register/unregister race。
