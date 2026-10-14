@@ -44,6 +44,7 @@ from config.prompts.prompts_memory import (
     PERSONA_HEADER, INNER_THOUGHTS_DYNAMIC,
     RECENT_HISTORY_INTRO, NO_RECENT_HISTORY,
     _normalize_memory_prompt_lang,
+    render_relationship_continuity_block,
 )
 from utils.frontend_utils import get_timestamp
 from utils.language_utils import (
@@ -59,6 +60,7 @@ from memory.context_budget import (
     build_memory_context_budget,
     fit_recent_lines_to_budget,
 )
+from memory.relationship_state import build_relationship_continuity
 from memory.external_markdown_import import MAX_ENTRIES, MAX_ENTRY_CHARS
 from memory.outbox import OP_PERSIST_PROMPT_LOCALE
 from memory.persona.fusion import ExternalMemoryImportTooLargeError
@@ -3924,6 +3926,47 @@ async def _new_dialog(
                     _lang,
                 )
                 + "\n"
+            )
+
+        # PATCH 08: relationship continuity is a *derived* pacing lens over
+        # already-confirmed relationship memory.  It is intentionally not a
+        # second writable relationship database and contains no trust/intimacy
+        # score.  The character-card relationship remains authoritative; this
+        # block only tells the model how much learned shared history has
+        # accumulated so it neither manufactures instant closeness nor resets
+        # to stranger-like formality after routine gaps.  Fail-open: a lens
+        # bug must never prevent the ordinary memory bootstrap from opening.
+        try:
+            relationship_persona = await runtime.persona_manager.aensure_persona(
+                lanlan_name
+            )
+            relationship_state = build_relationship_continuity(
+                relationship_persona,
+                confirmed_reflections,
+                now=datetime.now(),
+            )
+            # One isolated relationship observation is already visible in the
+            # normal persona/reflection prose and is too little evidence to
+            # justify extra pacing metadata.  Start rendering at two distinct
+            # learned observations; the state machine itself still remains
+            # conservative (multi-day evidence is required to advance bands).
+            if relationship_state is not None and relationship_state.evidence_count >= 2:
+                result += "\n" + render_relationship_continuity_block(
+                    _lang,
+                    band=relationship_state.band,
+                    evidence_count=relationship_state.evidence_count,
+                    distinct_days=relationship_state.distinct_days,
+                    span_days=relationship_state.span_days,
+                    shared_memory_count=relationship_state.shared_memory_count,
+                    milestone_count=relationship_state.milestone_count,
+                    agreement_count=relationship_state.agreement_count,
+                    active_tension_count=relationship_state.active_tension_count,
+                ) + "\n"
+        except Exception as e:
+            logger.debug(
+                "[RelationshipContinuity] %s: derived lens skipped: %s",
+                lanlan_name,
+                e,
             )
 
         # ── [动态部分] 内心活动（每次变化） ──

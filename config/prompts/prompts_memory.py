@@ -5024,3 +5024,104 @@ Formato de saída JSON:
 
 def get_scoped_memory_refine_prompt(lang: str = "zh") -> str:
     return _loc(SCOPED_MEMORY_REFINE_PROMPT, lang)
+
+
+# =====================================================================
+# ======= Learned relationship continuity (PATCH 08) ==================
+# =====================================================================
+# This is deliberately a *derived pacing hint*, not an authoritative
+# relationship score.  The character-card relationship remains the fictional
+# premise; this block only reports how much learned shared-history evidence the
+# existing memory pipeline has accumulated.
+
+RELATIONSHIP_CONTINUITY_BAND = {
+    "forming": {
+        "zh": "形成中", "zh-TW": "形成中", "en": "forming", "ja": "形成中",
+        "ko": "형성 중", "ru": "формируется", "es": "formándose", "pt": "em formação",
+    },
+    "developing": {
+        "zh": "逐步积累", "zh-TW": "逐步累積", "en": "developing", "ja": "発展中",
+        "ko": "발전 중", "ru": "развивается", "es": "desarrollándose", "pt": "em desenvolvimento",
+    },
+    "established": {
+        "zh": "已有稳定共同经历", "zh-TW": "已有穩定共同經歷", "en": "established shared history", "ja": "共有履歴が定着",
+        "ko": "공유 이력이 정착됨", "ru": "устойчивая совместная история", "es": "historia compartida consolidada", "pt": "história compartilhada consolidada",
+    },
+}
+
+RELATIONSHIP_CONTINUITY_BLOCK = {
+    "zh": """<RelationshipContinuity>
+这只描述系统已经学到的共同经历，不覆盖角色卡定义的初始关系。
+共同经历连续性：{band}；证据={evidence_count}；有证据的日期={distinct_days}；跨度≈{span_days}天；共同记忆={shared_memory_count}；里程碑={milestone_count}；约定={agreement_count}；当前摩擦={active_tension_count}。
+仅用它调整熟悉感的节奏。亲近或摩擦必须有具体记忆支撑；不要仅凭计数推断更强的亲密程度，也不要在普通停顿后突然像刚认识一样生疏。当前摩擦应被尊重，但不要无依据扩大。
+</RelationshipContinuity>""",
+    "zh-TW": """<RelationshipContinuity>
+這只描述系統已經學到的共同經歷，不覆蓋角色卡定義的初始關係。
+共同經歷連續性：{band}；證據={evidence_count}；有證據的日期={distinct_days}；跨度≈{span_days}天；共同記憶={shared_memory_count}；里程碑={milestone_count}；約定={agreement_count}；目前摩擦={active_tension_count}。
+僅用它調整熟悉感的節奏。親近或摩擦必須有具體記憶支撐；不要只憑計數推斷更強的親密程度，也不要在普通停頓後突然像剛認識一樣生疏。目前摩擦應被尊重，但不要無依據擴大。
+</RelationshipContinuity>""",
+    "en": """<RelationshipContinuity>
+This describes learned shared history only; it does NOT override the relationship premise in the character card.
+Shared-history continuity: {band}; evidence={evidence_count}; observed_days={distinct_days}; span≈{span_days}d; shared_memories={shared_memory_count}; milestones={milestone_count}; agreements={agreement_count}; active_tensions={active_tension_count}.
+Use this only to pace familiarity. Ground closeness or tension in concrete memories; never infer stronger intimacy from counts alone, and do not reset to stranger-like formality after an ordinary pause. Respect active tension without amplifying it beyond evidence.
+</RelationshipContinuity>""",
+    "ja": """<RelationshipContinuity>
+これは学習済みの共有履歴だけを表し、キャラクターカードで定義された初期関係を上書きしません。
+共有履歴の連続性：{band}；証拠={evidence_count}；証拠のある日数={distinct_days}；期間≈{span_days}日；共有記憶={shared_memory_count}；節目={milestone_count}；約束={agreement_count}；現在の摩擦={active_tension_count}。
+親しさのペース調整にだけ使ってください。親密さや摩擦は具体的な記憶に基づけ、件数だけでより強い親密さを推測せず、通常の間が空いただけで初対面のような距離感に戻らないでください。現在の摩擦は尊重しつつ、根拠なく拡大しないでください。
+</RelationshipContinuity>""",
+    "ko": """<RelationshipContinuity>
+이 정보는 학습된 공유 이력만 나타내며 캐릭터 카드에 정의된 기본 관계를 덮어쓰지 않습니다.
+공유 이력 연속성: {band}; 증거={evidence_count}; 증거가 있는 날짜={distinct_days}; 기간≈{span_days}일; 공유 기억={shared_memory_count}; 이정표={milestone_count}; 약속={agreement_count}; 현재 긴장={active_tension_count}.
+친숙함의 속도를 조절하는 데만 사용하세요. 친밀감이나 긴장은 구체적인 기억에 근거해야 하며, 숫자만으로 더 강한 친밀감을 추론하거나 평범한 공백 뒤에 처음 만난 사람처럼 돌아가지 마세요. 현재 긴장은 존중하되 근거 이상으로 확대하지 마세요.
+</RelationshipContinuity>""",
+    "ru": """<RelationshipContinuity>
+Это только накопленная совместная история; она НЕ переопределяет исходные отношения из карточки персонажа.
+Непрерывность совместной истории: {band}; подтверждений={evidence_count}; дней с подтверждениями={distinct_days}; период≈{span_days} дн.; общих воспоминаний={shared_memory_count}; вех={milestone_count}; договорённостей={agreement_count}; активных напряжений={active_tension_count}.
+Используй это только для темпа привычности. Близость или напряжение должны опираться на конкретные воспоминания; не выводи более сильную интимность из одних счётчиков и не возвращайся к манере незнакомцев после обычной паузы. Учитывай текущее напряжение, но не преувеличивай его без подтверждений.
+</RelationshipContinuity>""",
+    "es": """<RelationshipContinuity>
+Esto describe solo la historia compartida aprendida; NO reemplaza la relación inicial definida por la tarjeta del personaje.
+Continuidad de historia compartida: {band}; evidencia={evidence_count}; días con evidencia={distinct_days}; periodo≈{span_days}d; recuerdos compartidos={shared_memory_count}; hitos={milestone_count}; acuerdos={agreement_count}; tensiones activas={active_tension_count}.
+Úsalo solo para marcar el ritmo de familiaridad. Basa cercanía o tensión en recuerdos concretos; no deduzcas mayor intimidad solo por los conteos ni vuelvas a una formalidad de desconocidos tras una pausa normal. Respeta la tensión activa sin amplificarla más allá de la evidencia.
+</RelationshipContinuity>""",
+    "pt": """<RelationshipContinuity>
+Isto descreve apenas o histórico compartilhado aprendido; NÃO substitui a relação inicial definida no cartão da personagem.
+Continuidade do histórico compartilhado: {band}; evidências={evidence_count}; dias com evidência={distinct_days}; período≈{span_days}d; memórias compartilhadas={shared_memory_count}; marcos={milestone_count}; acordos={agreement_count}; tensões ativas={active_tension_count}.
+Use isto apenas para ajustar o ritmo de familiaridade. Baseie proximidade ou tensão em memórias concretas; não deduza intimidade maior apenas pelas contagens nem volte a uma formalidade de desconhecidos após uma pausa normal. Respeite tensões ativas sem ampliá-las além das evidências.
+</RelationshipContinuity>""",
+}
+
+
+def render_relationship_continuity_block(
+    lang: str | None,
+    *,
+    band: str,
+    evidence_count: int,
+    distinct_days: int,
+    span_days: int,
+    shared_memory_count: int,
+    milestone_count: int,
+    agreement_count: int,
+    active_tension_count: int,
+) -> str:
+    """Render the bounded relationship-continuity pacing hint.
+
+    ``band`` is an internal deterministic label produced by
+    ``memory.relationship_state``.  Unknown labels degrade to ``forming`` so a
+    corrupt/forward-version value can never manufacture stronger familiarity.
+    """
+    normalized = _normalize_memory_prompt_lang(lang)
+    safe_band = band if band in RELATIONSHIP_CONTINUITY_BAND else "forming"
+    band_label = _loc(RELATIONSHIP_CONTINUITY_BAND[safe_band], normalized)
+    template = _loc(RELATIONSHIP_CONTINUITY_BLOCK, normalized)
+    return template.format(
+        band=band_label,
+        evidence_count=max(0, int(evidence_count)),
+        distinct_days=max(0, int(distinct_days)),
+        span_days=max(0, int(span_days)),
+        shared_memory_count=max(0, int(shared_memory_count)),
+        milestone_count=max(0, int(milestone_count)),
+        agreement_count=max(0, int(agreement_count)),
+        active_tension_count=max(0, int(active_tension_count)),
+    )
