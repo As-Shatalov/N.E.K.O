@@ -676,6 +676,136 @@ async def test_an_ordinary_turn_still_runs_both_hooks_in_order():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_no_vad_late_server_vad_edges_do_not_cancel_the_response_they_belong_to():
+    """A delayed VAD pair from the triggering utterance must not steal its reply.
+
+    lanlan.app is intentionally treated as a no-server-VAD route, but a proxy
+    layer may still leak delayed OpenAI-shaped VAD frames. If response.created
+    wins that race, the old implementation interpreted the delayed
+    speech_started as a barge-in, cancelled the fresh response, then let
+    speech_stopped rotate the host sid. response.done subsequently saw a
+    different host turn and skipped both completion hooks, leaving voice mode
+    stuck with zero audio deltas.
+    """
+
+    host = _Host()
+    new_message_calls: list[str] = []
+
+    async def on_new_message():
+        new_message_calls.append("new_message")
+        host.starts_a_new_turn()
+
+    client = _free_client(
+        host,
+        get_host_turn_id=host.read_speech_id,
+        on_new_message=on_new_message,
+    )
+    socket = _RecordingSocket()
+    client.ws = socket
+    client._ensure_voice_handoff_audio_timeline()
+    # One second of the triggering utterance was already admitted before the
+    # response began. The delayed VAD timestamps both live inside that prefix.
+    client._voice_handoff_audio_samples = client._uplink_sample_rate
+    receive_loop = asyncio.create_task(client.handle_messages())
+
+    socket.feed({"type": "response.created", "response": {"id": "reply-1"}})
+    await _settle()
+    socket.feed(
+        {
+            "type": "input_audio_buffer.speech_started",
+            "item_id": "user-1",
+            "audio_start_ms": 100,
+        }
+    )
+    socket.feed(
+        {
+            "type": "input_audio_buffer.speech_stopped",
+            "item_id": "user-1",
+            "audio_end_ms": 900,
+        }
+    )
+    socket.feed(
+        {
+            "type": "response.done",
+            "response": {"id": "reply-1", "status": "completed"},
+        }
+    )
+    await _settle()
+
+    assert new_message_calls == []
+    assert host.calls == ["response_done", "sid_rotate"]
+    assert host.speech_id == "sid-rotated-by-hook"
+    assert client._response_arbiter._server_vad_response_pending is False
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_no_vad_real_barge_in_after_response_start_still_takes_the_turn():
+    """The late-edge guard must not weaken a genuine user interruption."""
+
+    host = _Host()
+    new_message_calls: list[str] = []
+
+    async def on_new_message():
+        new_message_calls.append("new_message")
+        host.starts_a_new_turn()
+
+    client = _free_client(
+        host,
+        get_host_turn_id=host.read_speech_id,
+        on_new_message=on_new_message,
+    )
+    socket = _RecordingSocket()
+    client.ws = socket
+    client._ensure_voice_handoff_audio_timeline()
+    client._voice_handoff_audio_samples = client._uplink_sample_rate
+    receive_loop = asyncio.create_task(client.handle_messages())
+
+    socket.feed({"type": "response.created", "response": {"id": "reply-1"}})
+    await _settle()
+
+    # This onset begins AFTER the response-start snapshot, so it is a true
+    # barge-in rather than a delayed boundary from the triggering utterance.
+    socket.feed(
+        {
+            "type": "input_audio_buffer.speech_started",
+            "item_id": "user-2",
+            "audio_start_ms": 1100,
+        }
+    )
+    socket.feed(
+        {
+            "type": "input_audio_buffer.speech_stopped",
+            "item_id": "user-2",
+            "audio_end_ms": 1400,
+        }
+    )
+    await _settle()
+
+    assert new_message_calls == ["new_message"]
+    assert host.speech_id == "sid-turn-2"
+
+    # The cancelled predecessor may still deliver its terminal, but it must not
+    # close or rotate the successor's host turn.
+    socket.feed(
+        {
+            "type": "response.done",
+            "response": {"id": "reply-1", "status": "canceled"},
+        }
+    )
+    await _settle()
+    assert host.calls == []
+    assert host.speech_id == "sid-turn-2"
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_no_vad_rotation_owns_the_next_unannounced_response():
     """An id-less no-VAD response still finishes under the rotated host turn."""
 
