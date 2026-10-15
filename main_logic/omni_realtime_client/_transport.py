@@ -233,6 +233,106 @@ class _TransportMixin:
             self._note_voice_handoff_input_boundary(expected_sequence=sequence)
         return True
 
+    def _late_no_vad_boundary_for_current_response(
+        self,
+        event: dict,
+        *,
+        timestamp_field: str,
+    ) -> bool:
+        """Whether a stray server-VAD edge belongs to input predating this response.
+
+        lanlan.app and other Gemini-compatible proxies are deliberately
+        configured as no-server-VAD routes, but compatibility layers may still
+        leak delayed speech_started / speech_stopped frames. Treating a delayed
+        edge as a fresh user turn cancels the response that edge belongs to,
+        rotates the host speech id, and makes its later response.done stand down
+        as if a successor had taken ownership.
+
+        Prefer the provider audio timeline when it is present. The response
+        snapshots how much PCM had already been admitted when it began; a VAD
+        timestamp wholly inside that prefix cannot describe speech that started
+        after the response. For proxies that omit timestamps, fall back to the
+        existing locally-detected speech sequence. The fallback is deliberately
+        conservative: if any new local speech evidence arrived after response
+        start, the event is allowed through as a possible real barge-in.
+        """
+        if self._has_server_vad or not self._is_responding:
+            return False
+        if getattr(
+            self,
+            "_voice_handoff_response_audio_generation",
+            None,
+        ) != getattr(self, "_connection_generation", None):
+            return False
+
+        response_samples = getattr(
+            self,
+            "_voice_handoff_response_audio_samples",
+            None,
+        )
+        event_ms = event.get(timestamp_field)
+        if (
+            type(response_samples) is int
+            and response_samples > 0
+            and type(event_ms) is int
+            and event_ms >= 0
+        ):
+            event_scaled = event_ms * self._uplink_sample_rate
+            response_scaled = response_samples * 1000
+            if timestamp_field == "audio_start_ms":
+                return event_scaled < response_scaled
+            return event_scaled <= response_scaled
+
+        response_sequence = getattr(
+            self,
+            "_voice_handoff_response_input_sequence",
+            None,
+        )
+        if type(response_sequence) is not int:
+            return False
+        if getattr(
+            self,
+            "_voice_handoff_input_generation",
+            None,
+        ) != getattr(self, "_connection_generation", None):
+            return False
+        return (
+            getattr(self, "_voice_handoff_input_sequence", 0)
+            <= response_sequence
+        )
+
+    def _mark_late_no_vad_speech_started(self, event: dict) -> None:
+        item_id = event.get("item_id")
+        self._late_no_vad_vad_boundary = (
+            self._connection_generation,
+            None if item_id is None else str(item_id),
+        )
+
+    def _consume_late_no_vad_speech_stopped(self, event: dict) -> bool:
+        pending = getattr(self, "_late_no_vad_vad_boundary", None)
+        if isinstance(pending, tuple) and len(pending) == 2:
+            generation, expected_item = pending
+            if generation != self._connection_generation:
+                self._late_no_vad_vad_boundary = None
+            else:
+                raw_item = event.get("item_id")
+                observed_item = None if raw_item is None else str(raw_item)
+                if (
+                    (expected_item is None and observed_item is None)
+                    or (
+                        expected_item is not None
+                        and observed_item is not None
+                        and observed_item == expected_item
+                    )
+                ):
+                    self._late_no_vad_vad_boundary = None
+                    return True
+
+        return self._late_no_vad_boundary_for_current_response(
+            event,
+            timestamp_field="audio_end_ms",
+        )
+
     def _note_voice_handoff_input_boundary(
         self,
         *,
@@ -2454,6 +2554,14 @@ class _TransportMixin:
             "_voice_handoff_input_sequence",
             0,
         )
+        # Snapshot the provider audio timeline at response start. A nominal
+        # no-server-VAD proxy can still leak delayed server-VAD frames; this
+        # boundary lets the receive loop prove that such a frame belongs to the
+        # already-consumed user utterance instead of treating it as a barge-in.
+        self._ensure_voice_handoff_audio_timeline()
+        self._voice_handoff_response_audio_generation = self._connection_generation
+        self._voice_handoff_response_audio_samples = self._voice_handoff_audio_samples
+        self._late_no_vad_vad_boundary = None
         self._interrupted = False
         # A stable successor id also closes the id-less quarantine opened by
         # a fail-open release; ordered socket delivery puts this evidence
@@ -3435,11 +3543,36 @@ class _TransportMixin:
                     logger.info("input_audio_buffer.committed observed (total=%d)", self._input_audio_committed_total)
                 # Handle interruptions
                 elif event_type == "input_audio_buffer.speech_started":
+                    self._speech_started_total += 1
+                    # A no-server-VAD compatibility proxy may leak the VAD edge
+                    # for the SAME utterance after response.created/content has
+                    # already begun. Calling handle_interruption there cancels
+                    # the fresh response before its first audio delta. Prove the
+                    # edge is old from the response-start audio boundary and keep
+                    # it out of turn ownership; the transcript fallback below
+                    # remains responsible for tool-scope admission on no-VAD
+                    # routes.
+                    if self._late_no_vad_boundary_for_current_response(
+                        event,
+                        timestamp_field="audio_start_ms",
+                    ):
+                        self._ensure_voice_handoff_audio_timeline()
+                        self._voice_handoff_server_item_id = event.get("item_id")
+                        self._bind_input_route_identity_to_item(event.get("item_id"))
+                        self._mark_late_no_vad_speech_started(event)
+                        logger.info(
+                            "late speech_started belongs to the active no-VAD "
+                            "response input (item_id=%s); not interrupting it",
+                            event.get("item_id"),
+                        )
+                        continue
+
+                    # A real new onset supersedes any unmatched delayed marker.
+                    self._late_no_vad_vad_boundary = None
                     self.note_user_turn_started()
                     self._ensure_voice_handoff_audio_timeline()
                     self._voice_handoff_server_item_id = event.get("item_id")
                     self._note_raw_speech_started_scope(event.get("item_id"))
-                    self._speech_started_total += 1
                     logger.info("Speech detected")
                     self._response_arbiter.notify_server_vad_started()
                     self._bind_input_route_identity_to_item(event.get("item_id"))
@@ -3464,6 +3597,20 @@ class _TransportMixin:
                     handoff_boundary_is_current = (
                         self._note_voice_handoff_server_boundary(event)
                     )
+                    if self._consume_late_no_vad_speech_stopped(event):
+                        # Pair with the delayed onset above (or prove the whole
+                        # boundary predates response start from audio_end_ms).
+                        # This edge closes old input only; it must not arm a
+                        # phantom server-VAD response or rotate the host sid.
+                        if handoff_boundary_is_current:
+                            self._audio_in_buffer = False
+                        logger.info(
+                            "late speech_stopped belongs to the active no-VAD "
+                            "response input (item_id=%s); keeping response ownership",
+                            event.get("item_id"),
+                        )
+                        continue
+
                     # Only an ended utterance can causally create the automatic
                     # server-VAD response.  Marking this at speech_started can
                     # steal an explicit response.created whose create was
