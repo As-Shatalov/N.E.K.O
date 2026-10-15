@@ -45,6 +45,7 @@ from config.prompts.prompts_memory import (
     RECENT_HISTORY_INTRO, NO_RECENT_HISTORY,
     _normalize_memory_prompt_lang,
     render_relationship_continuity_block,
+    render_open_loop_context_block,
 )
 from utils.frontend_utils import get_timestamp
 from utils.language_utils import (
@@ -61,6 +62,7 @@ from memory.context_budget import (
     fit_recent_lines_to_budget,
 )
 from memory.relationship_state import build_relationship_continuity
+from memory.open_loops import get_open_loop_store
 from memory.external_markdown_import import MAX_ENTRIES, MAX_ENTRY_CHARS
 from memory.outbox import OP_PERSIST_PROMPT_LOCALE
 from memory.persona.fusion import ExternalMemoryImportTooLargeError
@@ -887,6 +889,34 @@ async def _safe_auto_promote(lanlan_name: str) -> None:
         )
     except Exception as e:
         logger.debug(f"[ReflectAPI] {lanlan_name}: 后台 auto_promote 失败: {e}")
+
+
+@app.get("/open_loop_candidates/{lanlan_name}")
+async def api_open_loop_candidates(lanlan_name: str):
+    """Return eligible prospective-memory candidates without mutating cooldowns."""
+    lanlan_name = validate_lanlan_name(lanlan_name)
+    try:
+        candidates = await get_open_loop_store().acandidates(lanlan_name)
+    except Exception as exc:
+        logger.debug("[OpenLoopsAPI] %s: candidates failed: %s", lanlan_name, exc)
+        candidates = []
+    return {"candidates": candidates}
+
+
+@app.post("/record_open_loop_surfaced/{lanlan_name}")
+async def api_record_open_loop_surfaced(request: Request, lanlan_name: str):
+    """Back off open-loop candidates after they were exposed to proactive generation."""
+    lanlan_name = validate_lanlan_name(lanlan_name)
+    body = await request.json()
+    loop_ids = body.get("loop_ids", []) if isinstance(body, dict) else []
+    if not isinstance(loop_ids, list) or not loop_ids:
+        return {"ok": True, "count": 0}
+    try:
+        count = await get_open_loop_store().arecord_surfaced(lanlan_name, loop_ids)
+    except Exception as exc:
+        logger.debug("[OpenLoopsAPI] %s: record_surfaced failed: %s", lanlan_name, exc)
+        count = 0
+    return {"ok": True, "count": count}
 
 
 @app.get("/followup_topics/{lanlan_name}")
@@ -3967,6 +3997,29 @@ async def _new_dialog(
                 "[RelationshipContinuity] %s: derived lens skipped: %s",
                 lanlan_name,
                 e,
+            )
+
+        # PATCH 09: explicit prospective memory.  This is separate from
+        # retrospective facts/reflections: an open loop is something whose
+        # outcome is still unknown.  The block is small/bounded and is added
+        # before recent-history budgeting so PATCH 06 charges its actual tokens
+        # against the same bootstrap envelope instead of silently growing the
+        # prompt beyond the model-aware budget.
+        try:
+            active_open_loops = await get_open_loop_store().aactive_loops(
+                lanlan_name,
+            )
+            open_loop_block = render_open_loop_context_block(
+                _lang,
+                active_open_loops,
+            )
+            if open_loop_block:
+                result += "\n" + open_loop_block + "\n"
+        except Exception as exc:
+            logger.debug(
+                "[OpenLoops] %s: bootstrap block skipped: %s",
+                lanlan_name,
+                exc,
             )
 
         # ── [动态部分] 内心活动（每次变化） ──

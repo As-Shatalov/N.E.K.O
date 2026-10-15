@@ -32,7 +32,7 @@ from memory.event_log import (
     EVIDENCE_SOURCE_USER_IGNORE,
     EVIDENCE_SOURCE_USER_REBUT,
 )
-from memory.outbox import OP_POST_TURN_SIGNALS
+from memory.outbox import OP_OPEN_LOOP_UPDATE, OP_POST_TURN_SIGNALS
 
 from . import gates, locale_state, outbox_infra, runtime, signal_extraction
 from ._shared import logger
@@ -120,6 +120,82 @@ def _with_language_context(func):
             return await func(*args, language=language, **kwargs)
 
     return wrapped
+
+
+
+async def _maybe_spawn_open_loop_update(
+    lanlan_name: str,
+    messages: list,
+    payload: dict,
+) -> asyncio.Task | None:
+    """PATCH 09: enqueue prospective-memory work only when a cheap gate fires.
+
+    This deliberately runs as a *separate* durable outbox op.  Prospective
+    extraction is useful but must not lengthen /cache or share the settlement
+    lock used by recent-history compression.  The store owns a second idempotency
+    layer (source_turn_hash) because an outbox handler may legally replay after
+    append_done I/O failure.
+    """
+    user_msgs = _extract_user_messages(messages)
+    if not user_msgs:
+        return None
+    from memory.open_loops import compute_turn_hash, get_open_loop_store
+
+    store = get_open_loop_store()
+    try:
+        if not await store.ashould_analyze_turn(lanlan_name, user_msgs):
+            return None
+    except Exception as exc:
+        logger.debug("[OpenLoops] %s: lexical gate failed open=false: %s", lanlan_name, exc)
+        return None
+
+    messages_dict = payload.get('messages') if isinstance(payload.get('messages'), list) else []
+    source_turn_hash = compute_turn_hash(messages_dict)
+    try:
+        if await store.ais_turn_processed(lanlan_name, source_turn_hash):
+            return None
+    except Exception as exc:
+        logger.debug("[OpenLoops] %s: processed-turn probe failed: %s", lanlan_name, exc)
+
+    open_payload = {
+        'messages': messages_dict,
+        'source_turn_hash': source_turn_hash,
+    }
+    if payload.get('language'):
+        open_payload['language'] = payload['language']
+    elif payload.get('render_language'):
+        open_payload['render_language'] = payload['render_language']
+
+    try:
+        op_id = await runtime.outbox.aappend_pending(
+            lanlan_name, OP_OPEN_LOOP_UPDATE, open_payload,
+        )
+    except Exception as exc:
+        # Same degradation policy as the existing post-turn op: durable queue
+        # failure must never make /cache look failed.  The direct background
+        # attempt is still idempotent via source_turn_hash.
+        logger.warning(
+            "[OpenLoops] %s: outbox append failed; using one-shot task: %s",
+            lanlan_name, exc,
+        )
+        operation = store.analyze_and_update(
+            lanlan_name,
+            messages_dict,
+            source_turn_hash=source_turn_hash,
+            language=open_payload.get('language') or open_payload.get('render_language'),
+        )
+        return _track_character_post_turn_task(
+            lanlan_name,
+            runtime._spawn_background_task(operation),
+        )
+
+    op = {'op_id': op_id, 'type': OP_OPEN_LOOP_UPDATE, 'payload': open_payload}
+    return _track_character_post_turn_task(
+        lanlan_name,
+        runtime._spawn_background_task(
+            outbox_infra._run_outbox_op(lanlan_name, op),
+        ),
+    )
 
 
 async def _spawn_outbox_post_turn_signals(
@@ -230,17 +306,21 @@ async def _spawn_outbox_post_turn_signals(
                 locale_order=locale_order,
                 locale_only=not messages,
             )
-        return _track_character_post_turn_task(
+        primary_task = _track_character_post_turn_task(
             lanlan_name,
             runtime._spawn_background_task(operation),
         )
+        await _maybe_spawn_open_loop_update(lanlan_name, messages, payload)
+        return primary_task
     op = {'op_id': op_id, 'type': OP_POST_TURN_SIGNALS, 'payload': payload}
-    return _track_character_post_turn_task(
+    primary_task = _track_character_post_turn_task(
         lanlan_name,
         runtime._spawn_background_task(
             outbox_infra._run_outbox_op(lanlan_name, op),
         ),
     )
+    await _maybe_spawn_open_loop_update(lanlan_name, messages, payload)
+    return primary_task
 
 
 async def _wait_for_character_prompt_locale_order(
@@ -571,4 +651,22 @@ async def _outbox_post_turn_signals_handler(lanlan_name: str, payload: dict) -> 
     await _run_post_turn_signals(messages, lanlan_name, **kwargs)
 
 
+async def _outbox_open_loop_update_handler(lanlan_name: str, payload: dict) -> None:
+    """Replay-safe handler for PATCH-09 prospective-memory updates."""
+    from memory.open_loops import compute_turn_hash, get_open_loop_store
+
+    messages_dict = payload.get('messages') if isinstance(payload.get('messages'), list) else []
+    if not messages_dict:
+        return
+    source_turn_hash = payload.get('source_turn_hash') or compute_turn_hash(messages_dict)
+    language = payload.get('language') or payload.get('render_language')
+    await get_open_loop_store().analyze_and_update(
+        lanlan_name,
+        messages_dict,
+        source_turn_hash=source_turn_hash,
+        language=language,
+    )
+
+
+outbox_infra.register_outbox_handler(OP_OPEN_LOOP_UPDATE, _outbox_open_loop_update_handler)
 outbox_infra.register_outbox_handler(OP_POST_TURN_SIGNALS, _outbox_post_turn_signals_handler)

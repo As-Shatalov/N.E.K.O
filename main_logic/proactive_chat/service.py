@@ -46,6 +46,7 @@ from config.prompts.prompts_proactive import (
     normalize_proactive_prompt_locale,
 )
 from config.prompts.prompts_sys import _loc
+from config.prompts.prompts_memory import render_open_loop_proactive_block
 from main_logic.omni_realtime_client import OmniRealtimeClient
 from main_logic.proactive_chat.contracts import (
     PROACTIVE_REASON_CHAT_DELIVERED,
@@ -339,6 +340,25 @@ def _render_followup_topic_hooks(
         if topic.get("id"):
             surfaced_reflection_ids.append(topic["id"])
     return prompt, surfaced_reflection_ids
+
+
+def _render_open_loop_hooks(
+    proactive_lang: str,
+    candidates: list[dict[str, Any]],
+) -> tuple[str, list[Any]]:
+    """Render bounded prospective-memory candidates and return rendered ids."""
+    if not candidates:
+        return "", []
+    rendered = [
+        row for row in candidates[:3]
+        if str(row.get("text") or "").strip()
+    ]
+    if not rendered:
+        return "", []
+    prompt = render_open_loop_proactive_block(proactive_lang, rendered)
+    if not prompt:
+        return "", []
+    return prompt, [row.get("id") for row in rendered if row.get("id")]
 
 
 def _command_language_candidates(
@@ -1529,8 +1549,11 @@ async def handle_proactive_chat(
         # 用户在 gaming / focused_work 状态下不应自然回忆——会很尬。直接跳过整段
         # （也省 reflect POST 的 15s timeout 风险）。stale_returning 反而欢迎回忆。
         followup_topics_prompt = ""
+        open_loop_prompt = ""
         _followup_topics = []
-        _surfaced_reflection_ids = []  # 记录本次搭话提及了哪些 pending 反思
+        _open_loop_candidates = []
+        _surfaced_reflection_ids = []  # 记录本次搭话看到哪些 pending 反思
+        _surfaced_open_loop_ids = []   # 记录本次搭话看到哪些 prospective open loops
         _allow_reminiscence = (
             activity_snapshot is None
             or activity_snapshot.propensity != "restricted_screen_only"
@@ -1577,7 +1600,31 @@ async def handle_proactive_chat(
             except Exception as e:
                 logger.debug(f"[{lanlan_name}] 回调话题获取失败（不影响主流程）: {e}")
 
-        # Phase 1 preempt check：followup GET(5s) 是一段可能拖久的 await，
+            # PATCH 09: explicit unresolved intentions are a sibling memory
+            # source. They obey the same restricted-screen guard and later
+            # reminiscence throttling as reflection follow-ups.
+            try:
+                _loops_resp = await _mem_client.get(
+                    f"{_mem_base}/open_loop_candidates/{lanlan_name}",
+                    timeout=5.0,
+                )
+                if _loops_resp.status_code == 200:
+                    _open_loop_candidates = _loops_resp.json().get("candidates", [])
+                    if _open_loop_candidates:
+                        (
+                            open_loop_prompt,
+                            _surfaced_open_loop_ids,
+                        ) = _render_open_loop_hooks(
+                            topic_hook_lang,
+                            _open_loop_candidates,
+                        )
+                        print(
+                            f"[{lanlan_name}] 未决事项候选: {len(_open_loop_candidates)} 条"
+                        )
+            except Exception as e:
+                logger.debug(f"[{lanlan_name}] 未决事项获取失败（不影响主流程）: {e}")
+
+        # Phase 1 preempt check：memory candidate GETs are bounded local awaits;
         # 整段裸跑会让用户打断后继续跑完 LLM 配置和后续步骤，再到 pre-LLM
         # check 才识破。这里补一刀。
         if mgr.state.is_proactive_preempted():
@@ -1590,7 +1637,7 @@ async def handle_proactive_chat(
         # Memory follow-up topics are a first-class proactive source.  Only a
         # rendered cue counts: blank/duplicate candidates filtered out by
         # _render_followup_topic_hooks must not keep an otherwise empty turn alive.
-        _has_memory_initiative = bool(followup_topics_prompt)
+        _has_memory_initiative = bool(followup_topics_prompt or open_loop_prompt)
 
         # The old source-empty gate ran before memory lookup, so users who disabled
         # web/screen/music also accidentally disabled memory-driven initiative.
@@ -1756,7 +1803,7 @@ async def handle_proactive_chat(
             lanlan_name,
             enabled_modes,
             sources,
-            has_reminiscence=bool(_surfaced_reflection_ids),
+            has_reminiscence=bool(_surfaced_reflection_ids or _surfaced_open_loop_ids),
         )
         if source_weight_selection.weights:
             source_weights = source_weight_selection.weights
@@ -1782,11 +1829,14 @@ async def handle_proactive_chat(
                 _followup_topics = []
                 _surfaced_reflection_ids = []
                 followup_topics_prompt = ""
+                _open_loop_candidates = []
+                _surfaced_open_loop_ids = []
+                open_loop_prompt = ""
 
         # Weighting may suppress reminiscence after the initial source gate.  Phase 1
         # must use the post-suppression truth so a throttled memory cue does not
         # masquerade as an active reason to speak.
-        _has_memory_initiative = bool(followup_topics_prompt)
+        _has_memory_initiative = bool(followup_topics_prompt or open_loop_prompt)
 
         # Build once after source suppression so candidates are decayed only once.
         web_modes = [mode for mode in web_modes if mode in sources]
@@ -1876,8 +1926,9 @@ async def handle_proactive_chat(
         has_web_task = bool(merged_web_content)
 
         enriched_memory_context = memory_context
-        if followup_topics_prompt:
-            enriched_memory_context = memory_context + "\n" + followup_topics_prompt
+        for _memory_hook in (followup_topics_prompt, open_loop_prompt):
+            if _memory_hook:
+                enriched_memory_context += "\n" + _memory_hook
 
         if has_web_task or has_music_task or has_meme_task:
             # Phase 1 preempt check：拨号前最后一次检查。大头 LLM 调用即将开始，
@@ -2418,8 +2469,9 @@ async def handle_proactive_chat(
         # 使用 enriched_memory_context（含回忆线索）而非原始 memory_context。
         # open_threads 保持在上方 activity state section，不混进 memory_context。
         phase2_memory_context = memory_context
-        if followup_topics_prompt:
-            phase2_memory_context = memory_context + "\n" + followup_topics_prompt
+        for _memory_hook in (followup_topics_prompt, open_loop_prompt):
+            if _memory_hook:
+                phase2_memory_context += "\n" + _memory_hook
 
         # ── 用户显式 ban-topic 注入 ─────────────────────────────────
         # Phase 2 的 system prompt 自己拼，从不经过 _build_initial_prompt，
@@ -2605,6 +2657,7 @@ async def handle_proactive_chat(
             **state_storage_kwargs,
             has_unfinished_thread=_has_unfinished_thread,
             surfaced_reflection_ids=_surfaced_reflection_ids,
+            surfaced_open_loop_ids=_surfaced_open_loop_ids,
             selected_web_link=selected_web_link,
             selected_web_topic_key=selected_web_topic_key,
             web_parsed=web_parsed,

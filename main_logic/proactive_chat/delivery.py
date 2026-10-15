@@ -391,6 +391,7 @@ async def _record_committed_delivery(
     meme_content: dict[str, Any] | None,
     memory_server_port: int = MEMORY_SERVER_PORT,
     memory_dir: str | Path | None = None,
+    surfaced_open_loop_ids: list[Any] | None = None,
     log: logging.Logger | None = None,
 ) -> ProactiveChatResult:
     """Record post-commit history and return the successful chat contract."""
@@ -407,6 +408,7 @@ async def _record_committed_delivery(
     state_storage_kwargs = (
         {"memory_dir": memory_dir} if memory_dir is not None else {}
     )
+    surfaced_open_loop_ids = list(surfaced_open_loop_ids or [])
 
     _record_proactive_chat(lanlan_name, response_text, primary_channel)
     _record_proactive_material(
@@ -425,7 +427,7 @@ async def _record_committed_delivery(
         message=response_text,
         **state_storage_kwargs,
     )
-    if surfaced_reflection_ids:
+    if surfaced_reflection_ids or surfaced_open_loop_ids:
         _record_reminiscence_usage(lanlan_name)
 
     if has_unfinished_thread and (source_tag == "CHAT" or primary_channel == "chat"):
@@ -451,13 +453,21 @@ async def _record_committed_delivery(
             print(
                 f"[{lanlan_name}] 记录 surfaced 反思: {len(surfaced_reflection_ids)} 条"
             )
+        if surfaced_open_loop_ids:
+            await memory_client.post(
+                f"{memory_base}/record_open_loop_surfaced/{lanlan_name}",
+                json={"loop_ids": surfaced_open_loop_ids},
+                timeout=5.0,
+            )
+            print(
+                f"[{lanlan_name}] 记录 surfaced 未决事项: {len(surfaced_open_loop_ids)} 条"
+            )
     except Exception as exc:
         active_logger.debug(
             "[%s] 长期记忆后处理失败（不影响主流程）: %s",
             lanlan_name,
             exc,
         )
-
     if selected_web_topic_key and (
         selected_web_link is None or _is_link_selected(selected_web_link, source_links)
     ):

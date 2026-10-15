@@ -128,6 +128,9 @@ MANAGED_MEMORY_FILENAMES = (
     "reflections.json",
     "reflections_archive.json",
     "surfaced.json",
+    # PATCH 09 prospective memory: explicit unresolved intentions must travel
+    # with the rest of a character's durable memory state.
+    "open_loops.json",
     "time_indexed.db",
 )
 

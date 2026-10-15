@@ -66,6 +66,8 @@ logger = get_module_logger(__name__, "Memory")
 # 到 ``_periodic_signal_extraction_loop`` 后，handler 实际只做 counter bump +
 # 复读嗅探 + check_feedback + OFF-mode Stage-1 fallback——符号名随之更新，值保留。
 OP_POST_TURN_SIGNALS = "extract_facts"
+# PATCH 09: dedicated prospective-memory op. Keep the wire value immutable once shipped.
+OP_OPEN_LOOP_UPDATE = "open_loop_update_v1"
 OP_PERSIST_PROMPT_LOCALE = "persist_prompt_locale"
 
 

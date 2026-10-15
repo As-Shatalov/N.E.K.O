@@ -5125,3 +5125,145 @@ def render_relationship_continuity_block(
         agreement_count=max(0, int(agreement_count)),
         active_tension_count=max(0, int(active_tension_count)),
     )
+
+# =====================================================================
+# ======= Prospective memory / Open Loops (PATCH 09) ===================
+# =====================================================================
+# Open loops are deferred intentions whose outcome is not known yet.  They are
+# intentionally separate from short-lived activity open_threads and from
+# retrospective reflections.  The model proposes typed actions; code owns the
+# lifecycle and persistence.
+
+OPEN_LOOP_UPDATE_PROMPT = {
+    "zh": """你是前瞻记忆更新器。只管理将来需要再次关注的明确意图/未决事项，不做普通事实抽取。
+当前锚点时间：{ANCHOR_TIME}
+现有未决事项(JSON)：{ACTIVE_LOOPS}
+当前一轮对话：
+{CURRENT_TURN}
+
+只输出一个 JSON 对象：{{"create": [...], "update": [...]}}。
+create 每项字段：text, kind(plan|promise|task|decision|question|followup), owner(master|shared), importance(1..10), due_when(null 或 {{"start":{{"offset":整数,"unit":"minute|hour|day|week|month|year"}},"end":null}}), resolution_hint。
+update 每项字段：id, action(resolve|cancel|reschedule|revise)，以及该动作真正需要的字段。
+
+严格规则：
+- 只有用户明确计划、承诺、待办、未来要验证的结果、明确让系统之后跟进/提醒，才 create。普通兴趣、闲聊、愿望“有空也许”、已经完成的事情都不要建。
+- AI 单方面提出的建议/承诺不能成为长期未决事项；只有用户明确接受或共同约定时可记为 shared。
+- 当前轮明确表示完成→resolve；放弃→cancel；改时间→reschedule；同一事项内容被修正→revise。不要因沉默推断完成。
+- 已有事项优先 update，不要重复 create。无法确信就不动。
+- due_when 只表示相对当前锚点时间；没有明确时间就 null。不要编造截止时间。
+- text 写成简短、可验证的未决结果，例如“检查 TTS 重启后是否仍正常”，不要写成聊天复述。
+- 最多 create 3 条、update 4 条。无变化时严格返回 {{"create":[],"update":[]}}。不要 Markdown，不要解释。""",
+    "zh-TW": """你是前瞻記憶更新器。只管理未來需要再次關注的明確意圖/未決事項，不做一般事實抽取。
+目前錨點時間：{ANCHOR_TIME}
+現有未決事項(JSON)：{ACTIVE_LOOPS}
+目前一輪對話：
+{CURRENT_TURN}
+
+只輸出一個 JSON 物件：{{"create": [...], "update": [...]}}。
+create 欄位：text, kind(plan|promise|task|decision|question|followup), owner(master|shared), importance(1..10), due_when(null 或 {{"start":{{"offset":整數,"unit":"minute|hour|day|week|month|year"}},"end":null}}), resolution_hint。
+update 欄位：id, action(resolve|cancel|reschedule|revise)，以及該動作真正需要的欄位。
+規則：只有使用者明確的計畫/承諾/待辦/未來驗證結果/要求之後跟進才 create；普通興趣、閒聊、模糊願望或已完成事項不要建。AI 單方面建議不能入庫，除非使用者明確接受而成為 shared。完成→resolve，放棄→cancel，改時間→reschedule，修正內容→revise；沉默不代表完成。優先更新現有事項，不要重複建立。不確定就不動。沒有明確時間則 due_when=null，不可編造。最多 create 3、update 4；無變化返回 {{"create":[],"update":[]}}。不要 Markdown 或解釋。""",
+    "en": """You update prospective memory. Manage only explicit deferred intentions / unresolved outcomes that may matter later; do not perform ordinary fact extraction.
+Anchor time: {ANCHOR_TIME}
+Existing open loops (JSON): {ACTIVE_LOOPS}
+Current turn:
+{CURRENT_TURN}
+
+Output exactly one JSON object: {{"create": [...], "update": [...]}}.
+create fields: text, kind(plan|promise|task|decision|question|followup), owner(master|shared), importance(1..10), due_when(null or {{"start":{{"offset":integer,"unit":"minute|hour|day|week|month|year"}},"end":null}}), resolution_hint.
+update fields: id, action(resolve|cancel|reschedule|revise), plus only fields needed by that action.
+Rules: create only explicit user plans, commitments, tasks, future outcomes to verify, or explicit requests to follow up/remind later. Do not store casual interests, chatter, vague “maybe someday” wishes, or already-completed events. An assistant-only suggestion/promise is not durable unless the user explicitly accepts it, making it shared. Clear completion→resolve; abandonment→cancel; changed timing→reschedule; corrected content→revise. Silence never means resolved. Prefer updating an existing loop over creating a duplicate. If uncertain, do nothing. due_when is relative to the anchor; use null when no time was stated and never invent a deadline. Keep text short and outcome-verifiable, e.g. “check whether TTS still works after restart”. Max create=3, update=4. If nothing changes return {{"create":[],"update":[]}}. No Markdown or explanation.""",
+    "ja": """あなたは前向き記憶（prospective memory）の更新器です。将来もう一度注意すべき明確な意図・未解決事項だけを管理し、通常の事実抽出はしません。
+基準時刻：{ANCHOR_TIME}
+既存の未解決事項(JSON)：{ACTIVE_LOOPS}
+今回の会話：
+{CURRENT_TURN}
+
+JSON オブジェクト {{"create": [...], "update": [...]}} だけを出力してください。create: text, kind(plan|promise|task|decision|question|followup), owner(master|shared), importance(1..10), due_when(null または相対 offset/unit), resolution_hint。update: id, action(resolve|cancel|reschedule|revise) と必要な欄位のみ。
+ユーザーが明確に計画・約束・タスク・後で確認する結果・後日のフォロー/リマインドを示した時だけ create。雑談、興味、曖昧な「いつか」、既に完了した事柄は作らない。AI だけの提案は、ユーザーが明確に受け入れた shared の場合を除き保存しない。完了→resolve、放棄→cancel、日時変更→reschedule、内容修正→revise。沈黙を完了とみなさない。既存事項の update を優先し、重複 create しない。不確実なら何もしない。時刻が明示されていなければ due_when=null。最大 create 3、update 4。変化なしは {{"create":[],"update":[]}}。Markdown・説明は禁止。""",
+    "ko": """당신은 미래지향 기억(prospective memory) 업데이트 담당자입니다. 나중에 다시 확인해야 할 명확한 의도/미해결 사항만 관리하고 일반 사실 추출은 하지 않습니다.
+기준 시각: {ANCHOR_TIME}
+기존 미해결 항목(JSON): {ACTIVE_LOOPS}
+현재 대화 턴:
+{CURRENT_TURN}
+
+JSON 객체 {{"create": [...], "update": [...]}}만 출력하세요. create: text, kind(plan|promise|task|decision|question|followup), owner(master|shared), importance(1..10), due_when(null 또는 상대 offset/unit), resolution_hint. update: id, action(resolve|cancel|reschedule|revise)와 필요한 필드만.
+사용자가 명시적으로 계획/약속/할 일/나중에 확인할 결과/추후 팔로업이나 알림을 요청할 때만 create. 일반 관심사, 잡담, 막연한 “언젠가”, 이미 끝난 일은 만들지 마세요. AI만의 제안은 사용자가 명시적으로 수락해 shared가 된 경우가 아니면 저장하지 마세요. 완료→resolve, 포기→cancel, 시간 변경→reschedule, 내용 수정→revise. 침묵은 완료가 아닙니다. 기존 항목 update를 우선하고 중복 create 금지. 불확실하면 아무것도 하지 마세요. 명시된 시간이 없으면 due_when=null. 최대 create 3, update 4. 변화가 없으면 {{"create":[],"update":[]}}. Markdown/설명 금지.""",
+    "ru": """Ты обновляешь перспективную память. Храни только явные отложенные намерения и незавершённые дела, к которым действительно надо вернуться позже; обычные факты здесь не извлекай.
+Опорное время: {ANCHOR_TIME}
+Текущие незавершённые дела (JSON): {ACTIVE_LOOPS}
+Текущий ход диалога:
+{CURRENT_TURN}
+
+Выведи ровно один JSON-объект: {{"create": [...], "update": [...]}}.
+Поля create: text, kind(plan|promise|task|decision|question|followup), owner(master|shared), importance(1..10), due_when(null либо {{"start":{{"offset":целое,"unit":"minute|hour|day|week|month|year"}},"end":null}}), resolution_hint.
+Поля update: id, action(resolve|cancel|reschedule|revise) и только реально нужные для действия поля.
+Правила: create только для явного плана/обещания/задачи пользователя, результата, который ещё предстоит проверить, или прямой просьбы вернуться/напомнить позже. Обычные интересы, болтовню, расплывчатое «когда-нибудь может быть» и уже завершённые события не создавай. Одностороннее предложение/обещание ассистента не становится долговременным делом, пока пользователь явно не согласился; тогда owner=shared. Явно завершено→resolve; отказались→cancel; изменили срок→reschedule; исправили содержание→revise. Молчание никогда не означает завершение. Сначала обновляй существующее дело, не создавай дубль. Не уверен — ничего не меняй. due_when задаёт время относительно опорного; если срока не было, ставь null и не выдумывай дедлайн. text должен быть коротким и проверяемым по результату, например «проверить, работает ли TTS после перезапуска». Максимум create=3, update=4. Если изменений нет: {{"create":[],"update":[]}}. Без Markdown и объяснений.""",
+    "es": """Actualizas memoria prospectiva. Gestiona solo intenciones diferidas o asuntos pendientes explícitos que deban retomarse después; no extraigas hechos ordinarios.
+Hora de referencia: {ANCHOR_TIME}
+Pendientes actuales (JSON): {ACTIVE_LOOPS}
+Turno actual:
+{CURRENT_TURN}
+Devuelve solo {{"create": [...], "update": [...]}}. create: text, kind(plan|promise|task|decision|question|followup), owner(master|shared), importance(1..10), due_when(null o offset/unit relativo), resolution_hint. update: id, action(resolve|cancel|reschedule|revise) y solo los campos necesarios. Crea solo planes, compromisos, tareas, resultados futuros por comprobar o peticiones explícitas de seguimiento/recordatorio del usuario. No guardes intereses casuales, charla, “quizá algún día” ni cosas ya terminadas. Una sugerencia del asistente solo cuenta si el usuario la acepta explícitamente como shared. Finalizado→resolve, abandonado→cancel, cambio de fecha→reschedule, corrección→revise. El silencio no resuelve nada. Actualiza antes que duplicar. Si dudas, no hagas nada. Sin fecha explícita: due_when=null; no inventes plazos. Máximo create 3/update 4. Sin cambios: {{"create":[],"update":[]}}. Sin Markdown ni explicación.""",
+    "pt": """Você atualiza memória prospectiva. Gerencie apenas intenções adiadas ou pendências explícitas que realmente precisem ser retomadas depois; não extraia fatos comuns.
+Hora de referência: {ANCHOR_TIME}
+Pendências atuais (JSON): {ACTIVE_LOOPS}
+Turno atual:
+{CURRENT_TURN}
+Retorne somente {{"create": [...], "update": [...]}}. create: text, kind(plan|promise|task|decision|question|followup), owner(master|shared), importance(1..10), due_when(null ou offset/unit relativo), resolution_hint. Crie apenas planos, compromissos, tarefas, resultados futuros a verificar ou pedidos explícitos de acompanhamento/lembrete do usuário. Não guarde interesses casuais, conversa, “talvez um dia” nem coisas já concluídas. Sugestão do assistente só vira memória se o usuário aceitar explicitamente como shared. Concluído→resolve, abandonado→cancel, data alterada→reschedule, conteúdo corrigido→revise. Silêncio nunca resolve. Prefira atualizar a duplicar. Se houver dúvida, não faça nada. Sem horário explícito: due_when=null; não invente prazo. Máximo create 3/update 4. Sem mudanças: {{"create":[],"update":[]}}. Sem Markdown nem explicação.""",
+}
+
+
+def get_open_loop_update_prompt(lang: str | None = None) -> str:
+    return _loc(OPEN_LOOP_UPDATE_PROMPT, _normalize_memory_prompt_lang(lang))
+
+
+OPEN_LOOP_CONTEXT_BLOCK = {
+    "zh": """<OpenLoops>\n以下是仍未确认结果的明确计划/待办，不是已经发生的事实。需要时自然记住即可，不要逐条追问或假装已经完成。\n{ITEMS}\n</OpenLoops>""",
+    "zh-TW": """<OpenLoops>\n以下是仍未確認結果的明確計畫/待辦，不是已經發生的事實。需要時自然記住即可，不要逐條追問或假裝已完成。\n{ITEMS}\n</OpenLoops>""",
+    "en": """<OpenLoops>\nThese are explicit plans/pending outcomes whose result is still unknown, not completed facts. Keep them available when relevant; do not interrogate the user about every item or pretend any is complete.\n{ITEMS}\n</OpenLoops>""",
+    "ja": """<OpenLoops>\nこれは結果がまだ確認されていない明確な予定・未完了事項です。完了済みの事実ではありません。必要な時だけ自然に思い出し、全部を質問したり完了したふりをしないでください。\n{ITEMS}\n</OpenLoops>""",
+    "ko": """<OpenLoops>\n아직 결과가 확인되지 않은 명확한 계획/미해결 사항입니다. 완료된 사실이 아닙니다. 관련될 때만 자연스럽게 기억하고, 모든 항목을 캐묻거나 완료되었다고 가정하지 마세요.\n{ITEMS}\n</OpenLoops>""",
+    "ru": """<OpenLoops>\nЭто явные планы и незавершённые дела, результат которых ещё неизвестен; это НЕ завершённые факты. Учитывай их естественно, когда уместно, но не устраивай опрос по каждому пункту и не притворяйся, что дело уже выполнено.\n{ITEMS}\n</OpenLoops>""",
+    "es": """<OpenLoops>\nEstos son planes o asuntos pendientes explícitos cuyo resultado aún se desconoce; no son hechos ya cumplidos. Recuérdalos solo cuando sea pertinente, sin interrogar por cada punto ni suponer que ya terminó.\n{ITEMS}\n</OpenLoops>""",
+    "pt": """<OpenLoops>\nEstes são planos ou pendências explícitas cujo resultado ainda é desconhecido; não são fatos já concluídos. Lembre deles naturalmente quando relevante, sem perguntar sobre cada item nem fingir que já terminou.\n{ITEMS}\n</OpenLoops>""",
+}
+
+OPEN_LOOP_PROACTIVE_BLOCK = {
+    "zh": """<OpenLoopCandidates>\n这些未决事项可以成为主动搭话的理由，但最多挑一个真正合时宜的。优先陈述/提醒/观察，不必用问题结尾；不要催促。\n{ITEMS}\n</OpenLoopCandidates>""",
+    "zh-TW": """<OpenLoopCandidates>\n這些未決事項可以成為主動搭話的理由，但最多挑一個真正合時宜的。優先陳述/提醒/觀察，不必以問題結尾；不要催促。\n{ITEMS}\n</OpenLoopCandidates>""",
+    "en": """<OpenLoopCandidates>\nThese unresolved items may justify a proactive message, but choose at most one only when it is genuinely timely. Prefer a remark/reminder/observation over ending with a question, and do not nag.\n{ITEMS}\n</OpenLoopCandidates>""",
+    "ja": """<OpenLoopCandidates>\nこれらの未解決事項は主动メッセージのきっかけになり得ますが、本当に時宜に合うものを最大1件だけ選んでください。質問で終える必要はなく、催促しないでください。\n{ITEMS}\n</OpenLoopCandidates>""",
+    "ko": """<OpenLoopCandidates>\n이 미해결 항목들은 선제 대화의 이유가 될 수 있지만 정말 시의적절한 것 하나만 고르세요. 질문으로 끝낼 필요 없이 언급/알림/관찰을 우선하고 재촉하지 마세요.\n{ITEMS}\n</OpenLoopCandidates>""",
+    "ru": """<OpenLoopCandidates>\nЭти незавершённые дела могут дать повод заговорить первой, но выбери максимум одно и только если момент действительно подходящий. Лучше замечание, напоминание или наблюдение без обязательного вопроса в конце; не дави и не торопи.\n{ITEMS}\n</OpenLoopCandidates>""",
+    "es": """<OpenLoopCandidates>\nEstos pendientes pueden justificar un mensaje proactivo, pero elige como máximo uno y solo si es oportuno. Prefiere comentario/recordatorio/observación sin necesidad de acabar con pregunta; no presiones.\n{ITEMS}\n</OpenLoopCandidates>""",
+    "pt": """<OpenLoopCandidates>\nEstas pendências podem justificar uma mensagem proativa, mas escolha no máximo uma e apenas se for realmente oportuno. Prefira comentário/lembrete/observação sem precisar terminar com pergunta; não pressione.\n{ITEMS}\n</OpenLoopCandidates>""",
+}
+
+
+def _render_open_loop_items(loops: list[dict], *, limit: int) -> str:
+    lines: list[str] = []
+    for loop in loops[:max(0, limit)]:
+        text = str(loop.get("text") or "").strip()
+        if not text:
+            continue
+        text = text[:320]
+        kind = str(loop.get("kind") or "followup")
+        due_at = str(loop.get("due_at") or "").strip()
+        suffix = f"; due={due_at}" if due_at else ""
+        lines.append(f"- [{kind}] {text}{suffix}")
+    return "\n".join(lines)
+
+
+def render_open_loop_context_block(lang: str | None, loops: list[dict]) -> str:
+    items = _render_open_loop_items(loops, limit=6)
+    if not items:
+        return ""
+    return _loc(OPEN_LOOP_CONTEXT_BLOCK, _normalize_memory_prompt_lang(lang)).format(ITEMS=items)
+
+
+def render_open_loop_proactive_block(lang: str | None, loops: list[dict]) -> str:
+    items = _render_open_loop_items(loops, limit=3)
+    if not items:
+        return ""
+    return _loc(OPEN_LOOP_PROACTIVE_BLOCK, _normalize_memory_prompt_lang(lang)).format(ITEMS=items)
