@@ -35,6 +35,8 @@ ALLOWED_CONVERSATION_SETTINGS = frozenset({
     "subtitleEnabled",
     "userLanguage",
     "textGuardMaxLength",
+    "adaptiveResponseLengthEnabled",
+    "adaptiveResponseHardMaxTokens",
     "noiseReductionEnabled",
     "independentAsrEnabled",
     "independentAsrProviderPreference",

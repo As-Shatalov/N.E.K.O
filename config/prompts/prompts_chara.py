@@ -263,6 +263,34 @@ _ALL_DEFAULTS_STRIPPED = {_normalize_default_prompt_text(v) for v in _ALL_DEFAUL
 lanlan_prompt = _ALL_DEFAULTS['zh']
 
 # ============================================================================
+# Adaptive ordinary-conversation response envelope (PATCH 10)
+# ============================================================================
+
+_RESPONSE_LENGTH_POLICY = """
+<ResponseLengthPolicy>
+For ordinary conversation, this policy overrides generic "concise" wording in the base character prompt. Here "concise" means no filler or needless repetition; it does NOT mean every reply should be short or the same size.
+Choose the length of each ordinary reply yourself from the needs of that turn.
+- A tiny reaction may be a fragment or one sentence.
+- Normal conversation may use a few sentences.
+- A genuinely complex technical, emotional, or explanatory topic may use several short paragraphs when that adds value.
+- Do not pad a simple thought to reach a minimum, and do not compress a substantive answer merely to look concise.
+- Do not settle into a fixed number of sentences or lines across turns. Vary pacing naturally with importance, complexity, emotion, and the user's apparent need.
+- Stop as soon as the thought is complete. The host may provide an upper safety envelope; treat it only as a ceiling, never as a target length.
+</ResponseLengthPolicy>
+""".strip()
+
+
+def get_response_length_policy(lang: str | None = None) -> str:
+    """Return the provider-neutral soft policy for ordinary conversation.
+
+    The wording intentionally avoids token-count targets: models are poor at
+    self-counting tokens, and native-audio providers use different token units.
+    Core enforces the text-path hard ceiling separately.
+    """
+    return _RESPONSE_LENGTH_POLICY
+
+
+# ============================================================================
 # 公开 API
 # ============================================================================
 

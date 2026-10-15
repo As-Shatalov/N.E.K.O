@@ -16,6 +16,26 @@
 """Session lifecycle, anti-repeat, avatar, omni, and proactive search limits."""
 
 # ---- Main: session / avatar / omni ----
+
+ADAPTIVE_RESPONSE_LENGTH_ENABLED = True
+"""Enable the ordinary-conversation response envelope.
+
+The envelope deliberately does NOT pick a target length per turn.  It only
+removes the old fixed-short bias and gives the model room to choose whether a
+turn deserves a fragment, a few sentences, or several short paragraphs.
+Specialised paths (proactive chat, games, summaries) keep their own budgets.
+"""
+
+ADAPTIVE_RESPONSE_HARD_MAX_TOKENS = 640
+"""Safety ceiling for ordinary text/offline replies while adaptive length is on.
+
+This is a ceiling, not a target and not a minimum.  640 o200k_base tokens leaves
+enough room for a substantive technical answer without letting a voice companion
+run away into essay-length output.  Realtime native-audio providers receive the
+soft response-envelope instruction but keep provider-native output accounting;
+we intentionally do not map text tokens onto audio-token budgets.
+"""
+
 SESSION_ARCHIVE_TRIGGER_TOKENS = 5000
 """会话历史归档触发的累计 token 总量。
 - 用途：core.py 主循环每 turn-end 后检查；超过则置

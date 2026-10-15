@@ -68,6 +68,10 @@ from copy import deepcopy
 from urllib.parse import urlparse, urlunparse
 
 from config import DEFAULT_CONFIG_DATA, GEOIP_FORCE_NON_MAINLAND
+from config.session_settings import (
+    ADAPTIVE_RESPONSE_LENGTH_ENABLED,
+    ADAPTIVE_RESPONSE_HARD_MAX_TOKENS,
+)
 from utils.gptsovits_config import normalize_gsv_api_url
 from utils.steam_state import get_steamworks
 
@@ -1300,14 +1304,35 @@ class CoreConfigMixin:
         else:
             config['DISABLE_TTS'] = False
 
-        # 文本模式回复长度守卫上限（tiktoken o200k_base tokens，超限触发 reroll；
-        # reroll 耗尽后回退到最后一个句末标点截断后落定）
+        # 旧文本 guard 仍保留，供 adaptive envelope 显式关闭时回退。
         try:
             config['TEXT_GUARD_MAX_LENGTH'] = int(core_cfg.get('textGuardMaxLength', 300))
             if config['TEXT_GUARD_MAX_LENGTH'] <= 0:
                 config['TEXT_GUARD_MAX_LENGTH'] = 300
         except (TypeError, ValueError):
             config['TEXT_GUARD_MAX_LENGTH'] = 300
+
+        # PATCH 10: ordinary conversation gets an adaptive response envelope.
+        # The model chooses the actual length; Core owns only the upper safety
+        # ceiling.  Keep legacy textGuardMaxLength intact for easy rollback.
+        _adaptive_raw = core_cfg.get(
+            'adaptiveResponseLengthEnabled', ADAPTIVE_RESPONSE_LENGTH_ENABLED
+        )
+        if isinstance(_adaptive_raw, bool):
+            config['ADAPTIVE_RESPONSE_LENGTH_ENABLED'] = _adaptive_raw
+        elif isinstance(_adaptive_raw, str):
+            config['ADAPTIVE_RESPONSE_LENGTH_ENABLED'] = (
+                _adaptive_raw.strip().lower() in ('true', '1', 'yes', 'on')
+            )
+        else:
+            config['ADAPTIVE_RESPONSE_LENGTH_ENABLED'] = ADAPTIVE_RESPONSE_LENGTH_ENABLED
+        try:
+            _adaptive_cap = int(core_cfg.get(
+                'adaptiveResponseHardMaxTokens', ADAPTIVE_RESPONSE_HARD_MAX_TOKENS
+            ))
+        except (TypeError, ValueError):
+            _adaptive_cap = ADAPTIVE_RESPONSE_HARD_MAX_TOKENS
+        config['ADAPTIVE_RESPONSE_HARD_MAX_TOKENS'] = max(64, min(_adaptive_cap, 2000))
         
         # GPT-SoVITS 是本地 TTS 运行时，不依赖 enableCustomApi 总开关。用户
         # 保存的 ttsModelUrl 是 GSV server URL，不能被 follow_core/follow_assist

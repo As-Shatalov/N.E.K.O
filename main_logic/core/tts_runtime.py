@@ -57,6 +57,10 @@ from main_logic.tts_client import (
 )
 from utils.gptsovits_config import is_gsv_disabled_voice_id
 from utils.config_manager import _as_bool, get_reserved
+from config.session_settings import (
+    ADAPTIVE_RESPONSE_LENGTH_ENABLED,
+    ADAPTIVE_RESPONSE_HARD_MAX_TOKENS,
+)
 from utils.tts.native_voice_registry import is_free_preset_voice_id, resolve_native_voice_for_routing
 from utils.api_config_loader import get_livestream_config
 from threading import Thread
@@ -248,21 +252,53 @@ class TtsRuntimeMixin:
                 if not future.done():
                     future.set_result(False)
 
-    def _get_text_guard_max_length(self) -> int:
-        """Read the user-configured reply token cap.
-        Unit: tiktoken (o200k_base) tokens. 0 = unlimited (returns 999999).
-        Default 300 tokens ≈ 400 CJK characters / ~1200 English characters.
+    def _get_response_envelope_settings(self) -> tuple[bool, int]:
+        """Return ``(adaptive_enabled, hard_max_tokens)`` for ordinary chat.
+
+        PATCH 10 deliberately separates *style* from *safety*: the model chooses
+        the response length inside a broad envelope, while Core retains only a
+        hard runaway ceiling.  Specialised flows (proactive/game/summary) keep
+        their own independent budgets.
         """
         try:
-            # 优先从对话设置中读取，如果不存在则从核心配置读取
+            conversation_settings = _core_facade.load_global_conversation_settings()
+            core_cfg = self._config_manager.get_core_config()
+
+            enabled_raw = conversation_settings.get(
+                'adaptiveResponseLengthEnabled',
+                core_cfg.get('ADAPTIVE_RESPONSE_LENGTH_ENABLED', ADAPTIVE_RESPONSE_LENGTH_ENABLED),
+            )
+            enabled = _as_bool(enabled_raw, default=ADAPTIVE_RESPONSE_LENGTH_ENABLED)
+
+            cap_raw = conversation_settings.get(
+                'adaptiveResponseHardMaxTokens',
+                core_cfg.get('ADAPTIVE_RESPONSE_HARD_MAX_TOKENS', ADAPTIVE_RESPONSE_HARD_MAX_TOKENS),
+            )
+            try:
+                cap = int(cap_raw)
+            except (TypeError, ValueError):
+                cap = ADAPTIVE_RESPONSE_HARD_MAX_TOKENS
+            return bool(enabled), max(64, min(cap, 2000))
+        except Exception:
+            return ADAPTIVE_RESPONSE_LENGTH_ENABLED, ADAPTIVE_RESPONSE_HARD_MAX_TOKENS
+
+    def _get_text_guard_max_length(self) -> int:
+        """Return the ordinary text reply hard ceiling in o200k_base tokens.
+
+        Adaptive mode uses its dedicated broad safety ceiling.  When disabled,
+        the legacy ``textGuardMaxLength`` setting keeps its old semantics,
+        including ``<=0`` meaning unlimited.
+        """
+        adaptive_enabled, adaptive_cap = self._get_response_envelope_settings()
+        if adaptive_enabled:
+            return adaptive_cap
+
+        try:
             conversation_settings = _core_facade.load_global_conversation_settings()
             if 'textGuardMaxLength' in conversation_settings:
                 value = int(conversation_settings['textGuardMaxLength'])
             else:
                 value = int(self._config_manager.get_core_config().get('TEXT_GUARD_MAX_LENGTH', 300))
-            # 0 / 负数都表示"无限制"，与 OmniOfflineClient.__init__ /
-            # update_max_response_length 的语义统一。原本 < 0 会 raise 然后
-            # fallback 到 300，存量配置带 -1 的会被静默降级。
             if value <= 0:
                 return 999999
             return value

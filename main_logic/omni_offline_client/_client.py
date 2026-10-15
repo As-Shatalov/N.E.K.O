@@ -41,6 +41,7 @@ from ._media import _MediaMixin
 from ._lifecycle import _LifecycleMixin
 
 from utils.http.url import same_endpoint
+from config.session_settings import ADAPTIVE_RESPONSE_HARD_MAX_TOKENS
 
 
 # 端点同源判据收口到 utils.http.url：视觉槽的凭证继承与配置层「管理簿 Key 只能
@@ -188,7 +189,7 @@ class OmniOfflineClient(_ToolingMixin, _GenaiMixin, _StreamingMixin, _MediaMixin
         # 改一次滑块才恢复 unlimited。
         self.enable_response_guard = True
         if not isinstance(max_response_length, int):
-            self.max_response_length = 300
+            self.max_response_length = ADAPTIVE_RESPONSE_HARD_MAX_TOKENS
         elif max_response_length > 0:
             self.max_response_length = max_response_length
         else:

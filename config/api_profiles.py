@@ -16,6 +16,10 @@
 """Default core configuration, provider profiles, and persisted config payloads."""
 
 from .character_defaults import DEFAULT_CHARACTERS_CONFIG
+from .session_settings import (
+    ADAPTIVE_RESPONSE_LENGTH_ENABLED,
+    ADAPTIVE_RESPONSE_HARD_MAX_TOKENS,
+)
 
 DEFAULT_CORE_CONFIG = {
     "coreApiKey": "",
@@ -48,6 +52,8 @@ DEFAULT_CORE_CONFIG = {
     "openclawTimeout": 300.0,
     "openclawDefaultSenderId": "neko_user",
     "textGuardMaxLength": 300,
+    "adaptiveResponseLengthEnabled": ADAPTIVE_RESPONSE_LENGTH_ENABLED,
+    "adaptiveResponseHardMaxTokens": ADAPTIVE_RESPONSE_HARD_MAX_TOKENS,
 }
 
 DEFAULT_USER_PREFERENCES = []

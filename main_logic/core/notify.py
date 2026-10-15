@@ -71,6 +71,7 @@ from config.prompts.prompts_sys import (
     AGENT_TASKS_HEADER,
     AGENT_TASKS_NOTICE,
 )
+from config.prompts.prompts_chara import get_response_length_policy
 from utils.language_utils import normalize_language_code, is_supported_language_code
 from ._shared import logger
 
@@ -170,6 +171,15 @@ class NotifyMixin:
                 _loc(SESSION_INIT_PROMPT, _lang).format(name=self.lanlan_name)
                 + self.lanlan_prompt
             )
+
+        # PATCH 10: Core sets only a broad response envelope.  The model, not
+        # a turn classifier or randomizer, decides whether this specific reply
+        # should be tiny, normal, or expanded.  This is appended outside the
+        # character card so custom cards get the same host-level pacing policy.
+        adaptive_enabled, _adaptive_cap = self._get_response_envelope_settings()
+        if adaptive_enabled:
+            prompt += "\n\n" + get_response_length_policy(_lang)
+
         if self._is_agent_enabled():
             # Plugin summary (with plugin ids) is intentionally disabled to avoid
             # exposing implementation identifiers in the general agent prompt.

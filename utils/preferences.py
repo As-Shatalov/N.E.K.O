@@ -516,7 +516,7 @@ def _validate_conversation_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     }
     int_interval_fields = {'proactiveChatInterval', 'proactiveVisionInterval'}
     string_fields = {'userLanguage'}
-    int_limit_fields = {'textGuardMaxLength'}
+    int_limit_fields = {'textGuardMaxLength', 'adaptiveResponseHardMaxTokens'}
     choice_fields = {
         'independentAsrProviderPreference': _INDEPENDENT_ASR_PROVIDER_PREFERENCES,
     }
