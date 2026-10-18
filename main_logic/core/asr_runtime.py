@@ -5631,7 +5631,7 @@ class AsrRuntimeMixin:
                     session_ref=session_ref,
                 )
             raise
-        except Exception:
+        except Exception as exc:
             if abandon_on_failure:
                 self._abandon_core_voice_turn(
                     external_turn_id,
@@ -5639,10 +5639,12 @@ class AsrRuntimeMixin:
                 )
             if not operation_is_current():
                 return False
-            logger.exception(
-                "[%s] independent ASR turn preparation failed turn_id=%s",
+            logger.error(
+                "[%s] independent ASR turn preparation failed "
+                "turn_id=%s error_type=%s",
                 self.lanlan_name,
                 external_turn_id,
+                type(exc).__name__,
             )
             return False
         finally:
