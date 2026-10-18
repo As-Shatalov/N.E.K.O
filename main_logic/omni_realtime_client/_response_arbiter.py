@@ -823,7 +823,20 @@ class RealtimeResponseArbiter:
                     self._arm_pause_expiry(generation)
                     return
                 if owner_alive:
-                    logger.warning("Dispatch pause exceeded absolute bound for owner=%s", self._pause_owner)
+                    logger.warning(
+                        "Dispatch pause exceeded absolute bound for owner=%s; "
+                        "retiring uncertain realtime connection",
+                        self._pause_owner,
+                    )
+                    # Never reopen the response lane over a turn Core still
+                    # claims is alive. Reconnect is safer than overlapping
+                    # response.create with a possible user utterance.
+                    if self._pause_expiry is asyncio.current_task():
+                        self._pause_expiry = None
+                    await self._tear_down_transport(
+                        "live external ASR turn exceeded absolute dispatch pause bound"
+                    )
+                    return
             logger.warning(
                 "realtime dispatch held paused for its full %.1fs bound "
                 "(owner=%s preparations=%d current=%s queued=%d)",
