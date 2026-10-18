@@ -352,6 +352,81 @@ def _safe_proactive_history_size() -> dict[str, int]:
     return out
 
 
+def _safe_session_lifecycle() -> dict[str, Any]:
+    """Content-free snapshot of ASR and realtime response ownership."""
+    from main_routers.shared_state import get_session_manager
+
+    def task_state(task: Any) -> dict[str, Any] | None:
+        if task is None:
+            return None
+        done = bool(task.done())
+        result: dict[str, Any] = {
+            "done": done,
+            "cancelling": task.cancelling() if callable(getattr(task, "cancelling", None)) else None,
+        }
+        if done:
+            try:
+                result["cancelled"] = bool(task.cancelled())
+                if not result["cancelled"]:
+                    exc = task.exception()
+                    result["error_type"] = type(exc).__name__ if exc else None
+            except Exception:
+                result["error_type"] = "unknown"
+            return result
+        get_coro = getattr(task, "get_coro", None)
+        coro = get_coro() if callable(get_coro) else None
+        frames: list[str] = []
+        for _ in range(15):
+            frame = getattr(coro, "cr_frame", None) or getattr(coro, "gi_frame", None)
+            if frame is not None:
+                frames.append(f"{frame.f_code.co_name}:{frame.f_lineno}")
+            coro = getattr(coro, "cr_await", None) or getattr(coro, "gi_yieldfrom", None)
+            if coro is None:
+                break
+        result["awaits"] = frames
+        return result
+
+    snapshot: dict[str, Any] = {}
+    for name, manager in get_session_manager().items():
+        session = getattr(manager, "session", None)
+        arbiter = getattr(session, "_response_arbiter", None)
+        asr = getattr(manager, "_asr_runtime", None)
+        dispatcher = getattr(asr, "_asr_transcript_dispatcher", None)
+        current = getattr(arbiter, "_current", None)
+        paused = bool(
+            arbiter is not None and not arbiter._dispatch_allowed.is_set()
+        )
+        paused_at = getattr(arbiter, "_pause_started_at", None)
+        age = (
+            round(time.monotonic() - paused_at, 2)
+            if paused and isinstance(paused_at, float) and paused_at > 0
+            else None
+        )
+        snapshot[str(name)] = {
+            "active": getattr(manager, "is_active", None),
+            "ready": getattr(manager, "session_ready", None),
+            "client": type(session).__name__,
+            "listener": task_state(getattr(manager, "message_handler_task", None)),
+            "arbiter_worker": task_state(getattr(arbiter, "_worker", None)),
+            "arbiter_source": getattr(current, "source", None),
+            "arbiter_idle": arbiter._idle.is_set() if arbiter is not None else None,
+            "arbiter_dispatch": not paused if arbiter is not None else None,
+            "arbiter_available": getattr(arbiter, "_connection_available", None),
+            "arbiter_queue": arbiter._queue.qsize() if arbiter is not None else None,
+            "arbiter_preparations": getattr(arbiter, "_turn_preparations", None),
+            "arbiter_pause_owner": getattr(arbiter, "_pause_owner", None),
+            "arbiter_pause_age_sec": age,
+            "voice_pause_id": getattr(session, "_external_voice_turn_pause_id", None),
+            "asr_turn_prepared": getattr(asr, "_asr_turn_prepared", None),
+            "asr_dispatcher": task_state(getattr(dispatcher, "_worker", None)),
+            "asr_pending_delivery": getattr(dispatcher, "has_pending_delivery", None),
+            "connections_live": sum(
+                not item.closed for item in getattr(manager, "_connection_records", ())
+            ),
+        }
+    return snapshot
+
+
 def _collect_snapshot(include_deep: bool = False, channel: str = "watchdog") -> dict[str, Any]:
     """Take a single snapshot. Every field is individually try-wrapped — one blowing up does not affect the others.
 
@@ -394,6 +469,10 @@ def _collect_snapshot(include_deep: bool = False, channel: str = "watchdog") -> 
     except Exception as exc:
         snap["widget_mode"] = {"error": str(exc)[:160]}
     if include_deep:
+        try:
+            snap["session_lifecycle"] = _safe_session_lifecycle()
+        except Exception as exc:
+            snap["session_lifecycle"] = {"error_type": type(exc).__name__}
         # Deep 字段——~50 ms 阻塞但有 30 min 间隔，长跑曲线仍能画时序。
         snap["gc_object_top"] = _safe_gc_object_top()
         snap.update(_safe_psutil_heavy(channel))
