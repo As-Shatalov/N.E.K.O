@@ -116,7 +116,19 @@ def create_chat_llm(
         # OpenAI SDK 要求 api_key 非空，给占位值（实际鉴权走 x-api-key header）
         _api_key = "anthropic-via-header"
 
-    return ChatOpenAI(
+    # Patch 12.0.1: only the streaming OpenAI-compatible client negotiates
+    # optional, provider-specific request fields after explicit HTTP 400/422.
+    # Non-streaming clients and the Anthropic route remain unchanged.
+    client_class = ChatOpenAI
+    if streaming:
+        from .stream_compat_12_0_1 import StreamingCompatChatOpenAI
+        # Respect caller/test overrides of factory.ChatOpenAI. The subclass
+        # is valid only for the original imported class, not a monkeypatched
+        # backend with a different API contract.
+        if isinstance(ChatOpenAI, type) and issubclass(StreamingCompatChatOpenAI, ChatOpenAI):
+            client_class = StreamingCompatChatOpenAI
+
+    return client_class(
         model=model,
         base_url=base_url,
         api_key=_api_key,
