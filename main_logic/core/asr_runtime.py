@@ -5531,6 +5531,11 @@ class AsrRuntimeMixin:
             return False
         transition_generation = self._voice_input_transition_generation
         external_turn_id = f"asr-{token.ingress.session_epoch}-{token.turn_id}"
+        logger.info(
+            "[voice-chain] stage=asr_turn_prepare turn_id=%s session_epoch=%s",
+            external_turn_id,
+            token.ingress.session_epoch,
+        )
         self._begin_core_multimodal_turn(external_turn_id, token)
         previous_preview_turn_id = self._core_asr_preview_turn_id
         previous_preview_turn_token = self._core_asr_preview_turn_token
@@ -5552,6 +5557,33 @@ class AsrRuntimeMixin:
             )
 
         prepare = getattr(session_ref, "prepare_external_voice_turn", None)
+        arbiter = getattr(session_ref, "_response_arbiter", None)
+        runtime = getattr(self, "_asr_runtime", None)
+        capture_identity = getattr(runtime, "_capture_runtime_identity", None)
+        identity = (
+            capture_identity(ingress_token=token.ingress, turn_token=token)
+            if callable(capture_identity) else None
+        )
+        pause_owner_alive = None
+        if arbiter is not None and not getattr(session_ref, "_is_gemini", False):
+            def pause_owner_alive(owner):
+                lifecycle = getattr(runtime, "_asr_lifecycle", None)
+                identity_matches = getattr(runtime, "_runtime_identity_matches", None)
+                return bool(
+                    owner == external_turn_id
+                    and operation_is_current()
+                    and runtime is self._asr_runtime
+                    and identity is not None
+                    and callable(identity_matches)
+                    and identity_matches(identity)
+                    and lifecycle is not None
+                    and lifecycle.snapshot.state is VoiceLifecycleState.ACTIVE
+                    and lifecycle.snapshot.turn_id == token.turn_id
+                    and runtime._asr_turn_prepared
+                )
+
+            pause_owner_alive.pause_owner = external_turn_id
+            arbiter.pause_owner_alive = pause_owner_alive
         preparation_succeeded = False
         try:
             if callable(prepare):
@@ -5581,6 +5613,10 @@ class AsrRuntimeMixin:
             await self.handle_new_message()
             if operation_is_current():
                 preparation_succeeded = True
+                logger.info(
+                    "[voice-chain] stage=asr_turn_ready turn_id=%s",
+                    external_turn_id,
+                )
                 return True
             if abandon_on_failure:
                 self._abandon_core_voice_turn(
@@ -5595,7 +5631,7 @@ class AsrRuntimeMixin:
                     session_ref=session_ref,
                 )
             raise
-        except Exception:
+        except Exception as exc:
             if abandon_on_failure:
                 self._abandon_core_voice_turn(
                     external_turn_id,
@@ -5603,12 +5639,21 @@ class AsrRuntimeMixin:
                 )
             if not operation_is_current():
                 return False
-            logger.warning(
-                "[%s] independent ASR turn preparation failed",
+            logger.error(
+                "[%s] independent ASR turn preparation failed "
+                "turn_id=%s error_type=%s",
                 self.lanlan_name,
+                external_turn_id,
+                type(exc).__name__,
             )
             return False
         finally:
+            if (
+                not preparation_succeeded
+                and arbiter is not None
+                and getattr(arbiter, "pause_owner_alive", None) is pause_owner_alive
+            ):
+                arbiter.pause_owner_alive = None
             if (
                 not preparation_succeeded
                 and self._core_asr_preview_turn_id == external_turn_id
@@ -5662,6 +5707,12 @@ class AsrRuntimeMixin:
     ) -> None:
         token = event.turn_token.ingress
         external_turn_id = f"asr-{token.session_epoch}-{event.turn_token.turn_id}"
+        logger.info(
+            "[voice-chain] stage=asr_transcript_dispatch turn_id=%s provider=%s text_len=%d",
+            external_turn_id,
+            event.provider,
+            len(event.text.strip()),
+        )
         if session_ref is None:
             session_ref = getattr(self, "session", None)
         prepared_session_ref = session_ref

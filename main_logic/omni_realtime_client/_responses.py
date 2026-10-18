@@ -339,9 +339,15 @@ class _ResponseMixin:
         active_pause_id = getattr(self, "_external_voice_turn_pause_id", None)
         if active_pause_id == stable_turn_id:
             self._external_voice_turn_pause_id = None
-        arbiter.resume_dispatch()
+        arbiter.allow_ticket_while_paused(ticket)
+        if active_pause_id in (None, stable_turn_id):
+            arbiter.resume_dispatch()
         try:
             await ticket.sent
+            logger.info(
+                "[voice-chain] stage=external_turn_sent turn_id=%s",
+                stable_turn_id,
+            )
         except asyncio.CancelledError:
             await arbiter.cancel_ticket(ticket)
             raise
@@ -357,7 +363,7 @@ class _ResponseMixin:
                 and getattr(self, "_external_voice_turn_pause_id", None)
                 == active_pause_id
             ):
-                arbiter.pause_dispatch()
+                arbiter.pause_dispatch(active_pause_id)
         return ticket
 
     def get_multimodal_turn_delivery(self) -> MultimodalTurnDelivery:
@@ -684,7 +690,9 @@ class _ResponseMixin:
         active_pause_id = getattr(self, "_external_voice_turn_pause_id", None)
         if active_pause_id == stable_turn_id:
             self._external_voice_turn_pause_id = None
-        arbiter.resume_dispatch()
+        arbiter.allow_ticket_while_paused(ticket)
+        if active_pause_id in (None, stable_turn_id):
+            arbiter.resume_dispatch()
         try:
             await ticket.sent
         except asyncio.CancelledError:
@@ -697,7 +705,7 @@ class _ResponseMixin:
                 and getattr(self, "_external_voice_turn_pause_id", None)
                 == active_pause_id
             ):
-                arbiter.pause_dispatch()
+                arbiter.pause_dispatch(active_pause_id)
         # Only here, and only on the path where ``ticket.sent`` resolved without
         # raising. Everything that could still have removed or rewritten a frame
         # has already run against this very dict -- both ownership downgrades
@@ -994,16 +1002,28 @@ class _ResponseMixin:
             # 隔离针对的是**上一轮**（主动搭话）那一轮，所以它必须在上一轮的
             # scope 下跑完；跑完之后这一轮才真正开始。
             self.note_user_turn_started()
+            preparation_arbiter = None
+            preparation_token = None
             try:
                 if not self._is_gemini:
                     arbiter = self._ensure_response_arbiter()
                     self._external_voice_turn_pause_id = stable_turn_id
-                    arbiter.pause_dispatch()
-                    await arbiter.cancel_current()
+                    preparation_token = arbiter.begin_turn_preparation(stable_turn_id)
+                    preparation_arbiter = arbiter
+                    # An unsent external-ASR ticket is an owed answer, not
+                    # a live response to cancel during the next speech onset.
+                    if arbiter.has_live_response or (
+                        arbiter.current_source is not None
+                        and arbiter.current_source != "external_asr"
+                    ):
+                        await arbiter.cancel_current()
                 await self.handle_interruption()
             except BaseException:
                 self.abandon_external_voice_turn(stable_turn_id)
                 raise
+            finally:
+                if preparation_arbiter is not None:
+                    preparation_arbiter.end_turn_preparation(preparation_token)
         return self._connection_generation != connection_generation
 
     def _consume_cancelled_terminal(self) -> bool:

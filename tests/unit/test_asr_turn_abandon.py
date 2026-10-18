@@ -3,10 +3,9 @@
 ``prepare_external_voice_turn`` pauses arbiter dispatch under a per-turn
 pause id and ``submit_external_text_turn`` briefly resumes dispatch so an
 older completed turn can flow ahead of a newer paused turn (WARM_IDLE
-overlap). The newer turn's pause must be re-armed even when the older
-turn's ``ticket.sent`` fails — a transport error or a newer prepare's
-``cancel_current`` — or queued proactive work could dispatch ahead of the
-newer turn's user text.
+overlap). A previous turn that has not sent its response yet must not be
+cancelled by the newer turn, and proactive work must remain paused until the
+new voice turn completes.
 """
 
 import asyncio
@@ -68,7 +67,7 @@ async def test_failed_submit_rearms_newer_turn_pause():
     await arbiter.shutdown()
 
 
-async def test_newer_prepare_interrupt_keeps_dispatch_paused_for_new_turn():
+async def test_newer_prepare_preserves_older_unsent_response_and_pauses_proactive():
     sent_events: list[dict] = []
     arbiter: RealtimeResponseArbiter | None = None
     release_item_send = asyncio.Event()
@@ -93,21 +92,27 @@ async def test_newer_prepare_interrupt_keeps_dispatch_paused_for_new_turn():
         await asyncio.sleep(0)
     assert arbiter.current_source == "external_asr"
 
-    # A newer turn's prepare interrupts the still-unsent older item.
+    # The next turn must not cancel an older user sentence before response.create.
     prepare = asyncio.create_task(
         client.prepare_external_voice_turn(turn_id="turn-new")
     )
     for _ in range(10):
         await asyncio.sleep(0)
     release_item_send.set()
-    with pytest.raises(RuntimeError):
-        await asyncio.wait_for(submit, 2)
     await asyncio.wait_for(prepare, 2)
+    await asyncio.wait_for(submit, 2)
 
-    # Dispatch stays paused for the newer turn's user text.
+    # The old answer was dispatched, but the new user's pause survives.
     assert client._external_voice_turn_pause_id == "turn-new"
     assert not arbiter._dispatch_allowed.is_set()
-    assert all(
-        event["type"] != "response.create" for event in sent_events
-    )
+    assert sum(
+        event["type"] == "response.create" for event in sent_events
+    ) == 1
+
+    proactive = await arbiter.enqueue(source="proactive")
+    for _ in range(6):
+        await asyncio.sleep(0)
+    assert not proactive.sent.done()
+    client.abandon_external_voice_turn("turn-new")
+    await asyncio.wait_for(proactive.sent, 2)
     await arbiter.shutdown()

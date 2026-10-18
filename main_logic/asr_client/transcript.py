@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Hashable
 
 from main_logic.voice_turn.contracts import VoiceTurnToken
+from utils.logger_config import get_module_logger
 
 from .lifecycle import FinalKey
 
+
+logger = get_module_logger(__name__, "Main")
 
 SegmentId = Hashable
 
@@ -313,10 +317,18 @@ class TranscriptDispatcher:
                     await self._dispatch(envelope)
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    # Dispatch callbacks own status reporting. Keep the serial
-                    # worker alive if a defensive caller still leaks an error.
-                    pass
+                except Exception as exc:
+                    # Keep the worker alive, but never make a failed user turn
+                    # disappear silently. Log stack locations, not transcript
+                    # text or provider exception messages.
+                    logger.error(
+                        "[voice-chain] stage=asr_dispatch_error "
+                        "provider=%s turn=%s error_type=%s stack=%s",
+                        envelope.provider,
+                        envelope.final_key,
+                        type(exc).__name__,
+                        "".join(traceback.format_tb(exc.__traceback__, limit=12)),
+                    )
                 finally:
                     self._queue.task_done()
                     if (
