@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+import traceback
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
@@ -30,8 +31,11 @@ from main_logic.voice_turn.contracts import (
     VoiceTurnToken,
 )
 from main_logic.voice_turn.audio_input import ProcessedVoiceFrame
+from utils.logger_config import get_module_logger
 
 from ._infra import logger, _READY_TIMEOUT_SECONDS
+
+voice_chain_logger = get_module_logger(__name__, "Main")
 from .audio import AsrAudioDispatcher
 from .candidate_control import CandidateRejectionOutcome, CandidateRejectionRequest
 from ._registry_meta import AsrProviderAvailability
@@ -5117,17 +5121,45 @@ class IndependentAsrRuntime:
             ingress_token=ingress_token,
             turn_token=envelope.turn_token,
         )
+        voice_chain_logger.info(
+            "[voice-chain] stage=asr_final_dispatch_start "
+            "provider=%s turn=%s session_epoch=%s",
+            envelope.provider,
+            envelope.final_key,
+            ingress_token.session_epoch,
+        )
         try:
-            await self._callbacks.on_final(
+            accepted = await self._callbacks.on_final(
                 VoiceTranscriptEvent(
                     turn_token=envelope.turn_token,
                     provider=envelope.provider,
                     text=envelope.text,
                 )
             )
+            voice_chain_logger.info(
+                "[voice-chain] stage=asr_final_dispatch_done "
+                "provider=%s turn=%s accepted=%s",
+                envelope.provider,
+                envelope.final_key,
+                accepted,
+            )
         except asyncio.CancelledError:
+            voice_chain_logger.info(
+                "[voice-chain] stage=asr_final_dispatch_cancelled "
+                "provider=%s turn=%s",
+                envelope.provider,
+                envelope.final_key,
+            )
             raise
-        except Exception:
+        except Exception as exc:
+            voice_chain_logger.error(
+                "[voice-chain] stage=asr_final_dispatch_error "
+                "provider=%s turn=%s error_type=%s stack=%s",
+                envelope.provider,
+                envelope.final_key,
+                type(exc).__name__,
+                "".join(traceback.format_tb(exc.__traceback__, limit=12)),
+            )
             await self._send_asr_status(
                 "ASR_INDEPENDENT_INJECTION_FAILED",
                 envelope.provider,
