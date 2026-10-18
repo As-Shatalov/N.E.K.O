@@ -139,6 +139,8 @@ def test_reschedule_reopens_surface_budget(store):
 
 def test_surface_cooldown_and_hard_nag_cap(store, monkeypatch):
     now = datetime(2026, 10, 14, 12, 0, 0)
+    # Freeze the store clock too: real wall time moves beyond this fixture.
+    monkeypatch.setattr("memory.open_loops._now_naive", lambda: now)
     store._apply_actions(
         "Heli",
         [{"text": "запустить тестовый билд", "kind": "task", "importance": 8}],
@@ -152,7 +154,7 @@ def test_surface_cooldown_and_hard_nag_cap(store, monkeypatch):
     with store._get_lock("Heli"):
         payload = store._load_unlocked("Heli")
         row = next(r for r in payload["loops"] if r["id"] == loop_id)
-        row["next_eligible_at"] = (datetime.now() - timedelta(seconds=1)).isoformat()
+        row["next_eligible_at"] = (now - timedelta(seconds=1)).isoformat()
         store._save_unlocked("Heli", payload)
     assert [row["id"] for row in store.candidates("Heli")] == [loop_id]
 
@@ -164,7 +166,7 @@ def test_surface_cooldown_and_hard_nag_cap(store, monkeypatch):
         with store._get_lock("Heli"):
             payload = store._load_unlocked("Heli")
             row = next(r for r in payload["loops"] if r["id"] == loop_id)
-            row["next_eligible_at"] = (datetime.now() - timedelta(seconds=1)).isoformat()
+            row["next_eligible_at"] = (now - timedelta(seconds=1)).isoformat()
             store._save_unlocked("Heli", payload)
         store.record_surfaced("Heli", [loop_id])
     row = next(r for r in store.load("Heli")["loops"] if r["id"] == loop_id)
