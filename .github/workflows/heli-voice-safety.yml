@@ -32,4 +32,4 @@ jobs:
         run: uv sync
       - name: Run Heli voice and memory isolation regression tests
         run: |
-          uv run pytest -q tests/unit/test_heli_voice_stall_recovery.py tests/unit/test_asr_turn_abandon.py tests/unit/test_realtime_arbiter_native_path.py tests/unit/runtime/test_realtime_host_turn_identity.py tests/unit/test_gemini_hotswap_memory_race_patch081.py tests/unit/test_adaptive_context_window.py
+          uv run pytest -q tests/unit/test_heli_voice_stall_recovery.py tests/unit/test_asr_turn_abandon.py tests/unit/test_realtime_arbiter_native_path.py tests/unit/runtime/test_realtime_host_turn_identity.py tests/unit/test_gemini_hotswap_memory_race_patch081.py tests/unit/test_adaptive_context_window.py tests/unit/test_realtime_response_ownership.py tests/unit/test_realtime_arbiter_fail_open.py tests/unit/test_realtime_proactive_text.py tests/unit/test_realtime_wire_trace.py tests/unit/test_external_text_turns.py tests/unit/test_asr_transcript_dispatcher.py tests/unit/test_relationship_continuity_patch08.py tests/unit/test_open_loops_patch09.py tests/unit/test_temporal_fact_supersession_patch07.py
