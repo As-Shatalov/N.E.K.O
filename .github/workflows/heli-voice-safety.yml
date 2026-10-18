@@ -3,7 +3,7 @@ name: Heli Voice Safety
 on:
   push:
     branches:
-      - fix/heli-voice-stall-20261018
+      - heli-dev
   pull_request:
     branches:
       - heli-dev
